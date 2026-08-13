@@ -1,0 +1,231 @@
+# ============================================================
+# Gocode — .gitignore
+# Windows + Linux
+# ============================================================
+
+# ============================================================
+# Rust
+# ============================================================
+
+/target/
+
+# Keep Cargo.lock committed for this application.
+# Cargo.lock
+
+# Rust temporary / backup files
+**/*.rs.bk
+*.pdb
+
+# ============================================================
+# Gocode local runtime data
+# ============================================================
+
+# Keep project-level configuration and instructions trackable:
+# .gocode/project.toml
+# .gocode/instructions.md
+
+.gocode/sessions/
+.gocode/logs/
+.gocode/cache/
+.gocode/state.json
+.gocode/models.json
+
+# Temporary Gocode files
+.gocode/tmp/
+.gocode/temp/
+.gocode/*.tmp
+.gocode/*.bak
+.gocode/*.old
+
+# Update staging / downloaded binaries
+.gocode/update/
+.gocode/updates/
+.gocode/**/*.part
+
+# ============================================================
+# Secrets / environment files
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+*.secret
+*.secrets
+secrets.*
+credentials.*
+
+# Provider-specific local secret files
+*nvidia_api_key*
+*api_key.local*
+
+# ============================================================
+# Windows
+# ============================================================
+
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Windows build/debug artifacts created outside target/
+*.exe
+*.dll
+*.ilk
+*.exp
+
+# If executable fixtures are ever committed:
+# !tests/fixtures/**/*.exe
+
+# ============================================================
+# Linux
+# ============================================================
+
+# Common desktop / filesystem metadata
+.directory
+.Trash-*
+.nfs*
+
+# Core dumps / crash dumps
+core
+core.*
+*.core
+
+# Linux native build artifacts created outside target/
+*.so
+*.so.*
+*.a
+*.o
+*.obj
+
+# Valgrind / profiling output
+valgrind.log*
+callgrind.out.*
+perf.data
+perf.data.old
+
+# systemd / local service overrides if generated locally
+*.service.local
+
+# ============================================================
+# macOS noise
+# ============================================================
+# Not an initial platform, but harmless to ignore common files.
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ============================================================
+# Editors / IDEs
+# ============================================================
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.example.json
+
+# JetBrains
+.idea/
+*.iml
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Vim / Neovim
+*.swp
+*.swo
+*.swn
+*~
+
+# Emacs
+\#*\#
+.#*
+
+# Helix
+.helix/
+
+# ============================================================
+# Logs
+# ============================================================
+
+*.log
+logs/
+
+# ============================================================
+# Coverage / profiling
+# ============================================================
+
+coverage/
+*.profraw
+*.profdata
+lcov.info
+
+# ============================================================
+# Test / benchmark output
+# ============================================================
+
+test-results/
+bench-results/
+
+# ============================================================
+# Temporary files
+# ============================================================
+
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.old
+
+# ============================================================
+# Archives / release artifacts
+# ============================================================
+
+dist/
+release/
+artifacts/
+
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Checksums generated for release packaging
+SHA256SUMS
+*.sha256
+
+# ============================================================
+# Local scripts / machine-specific overrides
+# ============================================================
+
+*.local.toml
+*.local.json
+*.local.yaml
+*.local.yml
+
+# ============================================================
+# Optional local binaries
+# ============================================================
+
+/bin/
+/out/
+
+# ============================================================
+# Notes
+# ============================================================
+#
+# Intentionally NOT ignored:
+#
+# Cargo.lock
+# .gocode/project.toml
+# .gocode/instructions.md
+#
+# These files should remain version-controlled when present.
