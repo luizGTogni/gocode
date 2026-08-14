@@ -658,9 +658,11 @@ dependencies = [
 name = "gocode"
 version = "0.0.1"
 dependencies = [
+ "gocode-agent",
  "gocode-core",
  "gocode-credentials",
  "gocode-provider-nvidia",
+ "gocode-tools",
  "gocode-tui",
  "tokio",
  "tracing",

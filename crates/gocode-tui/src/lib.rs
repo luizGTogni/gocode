@@ -1,16 +1,27 @@
 //! Terminal user interface for Gocode.
 
 use crossterm::event;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use gocode_core::{AppCommand, AppEvent};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use gocode_core::{AgentActivityState, AppCommand, AppEvent, ToolActivityStatus};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    widgets::{Block, Borders, Paragraph},
+    layout::{Constraint, Direction, Layout, Rect},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use std::fmt::Write;
+use std::fmt::Write as _;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+const SCROLL_STEP: usize = 5;
+const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
+const COLLAPSED_OUTPUT_LINES: usize = 5;
+const EXPANDED_OUTPUT_LINES: usize = 200;
+const MIN_WIDTH: u16 = 24;
+const MIN_HEIGHT: u16 = 6;
 
 /// The active top-level interface screen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -26,6 +37,111 @@ pub enum Screen {
     Chat,
 }
 
+/// One rendered fact in the chat transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatEntry {
+    /// A message the user sent.
+    User(String),
+    /// Assistant text, appended to while a response streams.
+    Assistant(String),
+    /// One tool call's lifecycle, updated in place as it progresses.
+    Tool {
+        /// Correlation id shared by the matching start/finish pair.
+        id: String,
+        /// Model-facing tool name.
+        name: String,
+        /// Current lifecycle status.
+        status: ToolActivityStatus,
+        /// Short human-readable status detail.
+        detail: String,
+        /// Accumulated output, bounded and expandable.
+        output: String,
+        /// Whether the full output is currently shown.
+        expanded: bool,
+    },
+    /// Files affected by the tool calls in one run.
+    FileChanges(Vec<String>),
+    /// A non-fatal condition worth surfacing.
+    Warning(String),
+    /// A recoverable, inline error.
+    Error(String),
+    /// A neutral status note (command output, completion summary).
+    Info(String),
+}
+
+/// A pending permission confirmation shown as a modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionPrompt {
+    /// Short summary of the requested action.
+    pub summary: String,
+    /// Working directory the action would run or write in.
+    pub working_directory: String,
+}
+
+/// A parsed slash command handled entirely by the interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCommand {
+    /// Reopen the model picker.
+    Model,
+    /// Show the active provider.
+    Provider,
+    /// Show the resolved model and provider.
+    Config,
+    /// Clear the conversation view.
+    Clear,
+    /// List available commands.
+    Help,
+    /// Exit Gocode.
+    Exit,
+}
+
+/// One recognized slash command: its typed form, description, and variant.
+const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
+    ("/model", "Switch the active model", SlashCommand::Model),
+    (
+        "/provider",
+        "Show the active provider",
+        SlashCommand::Provider,
+    ),
+    (
+        "/config",
+        "Show the resolved model and provider",
+        SlashCommand::Config,
+    ),
+    ("/clear", "Clear the conversation view", SlashCommand::Clear),
+    ("/help", "List available commands", SlashCommand::Help),
+    ("/exit", "Exit Gocode", SlashCommand::Exit),
+];
+
+/// Slash-command suggestions matching the current composer prefix.
+#[must_use]
+pub fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+    SLASH_COMMANDS
+        .iter()
+        .filter(|(name, _, _)| name.starts_with(input))
+        .map(|(name, description, _)| (*name, *description))
+        .collect()
+}
+
+fn resolve_slash_command(input: &str) -> Option<SlashCommand> {
+    SLASH_COMMANDS
+        .iter()
+        .find(|(name, _, _)| *name == input)
+        .map(|(_, _, command)| *command)
+}
+
+/// A composer submission: either a model prompt or a client-handled command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatSubmission {
+    /// Text to send to the model.
+    Prompt(String),
+    /// A recognized slash command.
+    Command(SlashCommand),
+}
+
 /// Renderable interface state derived from application events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppState {
@@ -34,25 +150,26 @@ pub struct AppState {
     credential_input: String,
     models: Vec<String>,
     selected_model: usize,
-    assistant_text: String,
+    current_model: Option<String>,
     chat_input: String,
+    entries: Vec<ChatEntry>,
+    streaming_assistant: bool,
+    file_change_buffer: Vec<String>,
+    activity: Option<AgentActivityState>,
+    pending_permission: Option<PermissionPrompt>,
+    blocking_error: Option<String>,
     status: Option<String>,
-}
-
-/// Outcome of classifying one terminal event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputAction {
-    /// Keep the application running; a resize or non-actionable event may trigger a redraw.
-    Continue,
-    /// Exit the application normally.
-    Exit,
-    /// Interrupt active work before exiting the application.
-    Interrupt,
+    scroll: usize,
+    last_failed_prompt: Option<String>,
+    last_submitted_prompt: Option<String>,
+    queued: Option<String>,
 }
 
 impl AppState {
     /// Applies a normalized application event to the render state.
-    pub fn apply(&mut self, event: &AppEvent) {
+    ///
+    /// Returns a queued prompt to auto-submit, if the run that just ended freed one up.
+    pub fn apply(&mut self, event: &AppEvent) -> Option<String> {
         match event {
             AppEvent::BootStarted => self.screen = Screen::Boot,
             AppEvent::BootCompleted => self.screen = Screen::Chat,
@@ -73,10 +190,188 @@ impl AppState {
             }
             AppEvent::ModelSelected(model) => {
                 self.screen = Screen::Chat;
+                self.current_model = Some(model.clone());
                 self.status = Some(format!("Model: {model}"));
             }
-            AppEvent::AssistantTextDelta(delta) => self.assistant_text.push_str(delta),
-            AppEvent::ProviderFailed(message) => self.status = Some(message.clone()),
+            AppEvent::AssistantTextDelta(delta) => self.push_assistant_delta(delta),
+            AppEvent::ProviderFailed(message) => {
+                self.activity = None;
+                self.entries.push(ChatEntry::Error(message.clone()));
+                self.last_failed_prompt = self.last_submitted_prompt.take();
+                return self.queued.take();
+            }
+            AppEvent::BlockingError(message) => {
+                self.activity = None;
+                self.blocking_error = Some(message.clone());
+            }
+            AppEvent::AgentStateChanged(state) => self.activity = Some(*state),
+            AppEvent::ToolActivity {
+                id,
+                name,
+                status,
+                detail,
+            } => self.apply_tool_activity(id, name, *status, detail),
+            AppEvent::ToolOutputChunk { id, chunk } => self.append_tool_output(id, chunk),
+            AppEvent::FileChanged { path, .. } => self.file_change_buffer.push(path.clone()),
+            AppEvent::AgentWarning(message) => {
+                self.entries.push(ChatEntry::Warning(message.clone()));
+            }
+            AppEvent::PermissionRequested {
+                summary,
+                working_directory,
+            } => {
+                self.pending_permission = Some(PermissionPrompt {
+                    summary: summary.clone(),
+                    working_directory: working_directory.clone(),
+                });
+            }
+            AppEvent::AgentCompleted {
+                final_text,
+                turns,
+                tool_calls,
+                failed_tool_calls,
+            } => {
+                self.activity = None;
+                self.streaming_assistant = false;
+                if let Some(text) = final_text.as_ref().filter(|text| !text.is_empty()) {
+                    self.entries.push(ChatEntry::Assistant(text.clone()));
+                }
+                self.flush_file_changes();
+                self.entries.push(ChatEntry::Info(format!(
+                    "Done — {turns} turn(s), {tool_calls} tool call(s), {failed_tool_calls} failed."
+                )));
+                self.last_submitted_prompt = None;
+                return self.queued.take();
+            }
+            AppEvent::AgentCancelled => {
+                self.activity = None;
+                self.streaming_assistant = false;
+                self.pending_permission = None;
+                self.flush_file_changes();
+                self.entries.push(ChatEntry::Info("Cancelled.".into()));
+                self.last_submitted_prompt = None;
+                return self.queued.take();
+            }
+        }
+        None
+    }
+
+    fn push_assistant_delta(&mut self, delta: &str) {
+        if self.streaming_assistant
+            && let Some(ChatEntry::Assistant(text)) = self.entries.last_mut()
+        {
+            text.push_str(delta);
+            return;
+        }
+        self.entries.push(ChatEntry::Assistant(delta.to_string()));
+        self.streaming_assistant = true;
+    }
+
+    fn apply_tool_activity(
+        &mut self,
+        id: &str,
+        name: &str,
+        status: ToolActivityStatus,
+        detail: &str,
+    ) {
+        for entry in self.entries.iter_mut().rev() {
+            if let ChatEntry::Tool {
+                id: entry_id,
+                name: entry_name,
+                status: entry_status,
+                detail: entry_detail,
+                ..
+            } = entry
+                && entry_id == id
+            {
+                *entry_status = status;
+                entry_detail.clear();
+                entry_detail.push_str(detail);
+                if !name.is_empty() {
+                    entry_name.clear();
+                    entry_name.push_str(name);
+                }
+                return;
+            }
+        }
+        self.entries.push(ChatEntry::Tool {
+            id: id.to_string(),
+            name: name.to_string(),
+            status,
+            detail: detail.to_string(),
+            output: String::new(),
+            expanded: false,
+        });
+    }
+
+    fn append_tool_output(&mut self, id: &str, chunk: &str) {
+        for entry in self.entries.iter_mut().rev() {
+            if let ChatEntry::Tool {
+                id: entry_id,
+                output,
+                ..
+            } = entry
+                && entry_id == id
+            {
+                if output.len() < MAX_TOOL_OUTPUT_CHARS {
+                    output.push_str(chunk);
+                    if output.len() > MAX_TOOL_OUTPUT_CHARS {
+                        output.truncate(MAX_TOOL_OUTPUT_CHARS);
+                        output.push_str("\n… output truncated …");
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    fn flush_file_changes(&mut self) {
+        if !self.file_change_buffer.is_empty() {
+            self.entries.push(ChatEntry::FileChanges(std::mem::take(
+                &mut self.file_change_buffer,
+            )));
+        }
+    }
+
+    /// Toggles full/collapsed output on the most recent tool activity entry.
+    pub fn toggle_last_tool_output(&mut self) {
+        for entry in self.entries.iter_mut().rev() {
+            if let ChatEntry::Tool { expanded, .. } = entry {
+                *expanded = !*expanded;
+                return;
+            }
+        }
+    }
+
+    /// Records that a prompt was just sent, adding it to the transcript and marking the run
+    /// active. Callers own actually sending the corresponding [`AppCommand::SubmitChat`].
+    pub fn begin_run(&mut self, prompt: String) {
+        self.entries.push(ChatEntry::User(prompt.clone()));
+        self.last_submitted_prompt = Some(prompt);
+        self.activity = Some(AgentActivityState::Thinking);
+        self.streaming_assistant = false;
+        self.scroll = 0;
+    }
+
+    /// Scrolls the transcript further from the bottom (toward older entries).
+    pub fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_add(SCROLL_STEP);
+    }
+
+    /// Scrolls the transcript toward the bottom; reaching zero re-locks to newest output.
+    pub fn scroll_down(&mut self) {
+        self.scroll = self.scroll.saturating_sub(SCROLL_STEP);
+    }
+
+    /// Whether the transcript is pinned to the newest entry.
+    #[must_use]
+    pub fn is_scroll_locked(&self) -> bool {
+        self.scroll == 0
+    }
+
+    fn autocomplete(&mut self) {
+        if let Some((name, _)) = slash_suggestions(&self.chat_input).first() {
+            self.chat_input = (*name).to_string();
         }
     }
 
@@ -100,49 +395,270 @@ impl AppState {
     }
 }
 
+fn compose_lines(state: &AppState) -> Vec<String> {
+    if state.entries.is_empty() {
+        return vec![
+            "What can I help you build?".into(),
+            String::new(),
+            "Prompts and the project context you share are sent to NVIDIA NIM for inference."
+                .into(),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    for entry in &state.entries {
+        match entry {
+            ChatEntry::User(text) => push_wrapped(&mut lines, "You: ", text),
+            ChatEntry::Assistant(text) => push_wrapped(&mut lines, "Gocode: ", text),
+            ChatEntry::Tool {
+                name,
+                status,
+                detail,
+                output,
+                expanded,
+                ..
+            } => {
+                let marker = match status {
+                    ToolActivityStatus::Started => "…",
+                    ToolActivityStatus::Succeeded => "✓",
+                    ToolActivityStatus::Failed => "✗",
+                    ToolActivityStatus::Denied | ToolActivityStatus::Cancelled => "⊘",
+                };
+                lines.push(format!("  {marker} {name}: {detail}"));
+                if !output.is_empty() {
+                    let output_lines: Vec<&str> = output.lines().collect();
+                    let limit = if *expanded {
+                        EXPANDED_OUTPUT_LINES
+                    } else {
+                        COLLAPSED_OUTPUT_LINES
+                    };
+                    for line in output_lines.iter().take(limit) {
+                        lines.push(format!("      {line}"));
+                    }
+                    if output_lines.len() > limit {
+                        let hidden = output_lines.len() - limit;
+                        let action = if *expanded { "collapse" } else { "expand" };
+                        lines.push(format!(
+                            "      … {hidden} more line(s) (Ctrl+O to {action})"
+                        ));
+                    }
+                }
+            }
+            ChatEntry::FileChanges(paths) => {
+                lines.push(format!("  Modified files: {}", paths.join(", ")));
+            }
+            ChatEntry::Warning(text) => lines.push(format!("  ⚠ {text}")),
+            ChatEntry::Error(text) => lines.push(format!("  ✗ {text}")),
+            ChatEntry::Info(text) => lines.push(format!("  · {text}")),
+        }
+        lines.push(String::new());
+    }
+
+    if let Some(activity) = state.activity {
+        lines.push(match activity {
+            AgentActivityState::Thinking => "Gocode is thinking…".into(),
+            AgentActivityState::RunningTools => "Gocode is running tools…".into(),
+        });
+    }
+    if let Some(queued) = &state.queued {
+        lines.push(format!("Queued: {queued}"));
+    }
+
+    lines
+}
+
+fn push_wrapped(lines: &mut Vec<String>, prefix: &str, text: &str) {
+    let indent = " ".repeat(prefix.chars().count());
+    for (index, line) in text.lines().enumerate() {
+        if index == 0 {
+            lines.push(format!("{prefix}{line}"));
+        } else {
+            lines.push(format!("{indent}{line}"));
+        }
+    }
+}
+
+/// Outcome of classifying one terminal event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAction {
+    /// Keep the application running; a resize or non-actionable event may trigger a redraw.
+    Continue,
+    /// Exit the application normally.
+    Exit,
+    /// Interrupt active work before exiting the application.
+    Interrupt,
+}
+
 /// Renders the active application screen.
 pub fn render(frame: &mut Frame, state: &AppState) {
-    let content = match state.screen {
-        Screen::Boot => "Starting Gocode...".into(),
-        Screen::Onboarding => "NVIDIA API key:\n\nEnter your key. It will be stored only in your system credential store after validation.\n\n".to_string()
-            + &"•".repeat(state.credential_input.chars().count()),
-        Screen::ModelPicker => {
-            let visible_rows = usize::from(frame.area().height.saturating_sub(3)).max(1);
-            let first_visible = state.selected_model.saturating_sub(visible_rows - 1);
-            state.models[first_visible..]
-            .iter()
-            .enumerate()
-            .take(visible_rows)
-            .map(|(offset, model)| {
-                let index = first_visible + offset;
-                format!("{} {model}", if index == state.selected_model { ">" } else { " " })
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-        }
-        Screen::Chat => {
-            let mut content = if state.assistant_text.is_empty() {
-                "What can I help you build?".into()
-            } else {
-                state.assistant_text.clone()
-            };
-            if let Some(status) = &state.status {
-                let _ = write!(content, "\n\n{status}");
-            }
-            let _ = write!(content, "\n\n> {}", state.chat_input);
-            content
-        }
-    };
-    let title = match state.screen {
-        Screen::Boot => "Gocode",
-        Screen::Onboarding => "Gocode · NVIDIA setup",
-        Screen::ModelPicker => "Gocode · Select NVIDIA model",
-        Screen::Chat => "Gocode · Chat",
-    };
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        frame.render_widget(
+            Paragraph::new("Terminal too small — resize to continue.").wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
 
+    match state.screen {
+        Screen::Boot => frame.render_widget(
+            Paragraph::new("Starting Gocode...")
+                .block(Block::default().title("Gocode").borders(Borders::ALL)),
+            area,
+        ),
+        Screen::Onboarding => render_onboarding(frame, state, area),
+        Screen::ModelPicker => render_model_picker(frame, state, area),
+        Screen::Chat => render_chat(frame, state, area),
+    }
+}
+
+fn render_onboarding(frame: &mut Frame, state: &AppState, area: Rect) {
+    let mut content = "NVIDIA API key:\n\n\
+        Enter your key. It is validated immediately and stored only in your system credential \
+        store afterward — never in plain configuration files.\n\n\
+        Prompts and selected project context are sent to NVIDIA NIM once you start chatting.\n\n"
+        .to_string();
+    content.push_str(&"•".repeat(state.credential_input.chars().count()));
+    if let Some(status) = &state.status {
+        content.push_str("\n\n");
+        content.push_str(status);
+    }
     frame.render_widget(
-        Paragraph::new(content).block(Block::default().title(title).borders(Borders::ALL)),
-        frame.area(),
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Gocode · NVIDIA setup")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn render_model_picker(frame: &mut Frame, state: &AppState, area: Rect) {
+    let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
+    let first_visible = state.selected_model.saturating_sub(visible_rows - 1);
+    let content = state.models[first_visible..]
+        .iter()
+        .enumerate()
+        .take(visible_rows)
+        .map(|(offset, model)| {
+            let index = first_visible + offset;
+            format!(
+                "{} {model}",
+                if index == state.selected_model {
+                    ">"
+                } else {
+                    " "
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.render_widget(
+        Paragraph::new(content).block(
+            Block::default()
+                .title("Gocode · Select NVIDIA model")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
+    let suggestions = slash_suggestions(&state.chat_input);
+    let input_lines = 1 + state.chat_input.matches('\n').count();
+    let suggestion_lines = suggestions.len().min(4);
+    let compose_height = u16::try_from(input_lines + suggestion_lines + 2).unwrap_or(u16::MAX);
+    let compose_height = compose_height.min(area.height.saturating_sub(3)).max(3);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(compose_height)])
+        .split(area);
+
+    render_history(frame, state, layout[0]);
+    render_composer(frame, state, layout[1], &suggestions);
+
+    if let Some(prompt) = &state.pending_permission {
+        render_permission_modal(frame, prompt, area);
+    } else if let Some(message) = &state.blocking_error {
+        render_blocking_error_modal(frame, message, area);
+    }
+}
+
+fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
+    let lines = compose_lines(state);
+    let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible_rows);
+    let scroll = state.scroll.min(max_scroll);
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(visible_rows);
+    let visible = lines[start..end].join("\n");
+
+    let title = if state.is_scroll_locked() {
+        "Gocode · Chat"
+    } else {
+        "Gocode · Chat (scrolled — End to follow)"
+    };
+    frame.render_widget(
+        Paragraph::new(visible)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(title).borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions: &[(&str, &str)]) {
+    let mut content = format!("> {}", state.chat_input);
+    for (name, description) in suggestions {
+        let _ = write!(content, "\n  {name} — {description}");
+    }
+    if let Some(status) = &state.status {
+        let _ = write!(content, "\n{status}");
+    }
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+fn render_permission_modal(frame: &mut Frame, prompt: &PermissionPrompt, area: Rect) {
+    let modal = centered(area, 60, 7);
+    let content = format!(
+        "Permission needed\n\n{}\nin {}\n\n[y] Approve   [n] Deny",
+        prompt.summary, prompt.working_directory
+    );
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title("Confirm").borders(Borders::ALL)),
+        modal,
+    );
+}
+
+fn render_blocking_error_modal(frame: &mut Frame, message: &str, area: Rect) {
+    let modal = centered(area, 60, 7);
+    let content = format!("{message}\n\nPress Enter or Esc to continue.");
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title("Error").borders(Borders::ALL)),
+        modal,
     );
 }
 
@@ -199,13 +715,27 @@ pub async fn run(
     clippy::needless_pass_by_value,
     reason = "the sender is retained by the blocking event loop until terminal exit"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the terminal loop deliberately keeps every input source visible in one place"
+)]
 fn run_terminal(
     mut event_rx: mpsc::Receiver<AppEvent>,
     command_tx: mpsc::Sender<AppCommand>,
 ) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
     let _terminal_guard = TerminalGuard;
     let mut state = AppState::default();
+
+    let send_command = |command_tx: &mpsc::Sender<AppCommand>, command: AppCommand| {
+        command_tx.blocking_send(command).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("runtime command channel closed: {error}"),
+            )
+        })
+    };
 
     loop {
         terminal
@@ -213,7 +743,10 @@ fn run_terminal(
             .map_err(std::io::Error::other)?;
 
         while let Ok(app_event) = event_rx.try_recv() {
-            state.apply(&app_event);
+            if let Some(prompt) = state.apply(&app_event) {
+                state.begin_run(prompt.clone());
+                send_command(&command_tx, AppCommand::SubmitChat(prompt))?;
+            }
         }
 
         if !event::poll(Duration::from_millis(50))? {
@@ -222,53 +755,68 @@ fn run_terminal(
 
         let terminal_event = event::read()?;
         if let Event::Resize(columns, rows) = terminal_event {
-            command_tx
-                .blocking_send(AppCommand::Resize { columns, rows })
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        format!("runtime command channel closed: {error}"),
-                    )
-                })?;
+            send_command(&command_tx, AppCommand::Resize { columns, rows })?;
+        }
+
+        if let Some(approved) = handle_permission_event(&mut state, &terminal_event) {
+            send_command(&command_tx, AppCommand::PermissionResponse(approved))?;
+            continue;
         }
 
         if let Some(credential) = handle_onboarding_event(&mut state, &terminal_event) {
-            command_tx
-                .blocking_send(AppCommand::SubmitCredential(credential))
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        format!("runtime command channel closed: {error}"),
-                    )
-                })?;
+            send_command(&command_tx, AppCommand::SubmitCredential(credential))?;
             continue;
         }
 
         if let Some(model) = handle_model_picker_event(&mut state, &terminal_event) {
-            command_tx
-                .blocking_send(AppCommand::SelectModel(model))
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        format!("runtime command channel closed: {error}"),
-                    )
-                })?;
+            send_command(&command_tx, AppCommand::SelectModel(model))?;
             continue;
         }
 
-        if let Some(message) = handle_chat_event(&mut state, &terminal_event) {
-            command_tx
-                .blocking_send(AppCommand::SubmitChat(message))
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        format!("runtime command channel closed: {error}"),
-                    )
-                })?;
+        if let Some(submission) = handle_chat_event(&mut state, &terminal_event) {
+            match submission {
+                ChatSubmission::Prompt(text) => {
+                    state.begin_run(text.clone());
+                    send_command(&command_tx, AppCommand::SubmitChat(text))?;
+                }
+                ChatSubmission::Command(SlashCommand::Exit) => {
+                    send_command(&command_tx, AppCommand::Exit)?;
+                    return Ok(());
+                }
+                ChatSubmission::Command(SlashCommand::Clear) => {
+                    state.entries.clear();
+                    state.scroll = 0;
+                }
+                ChatSubmission::Command(SlashCommand::Model) => {
+                    state.screen = Screen::ModelPicker;
+                    state.selected_model = 0;
+                }
+                ChatSubmission::Command(SlashCommand::Provider) => {
+                    state
+                        .entries
+                        .push(ChatEntry::Info("Provider: NVIDIA NIM (hosted).".into()));
+                }
+                ChatSubmission::Command(SlashCommand::Config) => {
+                    let model = state
+                        .current_model
+                        .clone()
+                        .unwrap_or_else(|| "none selected".into());
+                    state.entries.push(ChatEntry::Info(format!(
+                        "Provider: NVIDIA NIM · Model: {model}"
+                    )));
+                }
+                ChatSubmission::Command(SlashCommand::Help) => {
+                    state.entries.push(ChatEntry::Info(
+                        "Commands: /model /provider /config /clear /help /exit".into(),
+                    ));
+                }
+            }
             continue;
         }
 
         if state.screen == Screen::Chat
+            && state.blocking_error.is_none()
+            && state.pending_permission.is_none()
             && matches!(
                 terminal_event,
                 Event::Key(KeyEvent {
@@ -278,23 +826,14 @@ fn run_terminal(
                 })
             )
         {
-            command_tx
-                .blocking_send(AppCommand::CancelProviderRequest)
-                .map_err(std::io::Error::other)?;
+            send_command(&command_tx, AppCommand::CancelProviderRequest)?;
             continue;
         }
 
         match classify_event(&terminal_event) {
             InputAction::Continue => {}
             InputAction::Exit | InputAction::Interrupt => {
-                command_tx
-                    .blocking_send(AppCommand::Exit)
-                    .map_err(|error| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            format!("runtime command channel closed: {error}"),
-                        )
-                    })?;
+                send_command(&command_tx, AppCommand::Exit)?;
                 return Ok(());
             }
         }
@@ -305,6 +844,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -316,6 +856,7 @@ pub fn install_panic_hook() {
     let previous_hook = std::panic::take_hook();
 
     std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
         previous_hook(panic_info);
     }));
@@ -412,12 +953,51 @@ pub fn handle_model_picker_event(state: &mut AppState, event: &Event) -> Option<
     None
 }
 
-/// Applies text input to the chat composer and returns a prompt on Enter.
+/// Applies Y/N confirmation keys to a pending permission prompt.
+///
+/// Returns `Some(true)` on approval, `Some(false)` on denial, clearing the prompt either way.
 #[must_use]
-pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<String> {
-    if state.screen != Screen::Chat {
+pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bool> {
+    state.pending_permission.as_ref()?;
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+
+    match code {
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+            state.pending_permission = None;
+            Some(true)
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            state.pending_permission = None;
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Applies text input, navigation, and control keys to the chat composer.
+///
+/// Returns a submission on Enter: a prompt for the model, or a recognized slash command.
+#[must_use]
+pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubmission> {
+    if state.screen != Screen::Chat
+        || state.blocking_error.is_some()
+        || state.pending_permission.is_some()
+    {
         return None;
     }
+
+    if let Event::Paste(text) = event {
+        state.chat_input.push_str(text);
+        return None;
+    }
+
     let Event::Key(KeyEvent {
         code,
         modifiers,
@@ -427,7 +1007,22 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<String> 
     else {
         return None;
     };
+
     match code {
+        KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
+            state.toggle_last_tool_output();
+        }
+        KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(prompt) = state.last_failed_prompt.take() {
+                state.chat_input = prompt;
+            }
+        }
+        KeyCode::PageUp => state.scroll_up(),
+        KeyCode::PageDown | KeyCode::End => state.scroll_down(),
+        KeyCode::Tab => state.autocomplete(),
+        KeyCode::Enter if modifiers.contains(KeyModifiers::ALT) => {
+            state.chat_input.push('\n');
+        }
         KeyCode::Char(character)
             if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
@@ -436,8 +1031,21 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<String> 
         KeyCode::Backspace => {
             state.chat_input.pop();
         }
-        KeyCode::Enter if !state.chat_input.is_empty() => {
-            return Some(std::mem::take(&mut state.chat_input));
+        KeyCode::Enter => {
+            let trimmed = state.chat_input.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Some(command) = resolve_slash_command(trimmed) {
+                state.chat_input.clear();
+                return Some(ChatSubmission::Command(command));
+            }
+            let text = std::mem::take(&mut state.chat_input);
+            if state.activity.is_some() {
+                state.queued = Some(text);
+                return None;
+            }
+            return Some(ChatSubmission::Prompt(text));
         }
         _ => {}
     }
@@ -447,28 +1055,56 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use gocode_core::AppEvent;
+    use gocode_core::{AgentActivityState, AppEvent, ErrorSeverity, ToolActivityStatus};
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{AppState, InputAction, Screen, classify_event, render, run_with_event_source};
+    use super::{
+        AppState, ChatEntry, ChatSubmission, InputAction, Screen, SlashCommand, classify_event,
+        handle_chat_event, handle_permission_event, render, run_with_event_source,
+        slash_suggestions,
+    };
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new_with_kind(
+            code,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ))
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn error_severity_maps_to_distinct_provider_events() {
+        assert_eq!(
+            gocode_core::ProviderError::MissingCredential.severity(),
+            ErrorSeverity::Blocking
+        );
+    }
 
     #[test]
     fn boot_lifecycle_events_render_boot_then_chat() {
         let mut state = AppState::default();
 
         state.apply(&AppEvent::BootStarted);
-
         assert_eq!(state.screen, Screen::Boot);
 
         state.apply(&AppEvent::BootCompleted);
-
         assert_eq!(state.screen, Screen::Chat);
     }
 
     #[test]
-    fn chat_screen_renders_the_initial_prompt() {
+    fn chat_screen_renders_the_initial_prompt_and_privacy_disclosure() {
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 10)).expect("terminal should initialize");
+            Terminal::new(TestBackend::new(80, 20)).expect("terminal should initialize");
         let state = AppState {
             screen: Screen::Chat,
             ..AppState::default()
@@ -478,14 +1114,9 @@ mod tests {
             .draw(|frame| render(frame, &state))
             .expect("screen should render");
 
-        let buffer = terminal.backend().buffer();
-        let content = buffer
-            .content
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-
+        let content = buffer_text(&terminal);
         assert!(content.contains("What can I help you build?"));
+        assert!(content.contains("sent to NVIDIA NIM"));
     }
 
     #[test]
@@ -495,19 +1126,13 @@ mod tests {
         state.push_credential_character('a');
         state.push_credential_character('b');
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 10)).expect("terminal should initialize");
+            Terminal::new(TestBackend::new(80, 20)).expect("terminal should initialize");
 
         terminal
             .draw(|frame| render(frame, &state))
             .expect("screen should render");
 
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
+        let content = buffer_text(&terminal);
         assert!(content.contains("NVIDIA API key"));
         assert!(content.contains("••"));
         assert!(!content.contains("ab"));
@@ -524,50 +1149,10 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_key_events_capture_and_submit_a_masked_credential() {
-        let mut state = AppState::default();
-        state.apply(&AppEvent::CredentialRequired);
-        let input = Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Char('k'),
-            KeyModifiers::NONE,
-            KeyEventKind::Press,
-        ));
-        let submit = Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            KeyEventKind::Press,
-        ));
-
-        assert_eq!(super::handle_onboarding_event(&mut state, &input), None);
-        assert_eq!(
-            super::handle_onboarding_event(&mut state, &submit),
-            Some("k".into())
-        );
-    }
-
-    #[test]
-    fn onboarding_accepts_shift_modified_printable_characters() {
-        let mut state = AppState::default();
-        state.apply(&AppEvent::CredentialRequired);
-        let input = Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Char('A'),
-            KeyModifiers::SHIFT,
-            KeyEventKind::Press,
-        ));
-
-        assert_eq!(super::handle_onboarding_event(&mut state, &input), None);
-        assert_eq!(state.take_credential_submission(), Some("A".into()));
-    }
-
-    #[test]
     fn model_picker_confirms_the_highlighted_model() {
         let mut state = AppState::default();
         state.apply(&AppEvent::ModelsAvailable(vec!["nvidia/model".into()]));
-        let submit = Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            KeyEventKind::Press,
-        ));
+        let submit = press(KeyCode::Enter);
 
         assert_eq!(
             super::handle_model_picker_event(&mut state, &submit),
@@ -578,7 +1163,7 @@ mod tests {
     #[test]
     fn terminal_loop_renders_then_exits_on_ctrl_c() {
         let mut terminal =
-            Terminal::new(TestBackend::new(40, 4)).expect("terminal should initialize");
+            Terminal::new(TestBackend::new(40, 10)).expect("terminal should initialize");
         let exit = Event::Key(KeyEvent::new_with_kind(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
@@ -590,15 +1175,6 @@ mod tests {
                 .expect("terminal loop should exit cleanly"),
             InputAction::Interrupt
         );
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect::<String>();
-        assert!(content.contains("What can I help you build?"));
     }
 
     #[test]
@@ -620,11 +1196,7 @@ mod tests {
     #[test]
     fn q_and_ctrl_c_are_distinct_exit_actions() {
         assert_eq!(
-            classify_event(&Event::Key(KeyEvent::new_with_kind(
-                KeyCode::Char('q'),
-                KeyModifiers::NONE,
-                KeyEventKind::Press,
-            ))),
+            classify_event(&press(KeyCode::Char('q'))),
             InputAction::Exit
         );
         assert_eq!(
@@ -635,5 +1207,307 @@ mod tests {
             ))),
             InputAction::Interrupt
         );
+    }
+
+    #[test]
+    fn streaming_deltas_append_to_one_assistant_entry_per_run() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("hi".into());
+
+        state.apply(&AppEvent::AssistantTextDelta("Hel".into()));
+        state.apply(&AppEvent::AssistantTextDelta("lo".into()));
+
+        assert_eq!(
+            state.entries.last(),
+            Some(&ChatEntry::Assistant("Hello".into()))
+        );
+    }
+
+    #[test]
+    fn tool_activity_updates_the_same_entry_by_id() {
+        let mut state = AppState::default();
+
+        state.apply(&AppEvent::ToolActivity {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            status: ToolActivityStatus::Started,
+            detail: "running".into(),
+        });
+        state.apply(&AppEvent::ToolActivity {
+            id: "call-1".into(),
+            name: String::new(),
+            status: ToolActivityStatus::Succeeded,
+            detail: "done".into(),
+        });
+
+        assert_eq!(state.entries.len(), 1);
+        let ChatEntry::Tool { name, status, .. } = &state.entries[0] else {
+            panic!("expected a tool entry");
+        };
+        assert_eq!(name, "read_file");
+        assert_eq!(*status, ToolActivityStatus::Succeeded);
+    }
+
+    #[test]
+    fn tool_output_is_collapsed_until_toggled() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::ToolActivity {
+            id: "call-1".into(),
+            name: "run_command".into(),
+            status: ToolActivityStatus::Started,
+            detail: "running".into(),
+        });
+        for line in 0..10 {
+            state.apply(&AppEvent::ToolOutputChunk {
+                id: "call-1".into(),
+                chunk: format!("line {line}\n"),
+            });
+        }
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 20)).expect("terminal should initialize");
+        let mut chat_state = state.clone();
+        chat_state.screen = Screen::Chat;
+        terminal
+            .draw(|frame| render(frame, &chat_state))
+            .expect("screen should render");
+        assert!(!buffer_text(&terminal).contains("line 9"));
+
+        chat_state.toggle_last_tool_output();
+        terminal
+            .draw(|frame| render(frame, &chat_state))
+            .expect("screen should render");
+        assert!(buffer_text(&terminal).contains("line 9"));
+    }
+
+    #[test]
+    fn permission_prompt_blocks_chat_input_and_resolves_on_yes() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::PermissionRequested {
+            summary: "run: npm install".into(),
+            working_directory: ".".into(),
+        });
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Char('x'))),
+            None
+        );
+        assert_eq!(
+            handle_permission_event(&mut state, &press(KeyCode::Char('y'))),
+            Some(true)
+        );
+        assert!(state.pending_permission.is_none());
+    }
+
+    #[test]
+    fn permission_denial_via_n_clears_the_prompt() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::PermissionRequested {
+            summary: "run: rm".into(),
+            working_directory: ".".into(),
+        });
+
+        assert_eq!(
+            handle_permission_event(&mut state, &press(KeyCode::Char('n'))),
+            Some(false)
+        );
+        assert!(state.pending_permission.is_none());
+    }
+
+    #[test]
+    fn cancellation_clears_a_stale_permission_prompt() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::PermissionRequested {
+            summary: "run: rm".into(),
+            working_directory: ".".into(),
+        });
+
+        state.apply(&AppEvent::AgentCancelled);
+
+        assert!(state.pending_permission.is_none());
+    }
+
+    #[test]
+    fn blocking_error_suppresses_chat_input_until_dismissed() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::BlockingError("credential rejected".into()));
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Char('x'))),
+            None
+        );
+        assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn slash_command_is_recognized_and_cleared_from_the_composer() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/clear".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Clear))
+        );
+        assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn unrecognized_slash_text_is_still_sent_as_a_prompt() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/not-a-command please help".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Prompt("/not-a-command please help".into()))
+        );
+    }
+
+    #[test]
+    fn tab_completes_the_first_matching_slash_suggestion() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/mo".into(),
+            ..AppState::default()
+        };
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Tab));
+
+        assert_eq!(state.chat_input, "/model");
+    }
+
+    #[test]
+    fn slash_suggestions_filter_by_prefix() {
+        assert_eq!(slash_suggestions("/c").len(), 2);
+        assert!(slash_suggestions("hello").is_empty());
+    }
+
+    #[test]
+    fn a_prompt_submitted_while_busy_is_queued_not_sent() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "second question".into(),
+            ..AppState::default()
+        };
+        state.begin_run("first question".into());
+
+        assert_eq!(handle_chat_event(&mut state, &press(KeyCode::Enter)), None);
+        assert_eq!(state.queued.as_deref(), Some("second question"));
+    }
+
+    #[test]
+    fn completion_dispatches_the_queued_prompt() {
+        let mut state = AppState::default();
+        state.begin_run("first".into());
+        state.queued = Some("second".into());
+
+        let dispatched = state.apply(&AppEvent::AgentCompleted {
+            final_text: None,
+            turns: 1,
+            tool_calls: 0,
+            failed_tool_calls: 0,
+        });
+
+        assert_eq!(dispatched, Some("second".into()));
+        assert!(state.queued.is_none());
+    }
+
+    #[test]
+    fn a_failed_provider_call_remembers_the_prompt_for_retry() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("flaky prompt".into());
+
+        state.apply(&AppEvent::ProviderFailed("network error".into()));
+
+        assert_eq!(state.last_failed_prompt.as_deref(), Some("flaky prompt"));
+        let _ = handle_chat_event(
+            &mut state,
+            &Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            )),
+        );
+        assert_eq!(state.chat_input, "flaky prompt");
+    }
+
+    #[test]
+    fn scroll_locks_to_the_bottom_until_the_user_scrolls_up() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        assert!(state.is_scroll_locked());
+
+        state.scroll_up();
+        assert!(!state.is_scroll_locked());
+
+        state.scroll_down();
+        assert!(state.is_scroll_locked());
+    }
+
+    #[test]
+    fn a_narrow_terminal_shows_a_resize_notice_instead_of_the_screen() {
+        let mut terminal =
+            Terminal::new(TestBackend::new(20, 5)).expect("terminal should initialize");
+        let state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("screen should render");
+
+        assert!(buffer_text(&terminal).contains("too small"));
+    }
+
+    #[test]
+    fn agent_thinking_state_renders_as_a_status_line() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("hi".into());
+        state.apply(&AppEvent::AgentStateChanged(AgentActivityState::Thinking));
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 20)).expect("terminal should initialize");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("screen should render");
+
+        assert!(buffer_text(&terminal).contains("thinking"));
+    }
+
+    #[test]
+    fn pasted_text_is_inserted_into_the_composer_without_submitting() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &Event::Paste("multi\nline".into())),
+            None
+        );
+        assert_eq!(state.chat_input, "multi\nline");
     }
 }

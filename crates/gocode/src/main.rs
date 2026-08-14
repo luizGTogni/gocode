@@ -1,12 +1,183 @@
 //! Gocode application bootstrap.
 
+use std::{collections::HashMap, sync::Arc};
+
+use gocode_agent::{Agent, AgentEvent, AgentRequest};
 use gocode_core::{
     AppCommand, AppError, EnvironmentPaths, Platform, PlatformPaths, RuntimeChannels,
     bootstrap_with_paths,
 };
 use gocode_credentials::{CredentialStore, NativeCredentialStore, SecretString};
 use gocode_provider_nvidia::NvidiaProvider;
+use gocode_tools::{
+    ChangeKind, ToolRegistry, ToolStatus, builtin_registry,
+    permissions::{
+        DefaultPermissionPolicy, PermissionContext, PermissionRequest, PermissionResolver,
+        ResolveFuture,
+    },
+};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing_subscriber::prelude::*;
+
+/// Slot for the single active permission prompt, shared between the resolver and the command
+/// loop so a user response (or a run cancellation) can reach the waiting resolver future.
+type PendingPermission = Arc<Mutex<Option<oneshot::Sender<bool>>>>;
+
+/// [`PermissionResolver`] that shows the prompt in the TUI and waits for the user's answer.
+struct TuiPermissionResolver {
+    event_tx: mpsc::Sender<gocode_core::AppEvent>,
+    pending: PendingPermission,
+}
+
+impl PermissionResolver for TuiPermissionResolver {
+    fn resolve<'a>(&'a self, request: &'a PermissionRequest) -> ResolveFuture<'a> {
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            *self.pending.lock().await = Some(response_tx);
+
+            if self
+                .event_tx
+                .send(gocode_core::AppEvent::PermissionRequested {
+                    summary: request.summary.clone(),
+                    working_directory: request.working_directory.display().to_string(),
+                })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+
+            response_rx.await.unwrap_or(false)
+        })
+    }
+}
+
+/// Forwards one agent run's events to the interface, translating them to the provider-neutral
+/// [`gocode_core::AppEvent`] contract.
+async fn bridge_agent_events(
+    mut agent_events: mpsc::Receiver<AgentEvent>,
+    event_tx: mpsc::Sender<gocode_core::AppEvent>,
+) {
+    let mut streamed_any_text = false;
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut tools_with_output: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while let Some(event) = agent_events.recv().await {
+        let mapped = match event {
+            AgentEvent::Started | AgentEvent::ToolStarted(_) => None,
+            AgentEvent::StateChanged(state) => match state {
+                gocode_agent::AgentState::Inference => {
+                    Some(gocode_core::AppEvent::AgentStateChanged(
+                        gocode_core::AgentActivityState::Thinking,
+                    ))
+                }
+                gocode_agent::AgentState::ExecutingTools
+                | gocode_agent::AgentState::WaitingForPermission => {
+                    Some(gocode_core::AppEvent::AgentStateChanged(
+                        gocode_core::AgentActivityState::RunningTools,
+                    ))
+                }
+                gocode_agent::AgentState::Idle
+                | gocode_agent::AgentState::Preparing
+                | gocode_agent::AgentState::Finalizing
+                | gocode_agent::AgentState::Completed
+                | gocode_agent::AgentState::Cancelled
+                | gocode_agent::AgentState::Failed => None,
+            },
+            AgentEvent::TextDelta(delta) => {
+                streamed_any_text = true;
+                Some(gocode_core::AppEvent::AssistantTextDelta(delta))
+            }
+            AgentEvent::ToolRequested(call) => {
+                let id = call.id.as_str().to_string();
+                let name = call.name.as_str().to_string();
+                tool_names.insert(id.clone(), name.clone());
+                Some(gocode_core::AppEvent::ToolActivity {
+                    id,
+                    name,
+                    status: gocode_core::ToolActivityStatus::Started,
+                    detail: "running".into(),
+                })
+            }
+            AgentEvent::ToolOutputChunk { id, chunk } => {
+                let id = id.as_str().to_string();
+                tools_with_output.insert(id.clone());
+                Some(gocode_core::AppEvent::ToolOutputChunk { id, chunk })
+            }
+            AgentEvent::ToolFinished(result) => {
+                let id = result.call_id.as_str().to_string();
+                let name = tool_names.get(&id).cloned().unwrap_or_default();
+                let status = match result.status {
+                    ToolStatus::Success => gocode_core::ToolActivityStatus::Succeeded,
+                    ToolStatus::Failed => gocode_core::ToolActivityStatus::Failed,
+                    ToolStatus::Cancelled => gocode_core::ToolActivityStatus::Cancelled,
+                    ToolStatus::Denied => gocode_core::ToolActivityStatus::Denied,
+                };
+                if !tools_with_output.contains(&id) && !result.output.content.is_empty() {
+                    let _ = event_tx
+                        .send(gocode_core::AppEvent::ToolOutputChunk {
+                            id: id.clone(),
+                            chunk: result.output.content.clone(),
+                        })
+                        .await;
+                }
+                Some(gocode_core::AppEvent::ToolActivity {
+                    id,
+                    name,
+                    status,
+                    detail: first_line(&result.output.content, 96),
+                })
+            }
+            AgentEvent::FileChanged(change) => Some(gocode_core::AppEvent::FileChanged {
+                path: change.path.display().to_string(),
+                kind: match change.kind {
+                    ChangeKind::Created => "created",
+                    ChangeKind::Modified => "modified",
+                    ChangeKind::Deleted => "deleted",
+                }
+                .to_string(),
+            }),
+            AgentEvent::Warning(warning) => Some(gocode_core::AppEvent::AgentWarning(
+                describe_warning(&warning),
+            )),
+            AgentEvent::Completed(completion) => Some(gocode_core::AppEvent::AgentCompleted {
+                final_text: (!streamed_any_text).then_some(completion.final_text),
+                turns: completion.stats.turns,
+                tool_calls: completion.stats.tool_calls,
+                failed_tool_calls: completion.stats.failed_tool_calls,
+            }),
+            AgentEvent::Cancelled => Some(gocode_core::AppEvent::AgentCancelled),
+        };
+
+        if let Some(mapped) = mapped
+            && event_tx.send(mapped).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn describe_warning(warning: &gocode_agent::AgentWarning) -> String {
+    match warning {
+        gocode_agent::AgentWarning::UnknownTool(name) => {
+            format!("The model requested an unavailable tool: {name}")
+        }
+        gocode_agent::AgentWarning::LoopDetected(name) => {
+            format!("Stopped a repeating tool call: {name}")
+        }
+    }
+}
+
+fn first_line(text: &str, max_chars: usize) -> String {
+    let first = text.lines().next().unwrap_or_default();
+    if first.chars().count() > max_chars {
+        format!("{}…", first.chars().take(max_chars).collect::<String>())
+    } else if first.is_empty() {
+        "done".into()
+    } else {
+        first.into()
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -44,17 +215,23 @@ async fn run_application() -> Result<(), AppError> {
         let credential_store = NativeCredentialStore::new();
         let mut provider = None;
         let mut selected_model = None;
+        let mut model_catalog: Vec<gocode_core::Model> = Vec::new();
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
+        let tool_registry: Arc<ToolRegistry> = Arc::new(builtin_registry());
+        let permission_pending: PendingPermission = Arc::new(Mutex::new(None));
+        let instructions =
+            std::fs::read_to_string(bootstrap.project.gocode_dir.join("instructions.md")).ok();
 
         if let Some(key) = environment_credential {
             let candidate = NvidiaProvider::hosted(SecretString::new(key));
             match candidate.list_models().await {
                 Ok(models) => {
                     let model_ids = models
-                        .into_iter()
+                        .iter()
                         .map(|model| model.id.as_str().into())
                         .collect();
+                    model_catalog = models;
                     provider = Some(candidate);
                     driver
                         .event_tx
@@ -120,9 +297,10 @@ async fn run_application() -> Result<(), AppError> {
                                 driver.event_tx.send(gocode_core::AppEvent::ProviderFailed(format!("Credential validated but could not be saved securely: {error:?}"))).await.map_err(|send_error| AppError::Initialization(format!("could not report credential-store failure: {send_error}")))?;
                             }
                             let model_ids = models
-                                .into_iter()
+                                .iter()
                                 .map(|model| model.id.as_str().into())
                                 .collect();
+                            model_catalog = models;
                             provider = Some(candidate);
                             driver
                                 .event_tx
@@ -175,47 +353,65 @@ async fn run_application() -> Result<(), AppError> {
                             })?;
                         continue;
                     };
+                    let tools_enabled = model_catalog
+                        .iter()
+                        .find(|candidate| candidate.id.as_str() == model)
+                        .is_some_and(|candidate| {
+                            candidate.capabilities.tools == gocode_core::ToolCapability::Supported
+                        });
+
                     let cancellation = gocode_core::CancellationToken::new();
                     active_cancellation = Some(cancellation.clone());
-                    let provider = provider.clone();
-                    let model = model.clone();
+                    let resolver = Arc::new(TuiPermissionResolver {
+                        event_tx: driver.event_tx.clone(),
+                        pending: permission_pending.clone(),
+                    });
+                    let permissions = PermissionContext::new(
+                        Arc::new(DefaultPermissionPolicy::editing()),
+                        resolver,
+                    );
+                    let agent = Agent::new(
+                        Arc::new(provider.clone()),
+                        tool_registry.clone(),
+                        permissions,
+                        gocode_agent::AgentLimits::default(),
+                    );
+                    let request = AgentRequest {
+                        prompt: message,
+                        model: gocode_core::ModelId::new(model.clone()),
+                        project_root: bootstrap.project.root.clone(),
+                        instructions: instructions.clone(),
+                        tools_enabled,
+                    };
                     let event_tx = driver.event_tx.clone();
+                    let (agent_events_tx, agent_events_rx) = mpsc::channel(64);
+                    tokio::spawn(bridge_agent_events(agent_events_rx, event_tx.clone()));
                     tokio::spawn(async move {
-                        let stream = provider
-                            .stream_chat(
-                                gocode_core::ChatRequest::single_user(model, message),
-                                cancellation,
-                            )
-                            .await;
-                        let Ok(mut stream) = stream else {
-                            let message = stream
-                                .expect_err("stream result is known to be an error")
-                                .to_string();
-                            let _ = event_tx
-                                .send(gocode_core::AppEvent::ProviderFailed(message))
-                                .await;
-                            return;
-                        };
-                        while let Some(event) = stream.recv().await {
-                            match event {
-                                Ok(gocode_core::ChatStreamEvent::TextDelta(delta)) => {
-                                    let _ = event_tx
-                                        .send(gocode_core::AppEvent::AssistantTextDelta(delta))
-                                        .await;
+                        if let Err(error) = agent.run(request, agent_events_tx, cancellation).await
+                        {
+                            match error {
+                                gocode_agent::AgentError::Cancelled => {}
+                                gocode_agent::AgentError::Provider(provider_error) => {
+                                    let event = match provider_error.severity() {
+                                        gocode_core::ErrorSeverity::Blocking => {
+                                            gocode_core::AppEvent::BlockingError(
+                                                provider_error.to_string(),
+                                            )
+                                        }
+                                        gocode_core::ErrorSeverity::Recoverable => {
+                                            gocode_core::AppEvent::ProviderFailed(
+                                                provider_error.to_string(),
+                                            )
+                                        }
+                                    };
+                                    let _ = event_tx.send(event).await;
                                 }
-                                Ok(
-                                    gocode_core::ChatStreamEvent::RequestId(_)
-                                    | gocode_core::ChatStreamEvent::ToolCallDelta(_)
-                                    | gocode_core::ChatStreamEvent::Usage(_)
-                                    | gocode_core::ChatStreamEvent::Finished(_),
-                                ) => {}
-                                Err(_) => {
+                                other => {
                                     let _ = event_tx
-                                        .send(gocode_core::AppEvent::ProviderFailed(
-                                            "NVIDIA stream ended unexpectedly.".into(),
+                                        .send(gocode_core::AppEvent::AgentWarning(
+                                            other.to_string(),
                                         ))
                                         .await;
-                                    return;
                                 }
                             }
                         }
@@ -224,6 +420,14 @@ async fn run_application() -> Result<(), AppError> {
                 AppCommand::CancelProviderRequest => {
                     if let Some(cancellation) = active_cancellation.take() {
                         cancellation.cancel();
+                    }
+                    if let Some(pending) = permission_pending.lock().await.take() {
+                        let _ = pending.send(false);
+                    }
+                }
+                AppCommand::PermissionResponse(approved) => {
+                    if let Some(pending) = permission_pending.lock().await.take() {
+                        let _ = pending.send(approved);
                     }
                 }
             }

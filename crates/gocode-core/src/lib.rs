@@ -13,6 +13,8 @@ pub enum AppCommand {
     SubmitChat(String),
     /// Cancel the current provider request while retaining the application session.
     CancelProviderRequest,
+    /// Answer the single active permission prompt: `true` approves, `false` denies.
+    PermissionResponse(bool),
 }
 
 /// Fact emitted by the application runtime and rendered by an interface.
@@ -36,8 +38,111 @@ pub enum AppEvent {
     ModelSelected(String),
     /// Incremental assistant text normalized from the provider stream.
     AssistantTextDelta(String),
-    /// The provider request ended with a safe, user-actionable error.
+    /// The provider request ended with a safe, user-actionable error; recoverable inline.
     ProviderFailed(String),
+    /// An error severe enough to require a blocking acknowledgement before work continues.
+    BlockingError(String),
+    /// The agent run's lifecycle state changed.
+    AgentStateChanged(AgentActivityState),
+    /// The model requested a tool call.
+    ToolActivity {
+        /// Correlation id shared by the matching start/finish pair.
+        id: String,
+        /// Model-facing tool name.
+        name: String,
+        /// Current lifecycle status of the call.
+        status: ToolActivityStatus,
+        /// Short human-readable summary of the action or outcome.
+        detail: String,
+    },
+    /// An incremental chunk of tool output (typically `run_command`).
+    ToolOutputChunk {
+        /// Correlation id of the tool call this chunk belongs to.
+        id: String,
+        /// Raw chunk content.
+        chunk: String,
+    },
+    /// A tool call affected a workspace file.
+    FileChanged {
+        /// Workspace-relative path.
+        path: String,
+        /// `created`, `modified`, or `deleted`.
+        kind: String,
+    },
+    /// A non-fatal condition worth surfacing to the user.
+    AgentWarning(String),
+    /// The agent asks the user to approve or deny one action before it proceeds.
+    PermissionRequested {
+        /// Short summary of the requested action.
+        summary: String,
+        /// Working directory the action would run or write in.
+        working_directory: String,
+    },
+    /// The agent run finished normally.
+    AgentCompleted {
+        /// The model's final visible response, present only when no delta was streamed.
+        final_text: Option<String>,
+        /// Number of inference turns consumed.
+        turns: usize,
+        /// Number of tool calls attempted.
+        tool_calls: usize,
+        /// Number of tool calls that did not succeed.
+        failed_tool_calls: usize,
+    },
+    /// The agent run was cancelled by the user.
+    AgentCancelled,
+}
+
+/// Coarse lifecycle phase of an active agent run, for a concise status indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentActivityState {
+    /// Waiting on the model for the next turn.
+    Thinking,
+    /// Running one or more tool calls.
+    RunningTools,
+}
+
+/// Lifecycle status of one tool call, as shown to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolActivityStatus {
+    /// Execution began.
+    Started,
+    /// Execution completed successfully.
+    Succeeded,
+    /// Execution completed unsuccessfully.
+    Failed,
+    /// The user or permission policy denied the action.
+    Denied,
+    /// Execution was cancelled.
+    Cancelled,
+}
+
+/// Severity of a normalized error, used to decide inline vs. blocking presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorSeverity {
+    /// Safe to show inline; the user can keep working.
+    Recoverable,
+    /// Serious enough to require acknowledgement before continuing.
+    Blocking,
+}
+
+impl ProviderError {
+    /// Classifies how urgently this error needs the user's attention.
+    #[must_use]
+    pub const fn severity(&self) -> ErrorSeverity {
+        match self {
+            Self::MissingCredential | Self::InvalidCredential => ErrorSeverity::Blocking,
+            Self::Network(_)
+            | Self::Timeout
+            | Self::RateLimited
+            | Self::ModelNotFound(_)
+            | Self::UnsupportedCapability(_)
+            | Self::InvalidRequest(_)
+            | Self::InvalidResponse(_)
+            | Self::Server { .. }
+            | Self::Cancelled => ErrorSeverity::Recoverable,
+        }
+    }
 }
 
 /// TUI-facing halves of the bounded runtime channels.
@@ -160,6 +265,30 @@ mod tests {
 
         assert_eq!(command, AppCommand::Exit);
         assert_eq!(event, AppEvent::BootStarted);
+    }
+
+    #[test]
+    fn credential_and_authentication_failures_are_blocking() {
+        assert_eq!(
+            super::ProviderError::MissingCredential.severity(),
+            super::ErrorSeverity::Blocking
+        );
+        assert_eq!(
+            super::ProviderError::InvalidCredential.severity(),
+            super::ErrorSeverity::Blocking
+        );
+    }
+
+    #[test]
+    fn transient_provider_failures_are_recoverable_inline() {
+        assert_eq!(
+            super::ProviderError::Timeout.severity(),
+            super::ErrorSeverity::Recoverable
+        );
+        assert_eq!(
+            super::ProviderError::RateLimited.severity(),
+            super::ErrorSeverity::Recoverable
+        );
     }
 
     #[test]
