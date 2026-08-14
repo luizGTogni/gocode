@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-keyring = { version = "3.6", features = ["windows-native", "sync-secret-service"] }
+keyring = { version = "3.6", features = ["windows-native", "sync-secret-service", "vendored"] }
 
 [lints]
 workspace = true
