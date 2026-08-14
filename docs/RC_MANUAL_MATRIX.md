@@ -1,4 +1,4 @@
-# v0.0.9 release-candidate manual matrix
+# v0.0.10 release-candidate manual matrix
 
 Record the runner or device, date, Gocode revision, terminal, and pass/fail
 result for every row before v0.1.0. A failure involving crash, data corruption,

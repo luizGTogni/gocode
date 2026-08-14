@@ -1,6 +1,6 @@
 # Release notes
 
-## v0.0.9 — Release Candidate
+## v0.0.10 — Release Candidate
 
 This release candidate packages the complete Gocode MVP for Windows x86_64 and
 Linux x86_64. It introduces deterministic release archives, checksums, install
