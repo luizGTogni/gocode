@@ -709,6 +709,10 @@ fn restrict_directory_permissions(directory: &Path) -> Result<(), AppError> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the platform-neutral caller propagates filesystem permission errors on Unix"
+)]
 fn restrict_directory_permissions(_directory: &Path) -> Result<(), AppError> {
     Ok(())
 }
