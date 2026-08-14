@@ -1,14 +1,22 @@
 /// Intent emitted by an interface and handled by the application runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     /// Request an orderly application shutdown.
     Exit,
     /// Notify the runtime that the terminal viewport changed dimensions.
     Resize { columns: u16, rows: u16 },
+    /// Submit an API key held only in memory for immediate provider validation.
+    SubmitCredential(String),
+    /// Choose one discovered provider model for the current user profile.
+    SelectModel(String),
+    /// Send a user message using the currently selected model.
+    SubmitChat(String),
+    /// Cancel the current provider request while retaining the application session.
+    CancelProviderRequest,
 }
 
 /// Fact emitted by the application runtime and rendered by an interface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppEvent {
     /// Application bootstrap has begun.
     BootStarted,
@@ -16,6 +24,20 @@ pub enum AppEvent {
     BootCompleted,
     /// Confirm the terminal viewport dimensions known by the runtime.
     TerminalResized { columns: u16, rows: u16 },
+    /// NVIDIA requires a credential before provider work can start.
+    CredentialRequired,
+    /// Credential validation is running outside the rendering path.
+    CredentialValidationStarted,
+    /// Credential validation failed with a safe, user-actionable message.
+    CredentialValidationFailed(String),
+    /// Authenticated model discovery completed successfully.
+    ModelsAvailable(Vec<String>),
+    /// A model has been selected and chat can accept a prompt.
+    ModelSelected(String),
+    /// Incremental assistant text normalized from the provider stream.
+    AssistantTextDelta(String),
+    /// The provider request ended with a safe, user-actionable error.
+    ProviderFailed(String),
 }
 
 /// TUI-facing halves of the bounded runtime channels.
@@ -167,6 +189,32 @@ mod tests {
         assert_eq!(
             request.messages,
             vec![super::ChatMessage::User("Explique este código".into())]
+        );
+    }
+
+    #[test]
+    fn cancellation_token_is_shared_by_provider_work() {
+        let token = super::CancellationToken::new();
+        let provider_token = token.clone();
+
+        token.cancel();
+
+        assert!(provider_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn runtime_channel_transports_an_in_memory_credential_submission() {
+        let (client, mut driver) = RuntimeChannels::create();
+
+        client
+            .command_tx
+            .send(AppCommand::SubmitCredential("temporary-key".into()))
+            .await
+            .expect("credential submission should send");
+
+        assert_eq!(
+            driver.command_rx.recv().await,
+            Some(AppCommand::SubmitCredential("temporary-key".into()))
         );
     }
 
@@ -933,6 +981,24 @@ pub fn load_or_create_global_config(path: &Path) -> Result<GlobalConfig, AppErro
     }
 }
 
+/// Persists the selected provider and model without ever writing a credential.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be replaced atomically.
+pub fn save_global_model_selection(
+    path: &Path,
+    provider: &str,
+    model: &str,
+) -> Result<(), AppError> {
+    atomic_write(
+        path,
+        &format!(
+            "schema_version = 1\ndefault_provider = \"{provider}\"\ndefault_model = \"{model}\"\n"
+        ),
+    )
+}
+
 #[derive(Deserialize)]
 struct RawGlobalConfig {
     schema_version: u32,
@@ -1145,6 +1211,50 @@ pub struct ChatRequest {
     pub model: ModelId,
     /// Conversation history in role order.
     pub messages: Vec<ChatMessage>,
+}
+
+/// Cooperative cancellation signal shared by one provider operation and its caller.
+#[derive(Clone)]
+pub struct CancellationToken {
+    cancelled: tokio::sync::watch::Sender<bool>,
+    receiver: tokio::sync::watch::Receiver<bool>,
+}
+
+impl CancellationToken {
+    /// Creates a token that is initially active.
+    #[must_use]
+    pub fn new() -> Self {
+        let (cancelled, receiver) = tokio::sync::watch::channel(false);
+        Self {
+            cancelled,
+            receiver,
+        }
+    }
+
+    /// Requests cancellation of all work holding a clone of this token.
+    pub fn cancel(&self) {
+        let _ = self.cancelled.send(true);
+    }
+
+    /// Reports whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.receiver.borrow()
+    }
+
+    /// Waits until cancellation is requested.
+    pub async fn cancelled(&self) {
+        let mut receiver = self.receiver.clone();
+        if !*receiver.borrow() {
+            let _ = receiver.changed().await;
+        }
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChatRequest {

@@ -7,7 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+gocode-credentials = { path = "../gocode-credentials" }
 gocode-core = { path = "../gocode-core" }
+gocode-provider-nvidia = { path = "../gocode-provider-nvidia" }
 gocode-tui = { path = "../gocode-tui" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
