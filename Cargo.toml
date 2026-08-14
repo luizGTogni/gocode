@@ -4,6 +4,7 @@ members = [
     "crates/gocode-credentials",
     "crates/gocode-core",
     "crates/gocode-provider-nvidia",
+    "crates/gocode-tools",
     "crates/gocode-tui",
 ]
 resolver = "3"
