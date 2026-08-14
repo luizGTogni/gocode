@@ -140,6 +140,36 @@ mod tests {
         assert_eq!(event, AppEvent::BootStarted);
     }
 
+    #[test]
+    fn unknown_model_capabilities_are_conservative() {
+        let capabilities = super::ModelCapabilities::unknown();
+
+        assert!(capabilities.streaming);
+        assert_eq!(capabilities.tools, super::ToolCapability::Unsupported);
+        assert_eq!(
+            capabilities.thinking,
+            super::ThinkingCapability::Unsupported
+        );
+    }
+
+    #[test]
+    fn stream_events_keep_provider_wire_format_out_of_consumers() {
+        let event = super::ChatStreamEvent::TextDelta("Olá".into());
+
+        assert_eq!(event, super::ChatStreamEvent::TextDelta("Olá".into()));
+    }
+
+    #[test]
+    fn chat_request_keeps_model_and_user_message_provider_neutral() {
+        let request = super::ChatRequest::single_user("nvidia/model", "Explique este código");
+
+        assert_eq!(request.model.as_str(), "nvidia/model");
+        assert_eq!(
+            request.messages,
+            vec![super::ChatMessage::User("Explique este código".into())]
+        );
+    }
+
     #[tokio::test]
     async fn runtime_channels_deliver_commands_and_events() {
         let (mut client, mut driver) = RuntimeChannels::create();
@@ -1033,3 +1063,120 @@ impl fmt::Display for AppError {
 }
 
 impl std::error::Error for AppError {}
+
+/// Provider-neutral capabilities resolved for a model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    /// Whether the provider can return incremental text for this model.
+    pub streaming: bool,
+    /// Whether function tools may be sent to the model.
+    pub tools: ToolCapability,
+    /// Whether reasoning controls are available for the model.
+    pub thinking: ThinkingCapability,
+}
+
+impl ModelCapabilities {
+    /// Uses only the behavior that can be safely assumed for an unrecognized model.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            streaming: true,
+            tools: ToolCapability::Unsupported,
+            thinking: ThinkingCapability::Unsupported,
+        }
+    }
+}
+
+/// A provider-neutral incremental event emitted while a chat request is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatStreamEvent {
+    /// Additional visible assistant text.
+    TextDelta(String),
+    /// A provider request identifier safe to retain for diagnostics.
+    RequestId(String),
+    /// The provider ended the response normally.
+    Completed,
+}
+
+/// A provider-independent identifier for a catalog model.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelId(String);
+
+impl ModelId {
+    /// Creates a model identifier from the provider's canonical name.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the canonical provider model name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One provider catalog model with normalized, safely resolved capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Model {
+    /// The provider's canonical identifier.
+    pub id: ModelId,
+    /// A UI-safe label, initially equal to the canonical identifier when no metadata exists.
+    pub display_name: String,
+    /// Capabilities resolved without guessing unsupported behavior.
+    pub capabilities: ModelCapabilities,
+}
+
+/// A role-tagged normalized conversation message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatMessage {
+    /// A system instruction.
+    System(String),
+    /// A user-authored request.
+    User(String),
+    /// An assistant response retained for a subsequent request.
+    Assistant(String),
+}
+
+/// A normalized request for streamed chat inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatRequest {
+    /// The selected catalog model.
+    pub model: ModelId,
+    /// Conversation history in role order.
+    pub messages: Vec<ChatMessage>,
+}
+
+impl ChatRequest {
+    /// Creates the smallest chat request: one selected model and one user message.
+    #[must_use]
+    pub fn single_user(model: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            model: ModelId::new(model),
+            messages: vec![ChatMessage::User(message.into())],
+        }
+    }
+}
+
+/// Whether a model can use function tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCapability {
+    /// Tool support is absent or cannot be established safely.
+    Unsupported,
+    /// Tool support is known for the selected model.
+    Supported,
+}
+
+/// Supported normalized reasoning controls for a model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThinkingCapability {
+    /// No reasoning-specific request fields may be sent.
+    Unsupported,
+    /// The model accepts one of the listed provider-defined effort names.
+    Effort {
+        /// Accepted provider-defined effort names.
+        levels: Vec<String>,
+        /// Provider-recommended default, when known.
+        default: Option<String>,
+    },
+}

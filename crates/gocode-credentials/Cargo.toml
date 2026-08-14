@@ -1,0 +1,13 @@
+[package]
+name = "gocode-credentials"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+keyring = { version = "3.6", features = ["windows-native", "sync-secret-service"] }
+
+[lints]
+workspace = true

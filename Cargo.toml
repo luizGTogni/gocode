@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "crates/gocode",
+    "crates/gocode-credentials",
     "crates/gocode-core",
+    "crates/gocode-provider-nvidia",
     "crates/gocode-tui",
 ]
 resolver = "3"

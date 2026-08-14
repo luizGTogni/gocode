@@ -1080,7 +1080,7 @@ Initial state:
 
 | Milestone | Status |
 |---|---|
-| v0.0.1 — Foundation | In progress |
+| v0.0.1 — Foundation | Complete |
 | v0.0.2 — NVIDIA Vertical Slice | Planned |
 | v0.0.3 — Coding Tools | Planned |
 | v0.0.4 — Agent Loop | Planned |
