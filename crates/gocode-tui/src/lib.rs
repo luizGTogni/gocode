@@ -525,8 +525,6 @@ fn push_wrapped(lines: &mut Vec<String>, prefix: &str, text: &str) {
 pub enum InputAction {
     /// Keep the application running; a resize or non-actionable event may trigger a redraw.
     Continue,
-    /// Exit the application normally.
-    Exit,
     /// Interrupt active work before exiting the application.
     Interrupt,
 }
@@ -750,7 +748,7 @@ where
         let event = next_event()?;
         match classify_event(&event) {
             InputAction::Continue => {}
-            action @ (InputAction::Exit | InputAction::Interrupt) => return Ok(action),
+            action @ InputAction::Interrupt => return Ok(action),
         }
     }
 }
@@ -910,7 +908,7 @@ fn run_terminal(
 
         match classify_event(&terminal_event) {
             InputAction::Continue => {}
-            InputAction::Exit | InputAction::Interrupt => {
+            InputAction::Interrupt => {
                 send_command(&command_tx, AppCommand::Exit)?;
                 return Ok(());
             }
@@ -955,18 +953,6 @@ pub fn classify_event(event: &Event) -> InputAction {
         return InputAction::Interrupt;
     }
 
-    if matches!(
-        event,
-        Event::Key(KeyEvent {
-            code: KeyCode::Char('q'),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            ..
-        })
-    ) {
-        return InputAction::Exit;
-    }
-
     InputAction::Continue
 }
 
@@ -976,6 +962,11 @@ pub fn classify_event(event: &Event) -> InputAction {
 #[must_use]
 pub fn handle_onboarding_event(state: &mut AppState, event: &Event) -> Option<String> {
     if state.screen != Screen::Onboarding {
+        return None;
+    }
+
+    if let Event::Paste(text) = event {
+        state.credential_input.push_str(text);
         return None;
     }
 
@@ -1164,8 +1155,8 @@ mod tests {
 
     use super::{
         AppState, ChatEntry, ChatSubmission, InputAction, Screen, SlashCommand, classify_event,
-        handle_chat_event, handle_onboarding_event, handle_permission_event, handle_update_event, render,
-        run_with_event_source, slash_suggestions,
+        handle_chat_event, handle_onboarding_event, handle_permission_event, handle_update_event,
+        render, run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -1293,7 +1284,10 @@ mod tests {
             handle_onboarding_event(&mut state, &Event::Paste("nvapi-secret".into())),
             None
         );
-        assert_eq!(state.take_credential_submission(), Some("nvapi-secret".into()));
+        assert_eq!(
+            state.take_credential_submission(),
+            Some("nvapi-secret".into())
+        );
     }
 
     #[test]
@@ -1326,9 +1320,17 @@ mod tests {
     }
 
     #[test]
-    fn resize_and_key_release_do_not_exit_the_tui() {
+    fn resize_key_release_and_plain_q_do_not_exit_the_tui() {
         assert_eq!(
             classify_event(&Event::Resize(120, 40)),
+            InputAction::Continue
+        );
+        assert_eq!(
+            classify_event(&Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            ))),
             InputAction::Continue
         );
         assert_eq!(
@@ -1342,11 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn q_and_ctrl_c_are_distinct_exit_actions() {
-        assert_eq!(
-            classify_event(&press(KeyCode::Char('q'))),
-            InputAction::Exit
-        );
+    fn ctrl_c_is_the_global_exit_action() {
         assert_eq!(
             classify_event(&Event::Key(KeyEvent::new_with_kind(
                 KeyCode::Char('c'),
