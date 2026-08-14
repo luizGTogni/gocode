@@ -5,6 +5,11 @@ use std::collections::BTreeMap;
 use gocode_core::ToolCallDelta;
 use gocode_tools::{ToolCall, ToolCallId, ToolName};
 
+/// Resource limits for untrusted provider stream fragments. These are deliberately independent
+/// of model output claims, and keep an incomplete tool call from growing without bound.
+const MAX_PENDING_CALLS: usize = 32;
+const MAX_FIELD_BYTES: usize = 64 * 1024;
+
 /// Accumulates [`ToolCallDelta`] fragments, correlated by index, into complete [`ToolCall`]s.
 ///
 /// No partial call is ever handed to a tool: [`Self::finish`] is only called once a turn's
@@ -22,7 +27,28 @@ struct PendingCall {
 }
 
 impl ToolCallAssembler {
-    pub(crate) fn apply(&mut self, delta: ToolCallDelta) {
+    /// Returns `false` when the delta would exceed the fixed assembly budget. Callers must stop
+    /// the turn rather than executing a partial or truncated request.
+    pub(crate) fn apply(&mut self, delta: ToolCallDelta) -> bool {
+        if !self.pending.contains_key(&delta.index) && self.pending.len() >= MAX_PENDING_CALLS {
+            return false;
+        }
+        let current = self.pending.get(&delta.index);
+        if delta
+            .id
+            .as_ref()
+            .is_some_and(|id| id.len() > MAX_FIELD_BYTES)
+            || delta.name_delta.as_ref().is_some_and(|name| {
+                current.map_or(name.len(), |call| call.name.len() + name.len()) > MAX_FIELD_BYTES
+            })
+            || delta.arguments_delta.as_ref().is_some_and(|arguments| {
+                current.map_or(arguments.len(), |call| {
+                    call.arguments.len() + arguments.len()
+                }) > MAX_FIELD_BYTES
+            })
+        {
+            return false;
+        }
         let entry = self.pending.entry(delta.index).or_default();
         if let Some(id) = delta.id {
             entry.id = Some(id);
@@ -33,6 +59,7 @@ impl ToolCallAssembler {
         if let Some(arguments_delta) = delta.arguments_delta {
             entry.arguments.push_str(&arguments_delta);
         }
+        true
     }
 
     /// Finalizes every accumulated fragment into a complete tool call, in requested order.
@@ -69,18 +96,18 @@ mod tests {
     #[test]
     fn assembles_fragments_split_across_multiple_deltas() {
         let mut assembler = ToolCallAssembler::default();
-        assembler.apply(ToolCallDelta {
+        assert!(assembler.apply(ToolCallDelta {
             index: 0,
             id: Some("call-1".into()),
             name_delta: Some("read_file".into()),
             arguments_delta: Some(r#"{"path":"#.into()),
-        });
-        assembler.apply(ToolCallDelta {
+        }));
+        assert!(assembler.apply(ToolCallDelta {
             index: 0,
             id: None,
             name_delta: None,
             arguments_delta: Some(r#""a.rs"}"#.into()),
-        });
+        }));
 
         let calls = assembler.finish();
 
@@ -93,18 +120,18 @@ mod tests {
     #[test]
     fn preserves_requested_order_across_indices() {
         let mut assembler = ToolCallAssembler::default();
-        assembler.apply(ToolCallDelta {
+        assert!(assembler.apply(ToolCallDelta {
             index: 1,
             id: Some("call-b".into()),
             name_delta: Some("search".into()),
             arguments_delta: Some("{}".into()),
-        });
-        assembler.apply(ToolCallDelta {
+        }));
+        assert!(assembler.apply(ToolCallDelta {
             index: 0,
             id: Some("call-a".into()),
             name_delta: Some("list_files".into()),
             arguments_delta: Some("{}".into()),
-        });
+        }));
 
         let calls = assembler.finish();
 
@@ -115,15 +142,27 @@ mod tests {
     #[test]
     fn malformed_arguments_become_an_empty_object_instead_of_failing() {
         let mut assembler = ToolCallAssembler::default();
-        assembler.apply(ToolCallDelta {
+        assert!(assembler.apply(ToolCallDelta {
             index: 0,
             id: Some("call-1".into()),
             name_delta: Some("read_file".into()),
             arguments_delta: Some("not json".into()),
-        });
+        }));
 
         let calls = assembler.finish();
 
         assert_eq!(calls[0].arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn rejects_an_oversized_untrusted_tool_call_fragment() {
+        let mut assembler = ToolCallAssembler::default();
+        assert!(!assembler.apply(ToolCallDelta {
+            index: 0,
+            id: None,
+            name_delta: None,
+            arguments_delta: Some("x".repeat(super::MAX_FIELD_BYTES + 1)),
+        }));
+        assert!(assembler.finish().is_empty());
     }
 }

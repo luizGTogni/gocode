@@ -1,9 +1,9 @@
 //! Shared path validation, discovery, and atomic-write primitives used by every filesystem tool.
 
 use std::{
+    fs::OpenOptions,
     io::Write,
     path::{Component, Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::contract::ToolError;
@@ -190,18 +190,21 @@ pub fn atomic_write_file(path: &Path, contents: &str) -> Result<(), ToolError> {
     let file_name = path
         .file_name()
         .ok_or_else(|| ToolError::Io(format!("{} has no file name", path.display())))?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
+    // `create_new` is important here: a predictable temporary path combined with `create`
+    // would let another local process redirect or replace this write before the rename.
+    // Collisions fail closed, preserving the existing target for a later retry.
     let temp_path = path.with_file_name(format!(
-        ".{}.{}-{nonce}.tmp",
+        ".{}.{}-{}.tmp",
         file_name.to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        unique_suffix()
     ));
 
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&temp_path)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()
     })();
@@ -218,6 +221,15 @@ pub fn atomic_write_file(path: &Path, contents: &str) -> Result<(), ToolError> {
         let _ = std::fs::remove_file(&temp_path);
         ToolError::Io(format!("could not replace {}: {error}", path.display()))
     })
+}
+
+fn unique_suffix() -> u128 {
+    // A collision is harmless because `create_new` above refuses to reuse an existing file.
+    // The timestamp merely makes collisions vanishingly unlikely without relying on it for
+    // security or adding a temporary-file dependency to the tool contract.
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
 }
 
 #[cfg(test)]

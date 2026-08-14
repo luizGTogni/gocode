@@ -41,6 +41,8 @@ pub enum AgentLimit {
     ConsecutiveFailures,
     /// The same tool call failed with the same arguments repeatedly.
     RepeatedToolCall,
+    /// Provider stream data exceeded the bounded tool-call assembly budget.
+    ToolCallPayloadTooLarge,
 }
 
 impl fmt::Display for AgentLimit {
@@ -58,6 +60,9 @@ impl fmt::Display for AgentLimit {
             }
             Self::RepeatedToolCall => {
                 formatter.write_str("the same tool call repeated with the same arguments")
+            }
+            Self::ToolCallPayloadTooLarge => {
+                formatter.write_str("the provider sent an oversized tool-call payload")
             }
         }
     }

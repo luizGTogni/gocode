@@ -6,6 +6,9 @@ use gocode_core::{
 use gocode_credentials::SecretString;
 
 const HOSTED_BASE_URL: &str = "https://integrate.api.nvidia.com/";
+/// Maximum buffered bytes without an SSE newline. A provider response is untrusted input, so a
+/// malformed never-ending event must not consume an unbounded amount of memory.
+const MAX_PENDING_SSE_BYTES: usize = 1024 * 1024;
 
 /// HTTP client for NVIDIA NIM's hosted OpenAI-compatible API.
 #[derive(Clone)]
@@ -122,6 +125,14 @@ impl NvidiaProvider {
                     chunk = body.next() => match chunk {
                         Some(Ok(bytes)) => {
                             pending.push_str(&String::from_utf8_lossy(&bytes));
+                            if pending.len() > MAX_PENDING_SSE_BYTES {
+                                let _ = sender
+                                    .send(Err(ProviderError::InvalidResponse(
+                                        "stream event exceeded the maximum permitted size".into(),
+                                    )))
+                                    .await;
+                                return;
+                            }
                             while let Some(newline) = pending.find('\n') {
                                 let line = pending[..newline].trim_end_matches('\r').to_owned();
                                 pending.drain(..=newline);

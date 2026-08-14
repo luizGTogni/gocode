@@ -1229,7 +1229,12 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<(), AppError> {
     ));
 
     let write_result = (|| -> std::io::Result<()> {
-        let mut temporary_file = std::fs::File::create(&temporary_path)?;
+        // Never follow or overwrite a pre-created temporary path. If another process happens
+        // to collide with this name, fail safely and leave the existing configuration intact.
+        let mut temporary_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)?;
         temporary_file.write_all(contents.as_bytes())?;
         temporary_file.sync_all()
     })();

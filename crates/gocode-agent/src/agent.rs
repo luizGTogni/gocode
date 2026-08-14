@@ -250,7 +250,11 @@ impl Agent {
                         text.push_str(&delta);
                         let _ = events.send(AgentEvent::TextDelta(delta)).await;
                     }
-                    Some(Ok(ChatStreamEvent::ToolCallDelta(delta))) => assembler.apply(delta),
+                    Some(Ok(ChatStreamEvent::ToolCallDelta(delta))) => {
+                        if !assembler.apply(delta) {
+                            return Err(AgentError::LimitReached(AgentLimit::ToolCallPayloadTooLarge));
+                        }
+                    }
                     Some(Ok(ChatStreamEvent::Finished(FinishReason::Cancelled))) => {
                         return Err(AgentError::Cancelled);
                     }

@@ -127,12 +127,13 @@ impl GitHubReleaseSource {
     ///
     /// Returns an error when the endpoint URL or HTTP client is invalid.
     pub fn with_endpoint(endpoint: &str) -> Result<Self, UpdateError> {
+        let endpoint = official_download_url(endpoint)?;
         Ok(Self {
             client: reqwest::Client::builder()
                 .user_agent("gocode-updater")
                 .build()
                 .map_err(|e| UpdateError::Network(e.to_string()))?,
-            endpoint: Url::parse(endpoint).map_err(|e| UpdateError::Network(e.to_string()))?,
+            endpoint,
         })
     }
     /// # Errors
@@ -417,6 +418,11 @@ mod tests {
     fn only_https_urls_are_accepted() {
         assert!(official_download_url("http://example.test/a").is_err());
         assert!(official_download_url("https://example.test/a").is_ok());
+    }
+    #[test]
+    fn release_source_requires_an_https_endpoint() {
+        assert!(GitHubReleaseSource::with_endpoint("http://example.test/releases").is_err());
+        assert!(GitHubReleaseSource::with_endpoint("https://example.test/releases").is_ok());
     }
     #[test]
     fn checksum_parser_requires_a_valid_matching_hash() {
