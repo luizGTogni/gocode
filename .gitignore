@@ -192,6 +192,12 @@ dist/
 release/
 artifacts/
 
+# Release packaging scripts are source files, not generated artifacts.
+!scripts/
+!scripts/release/
+!scripts/release/package-linux.sh
+!scripts/release/package-windows.ps1
+
 *.zip
 *.tar
 *.tar.gz

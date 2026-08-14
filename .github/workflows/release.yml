@@ -46,11 +46,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Package Linux archive
         if: runner.os == 'Linux'
-        run: bash ${{ matrix.script }} dist
+        run: |
+          test -f "${{ matrix.script }}"
+          bash "${{ matrix.script }}" dist
       - name: Package Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./${{ matrix.script }} -OutputDirectory dist
+        run: |
+          $script = "${{ matrix.script }}"
+          if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
+            throw "Missing release packaging script: $script"
+          }
+          & "./$script" -OutputDirectory dist
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ runner.os }}
