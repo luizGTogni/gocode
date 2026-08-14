@@ -247,6 +247,11 @@ impl Agent {
                 () = cancellation.cancelled() => return Err(AgentError::Cancelled),
                 event = stream.recv() => match event {
                     Some(Ok(ChatStreamEvent::TextDelta(delta))) => {
+                        if text.chars().count().saturating_add(delta.chars().count())
+                            > self.limits.max_response_chars
+                        {
+                            return Err(AgentError::LimitReached(AgentLimit::ResponseTooLarge));
+                        }
                         text.push_str(&delta);
                         let _ = events.send(AgentEvent::TextDelta(delta)).await;
                     }

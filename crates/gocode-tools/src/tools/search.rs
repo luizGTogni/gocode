@@ -14,6 +14,8 @@ use crate::{
 
 /// Maximum bytes read per candidate file while searching for matches.
 const MAX_SEARCHED_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Maximum search matches retained from an untrusted tool request.
+const MAX_RESULTS: usize = 200;
 
 /// Searches project text for a literal query before reading whole files.
 pub struct SearchTool;
@@ -70,6 +72,7 @@ impl Tool for SearchTool {
                     "query must not be empty".into(),
                 ));
             }
+            let max_results = args.max_results.clamp(1, MAX_RESULTS);
 
             let entries = discover(&ctx.project_root, &args.path, None, usize::MAX)?;
             let mut matches = Vec::new();
@@ -116,27 +119,23 @@ impl Tool for SearchTool {
                             line_index + 1,
                             line.trim()
                         ));
-                        if matches.len() >= args.max_results {
+                        if matches.len() >= max_results {
                             break;
                         }
                     }
                 }
-                if matches.len() >= args.max_results {
+                if matches.len() >= max_results {
                     break;
                 }
             }
 
-            let truncated = matches.len() >= args.max_results;
+            let truncated = matches.len() >= max_results;
             let content = if matches.is_empty() {
                 format!("No matches found for `{}`.", args.query)
             } else {
                 let mut content = matches.join("\n");
                 if truncated {
-                    let _ = write!(
-                        content,
-                        "\n[Results truncated at {} matches.]",
-                        args.max_results
-                    );
+                    let _ = write!(content, "\n[Results truncated at {max_results} matches.]");
                 }
                 content
             };
@@ -274,6 +273,26 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(result.output.truncated);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn untrusted_max_results_is_capped_to_the_tool_limit() {
+        let root = fixture("untrusted-cap");
+        let content: String = (0..250).map(|_| "needle\n").collect();
+        fs::write(root.join("a.txt"), content).unwrap();
+
+        let result = SearchTool
+            .execute(
+                ctx(&root),
+                serde_json::json!({"query": "needle", "max_results": 10_000}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output.content.matches("a.txt:").count(), 200);
         assert!(result.output.truncated);
 
         fs::remove_dir_all(root).unwrap();

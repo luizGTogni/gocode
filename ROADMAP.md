@@ -1087,7 +1087,7 @@ Initial state:
 | v0.0.5 — Product UX                      | Complete |
 | v0.0.6 — Updater                         | Complete |
 | v0.0.7 — Security and Platform Hardening | Complete |
-| v0.0.8 — Stability                       | Planned  |
+| v0.0.8 — Stability                       | Complete |
 | v0.0.9 — Release Candidate               | Planned  |
 | v0.1.0 — MVP Release                     | Planned  |
 

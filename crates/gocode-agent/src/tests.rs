@@ -455,6 +455,40 @@ async fn provider_failure_ends_the_run_with_a_provider_error() {
 }
 
 #[tokio::test]
+async fn oversized_streamed_text_stops_the_run_before_retaining_unbounded_output() {
+    let root = fixture("oversized-text");
+    let provider = FakeProvider::script(vec![vec![
+        Ok(ChatStreamEvent::TextDelta("abcd".into())),
+        Ok(ChatStreamEvent::TextDelta("ef".into())),
+    ]]);
+    let (tx, _rx) = mpsc::channel(8);
+    let agent = Agent::new(
+        Arc::new(provider),
+        Arc::new(ToolRegistry::new()),
+        PermissionContext::read_only_default(),
+        AgentLimits {
+            max_response_chars: 5,
+            ..AgentLimits::default()
+        },
+    );
+
+    let outcome = agent
+        .run(
+            request(&root, "produce too much text"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(AgentError::LimitReached(AgentLimit::ResponseTooLarge))
+    ));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn cancellation_before_the_run_starts_stops_it_immediately() {
     let root = fixture("cancelled");
     let provider = FakeProvider::script(vec![text_turn("should never be read")]);

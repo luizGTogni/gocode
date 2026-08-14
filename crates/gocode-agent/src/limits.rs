@@ -7,6 +7,8 @@ use std::fmt;
 /// See `docs/AGENT.md` §53–57. The defaults are starting guidelines, not tuned values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLimits {
+    /// Maximum number of UTF-8 scalar values retained from one provider response.
+    pub max_response_chars: usize,
     /// Maximum number of inference turns before the run stops.
     pub max_turns: usize,
     /// Maximum number of tool calls across the whole run.
@@ -20,6 +22,7 @@ pub struct AgentLimits {
 impl Default for AgentLimits {
     fn default() -> Self {
         Self {
+            max_response_chars: 64 * 1024,
             max_turns: 20,
             max_total_tool_calls: 50,
             max_tool_calls_per_turn: 10,
@@ -31,6 +34,8 @@ impl Default for AgentLimits {
 /// The specific limit an agent run stopped against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentLimit {
+    /// Provider stream text exceeded the response budget.
+    ResponseTooLarge,
     /// [`AgentLimits::max_turns`] was reached.
     MaxTurns,
     /// [`AgentLimits::max_total_tool_calls`] was reached.
@@ -48,6 +53,9 @@ pub enum AgentLimit {
 impl fmt::Display for AgentLimit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ResponseTooLarge => {
+                formatter.write_str("the provider response exceeded the maximum size")
+            }
             Self::MaxTurns => formatter.write_str("the maximum number of turns was reached"),
             Self::MaxTotalToolCalls => {
                 formatter.write_str("the maximum number of tool calls was reached")
