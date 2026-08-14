@@ -669,10 +669,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gocode-agent"
+version = "0.0.1"
+dependencies = [
+ "gocode-core",
+ "gocode-tools",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "gocode-core"
 version = "0.0.1"
 dependencies = [
  "serde",
+ "serde_json",
  "tokio",
  "toml",
 ]

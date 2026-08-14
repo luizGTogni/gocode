@@ -654,8 +654,10 @@ mod tests {
 }
 use std::{
     fmt,
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
+    pin::Pin,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -1158,10 +1160,61 @@ impl ModelCapabilities {
 pub enum ChatStreamEvent {
     /// Additional visible assistant text.
     TextDelta(String),
+    /// An incremental fragment of one tool call, correlated by `index` until assembled.
+    ToolCallDelta(ToolCallDelta),
     /// A provider request identifier safe to retain for diagnostics.
     RequestId(String),
-    /// The provider ended the response normally.
-    Completed,
+    /// Token accounting for the turn, when the provider reports it.
+    Usage(Usage),
+    /// The provider ended the response, with a normalized reason.
+    Finished(FinishReason),
+}
+
+/// One incremental fragment of a streamed tool call.
+///
+/// Providers that stream tool calls (rather than delivering them whole) split the call's `id`,
+/// function name, and JSON arguments across multiple deltas correlated by `index`. A
+/// provider-specific assembler accumulates these into a complete call before the Agent executes
+/// it; no partial call is ever executed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolCallDelta {
+    /// Position of this call among the tool calls requested in the current turn.
+    pub index: usize,
+    /// The call's correlation identifier, present on the first fragment.
+    pub id: Option<String>,
+    /// Additional characters of the tool name, if the provider streams it incrementally.
+    pub name_delta: Option<String>,
+    /// Additional characters of the JSON-encoded arguments.
+    pub arguments_delta: Option<String>,
+}
+
+/// Normalized token accounting for one provider turn. Fields remain optional because not every
+/// provider reports every count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Usage {
+    /// Tokens consumed by the request (system, history, and tool definitions).
+    pub input_tokens: Option<u64>,
+    /// Tokens produced in the response.
+    pub output_tokens: Option<u64>,
+    /// Tokens attributed to internal reasoning, when the provider separates them.
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Why the provider stopped generating for the current turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model produced a complete response with no pending tool calls.
+    Stop,
+    /// The model is requesting one or more tool calls before it can continue.
+    ToolCalls,
+    /// Generation stopped because an output or context limit was reached.
+    Length,
+    /// The request was cancelled before the provider finished.
+    Cancelled,
+    /// The provider's content filter stopped generation.
+    ContentFilter,
+    /// A provider-specific reason with no normalized equivalent.
+    Other(String),
 }
 
 /// A provider-independent identifier for a catalog model.
@@ -1194,23 +1247,75 @@ pub struct Model {
 }
 
 /// A role-tagged normalized conversation message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Assistant` and `Tool` carry the fields needed to keep a multi-turn tool-calling
+/// conversation coherent: an assistant turn may request tool calls alongside (or instead of)
+/// visible text, and a tool turn must be correlated back to the call it answers.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatMessage {
     /// A system instruction.
     System(String),
     /// A user-authored request.
     User(String),
     /// An assistant response retained for a subsequent request.
-    Assistant(String),
+    Assistant {
+        /// Visible assistant text produced this turn, if any.
+        text: Option<String>,
+        /// Tool calls requested this turn, in requested order.
+        tool_calls: Vec<ProviderToolCall>,
+    },
+    /// The result of one tool call, returned to the model.
+    Tool {
+        /// Correlation identifier copied from the originating [`ProviderToolCall`].
+        tool_call_id: String,
+        /// Model-facing result content.
+        content: String,
+    },
+}
+
+impl ChatMessage {
+    /// Creates a text-only assistant message with no tool calls.
+    #[must_use]
+    pub fn assistant_text(text: impl Into<String>) -> Self {
+        Self::Assistant {
+            text: Some(text.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+}
+
+/// A normalized tool call requested by the model during a chat turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderToolCall {
+    /// Correlation identifier assigned by the provider.
+    pub id: String,
+    /// Name of the requested tool.
+    pub name: String,
+    /// Parsed JSON arguments, not yet validated against the tool's schema.
+    pub arguments: serde_json::Value,
+}
+
+/// Generic tool metadata sent to a capable model, independent of any concrete tool
+/// implementation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
+    /// Stable, model-facing tool name.
+    pub name: String,
+    /// Concise description that teaches the model when to use, and not use, the tool.
+    pub description: String,
+    /// JSON schema describing accepted arguments.
+    pub input_schema: serde_json::Value,
 }
 
 /// A normalized request for streamed chat inference.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatRequest {
     /// The selected catalog model.
     pub model: ModelId,
     /// Conversation history in role order.
     pub messages: Vec<ChatMessage>,
+    /// Tool definitions offered to the model, empty when tools are not applicable.
+    pub tools: Vec<ToolDefinition>,
 }
 
 /// Cooperative cancellation signal shared by one provider operation and its caller.
@@ -1264,6 +1369,196 @@ impl ChatRequest {
         Self {
             model: ModelId::new(model),
             messages: vec![ChatMessage::User(message.into())],
+            tools: Vec::new(),
+        }
+    }
+}
+
+/// The normalized event channel returned by [`Provider::stream_chat`].
+pub type ChatStream = tokio::sync::mpsc::Receiver<Result<ChatStreamEvent, ProviderError>>;
+
+/// Future type returned by [`Provider::stream_chat`].
+///
+/// Hand-written instead of an `async-trait`-style macro so `dyn Provider` stays a
+/// dependency-free trait object, matching [`gocode_tools`]'s `ToolFuture` convention.
+pub type ProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ChatStream, ProviderError>> + Send + 'a>>;
+
+/// The capability boundary between the Agent and a concrete model-inference backend.
+///
+/// Implementations own every provider-specific detail: authentication, endpoints, wire request
+/// and response shapes, and streaming protocol. Callers only ever see normalized
+/// [`ChatRequest`]/[`ChatStreamEvent`]/[`ProviderError`] values.
+pub trait Provider: Send + Sync {
+    /// Starts a streamed chat request and returns its normalized event channel.
+    ///
+    /// Implementations must stop producing events promptly once `cancellation` fires.
+    fn stream_chat(
+        &self,
+        request: ChatRequest,
+        cancellation: CancellationToken,
+    ) -> ProviderFuture<'_>;
+}
+
+/// Stable, safe-to-display provider failure categories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderError {
+    /// No credential was available for this provider.
+    MissingCredential,
+    /// The provider rejected the configured credential.
+    InvalidCredential,
+    /// The request could not reach the provider or the connection failed mid-flight.
+    Network(String),
+    /// The provider did not respond before the client's timeout.
+    Timeout,
+    /// The provider asked the client to slow down.
+    RateLimited,
+    /// The requested model is not available from this provider.
+    ModelNotFound(String),
+    /// The request needed a capability the model or provider does not support.
+    UnsupportedCapability(String),
+    /// The normalized request could not be translated into a valid provider request.
+    InvalidRequest(String),
+    /// The provider returned a response that could not be parsed or normalized safely.
+    InvalidResponse(String),
+    /// A provider-side failure occurred.
+    Server {
+        /// HTTP status code, when the transport is HTTP.
+        status: Option<u16>,
+        /// Safe, non-sensitive diagnostic message.
+        message: String,
+    },
+    /// The request was cancelled before the provider finished.
+    Cancelled,
+}
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingCredential => formatter.write_str("no credential is configured"),
+            Self::InvalidCredential => formatter.write_str("the credential was rejected"),
+            Self::Network(message) => write!(formatter, "network error: {message}"),
+            Self::Timeout => formatter.write_str("the request timed out"),
+            Self::RateLimited => formatter.write_str("the provider rate-limited this request"),
+            Self::ModelNotFound(model) => write!(formatter, "model {model} was not found"),
+            Self::UnsupportedCapability(capability) => {
+                write!(formatter, "unsupported capability: {capability}")
+            }
+            Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
+            Self::InvalidResponse(message) => write!(formatter, "invalid response: {message}"),
+            Self::Server { status, message } => match status {
+                Some(status) => write!(formatter, "provider error ({status}): {message}"),
+                None => write!(formatter, "provider error: {message}"),
+            },
+            Self::Cancelled => formatter.write_str("the request was cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+/// Test doubles reusable by any crate that consumes [`Provider`], without depending on a real
+/// provider implementation.
+pub mod testing {
+    use std::{collections::VecDeque, sync::Mutex};
+
+    use super::{
+        CancellationToken, ChatRequest, ChatStreamEvent, Provider, ProviderError, ProviderFuture,
+    };
+
+    /// A [`Provider`] that replays one scripted turn per call to
+    /// [`Provider::stream_chat`], in call order.
+    ///
+    /// Each turn is a fixed sequence of events delivered on the returned channel. Once the
+    /// script is exhausted, further calls fail loudly with [`ProviderError::InvalidRequest`]
+    /// instead of hanging, so a test with an unexpectedly long agent loop fails fast.
+    pub struct FakeProvider {
+        turns: Mutex<VecDeque<Vec<Result<ChatStreamEvent, ProviderError>>>>,
+    }
+
+    impl FakeProvider {
+        /// Creates a provider that replays `turns` in order, one per `stream_chat` call.
+        #[must_use]
+        pub fn script(turns: Vec<Vec<Result<ChatStreamEvent, ProviderError>>>) -> Self {
+            Self {
+                turns: Mutex::new(turns.into_iter().collect()),
+            }
+        }
+    }
+
+    impl Provider for FakeProvider {
+        fn stream_chat(
+            &self,
+            _request: ChatRequest,
+            _cancellation: CancellationToken,
+        ) -> ProviderFuture<'_> {
+            Box::pin(async move {
+                let events = self
+                    .turns
+                    .lock()
+                    .expect("fake provider script lock should not be poisoned")
+                    .pop_front()
+                    .ok_or_else(|| {
+                        ProviderError::InvalidRequest("FakeProvider script exhausted".into())
+                    })?;
+                let (sender, receiver) = tokio::sync::mpsc::channel(events.len().max(1));
+                for event in events {
+                    let _ = sender.send(event).await;
+                }
+                Ok(receiver)
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::FakeProvider;
+        use crate::{
+            CancellationToken, ChatRequest, ChatStreamEvent, FinishReason, Provider, ProviderError,
+        };
+
+        #[tokio::test]
+        async fn replays_scripted_turns_in_order() {
+            let provider = FakeProvider::script(vec![
+                vec![
+                    Ok(ChatStreamEvent::TextDelta("Hi".into())),
+                    Ok(ChatStreamEvent::Finished(FinishReason::Stop)),
+                ],
+                vec![Ok(ChatStreamEvent::Finished(FinishReason::Stop))],
+            ]);
+            let request = ChatRequest::single_user("model", "hello");
+
+            let mut first = provider
+                .stream_chat(request.clone(), CancellationToken::new())
+                .await
+                .expect("first scripted turn should stream");
+            assert_eq!(
+                first.recv().await,
+                Some(Ok(ChatStreamEvent::TextDelta("Hi".into())))
+            );
+
+            let mut second = provider
+                .stream_chat(request, CancellationToken::new())
+                .await
+                .expect("second scripted turn should stream");
+            assert_eq!(
+                second.recv().await,
+                Some(Ok(ChatStreamEvent::Finished(FinishReason::Stop)))
+            );
+        }
+
+        #[tokio::test]
+        async fn exhausted_script_fails_loudly_instead_of_hanging() {
+            let provider = FakeProvider::script(vec![]);
+
+            let outcome = provider
+                .stream_chat(
+                    ChatRequest::single_user("model", "hello"),
+                    CancellationToken::new(),
+                )
+                .await;
+
+            assert!(matches!(outcome, Err(ProviderError::InvalidRequest(_))));
         }
     }
 }

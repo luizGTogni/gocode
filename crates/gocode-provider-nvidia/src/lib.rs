@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
 use gocode_core::{
-    CancellationToken, ChatMessage, ChatRequest, ChatStreamEvent, Model, ModelCapabilities, ModelId,
+    CancellationToken, ChatMessage, ChatRequest, ChatStream, ChatStreamEvent, FinishReason, Model,
+    ModelCapabilities, ModelId, Provider, ProviderError, ProviderFuture, ToolCallDelta, Usage,
 };
 use gocode_credentials::SecretString;
 
@@ -97,10 +98,7 @@ impl NvidiaProvider {
         &self,
         request: ChatRequest,
         cancellation: CancellationToken,
-    ) -> Result<
-        tokio::sync::mpsc::Receiver<Result<ChatStreamEvent, NvidiaClientError>>,
-        NvidiaClientError,
-    > {
+    ) -> Result<ChatStream, ProviderError> {
         let response = self
             .client
             .post(self.chat_url())
@@ -108,12 +106,10 @@ impl NvidiaProvider {
             .json(&build_chat_body(&request))
             .send()
             .await
-            .map_err(|error| NvidiaClientError::Network(error.to_string()))?;
+            .map_err(|error| ProviderError::Network(error.to_string()))?;
 
         if !response.status().is_success() {
-            return Err(NvidiaClientError::Http(map_status_error(
-                response.status().as_u16(),
-            )));
+            return Err(map_status_error(response.status().as_u16()).into());
         }
 
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
@@ -141,14 +137,16 @@ impl NvidiaProvider {
                                         }
                                     }
                                     Err(error) => {
-                                        let _ = sender.send(Err(NvidiaClientError::Protocol(error))).await;
+                                        let _ = sender
+                                            .send(Err(ProviderError::InvalidResponse(error.to_string())))
+                                            .await;
                                         return;
                                     }
                                 }
                             }
                         }
                         Some(Err(error)) => {
-                            let _ = sender.send(Err(NvidiaClientError::Network(error.to_string()))).await;
+                            let _ = sender.send(Err(ProviderError::Network(error.to_string()))).await;
                             return;
                         }
                         None => return,
@@ -160,7 +158,17 @@ impl NvidiaProvider {
     }
 }
 
-/// Safe error surface produced by the NVIDIA client.
+impl Provider for NvidiaProvider {
+    fn stream_chat(
+        &self,
+        request: ChatRequest,
+        cancellation: CancellationToken,
+    ) -> ProviderFuture<'_> {
+        Box::pin(self.stream_chat(request, cancellation))
+    }
+}
+
+/// Safe error surface produced by the NVIDIA client outside the streamed event channel.
 #[derive(Debug)]
 pub enum NvidiaClientError {
     /// The request could not reach NVIDIA or finish before the HTTP client's timeout.
@@ -183,27 +191,104 @@ impl std::fmt::Display for NvidiaClientError {
 
 impl std::error::Error for NvidiaClientError {}
 
+impl From<NvidiaClientError> for ProviderError {
+    fn from(error: NvidiaClientError) -> Self {
+        match error {
+            NvidiaClientError::Network(message) => Self::Network(message),
+            NvidiaClientError::Http(kind) => kind.into(),
+            NvidiaClientError::Protocol(error) => Self::InvalidResponse(error.to_string()),
+        }
+    }
+}
+
+impl From<NvidiaErrorKind> for ProviderError {
+    fn from(kind: NvidiaErrorKind) -> Self {
+        match kind {
+            NvidiaErrorKind::InvalidCredential => Self::InvalidCredential,
+            NvidiaErrorKind::RateLimited => Self::RateLimited,
+            NvidiaErrorKind::Server => Self::Server {
+                status: None,
+                message: "NVIDIA reported a server-side failure".into(),
+            },
+            NvidiaErrorKind::Request => Self::InvalidRequest("NVIDIA rejected the request".into()),
+        }
+    }
+}
+
 /// Builds NVIDIA's OpenAI-compatible streaming chat body from normalized input.
 #[must_use]
 pub fn build_chat_body(request: &ChatRequest) -> serde_json::Value {
     let messages = request
         .messages
         .iter()
-        .map(|message| {
-            let (role, content) = match message {
-                ChatMessage::System(content) => ("system", content),
-                ChatMessage::User(content) => ("user", content),
-                ChatMessage::Assistant(content) => ("assistant", content),
-            };
-            serde_json::json!({ "role": role, "content": content })
-        })
+        .map(build_message)
         .collect::<Vec<_>>();
 
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": request.model.as_str(),
         "messages": messages,
         "stream": true,
-    })
+    });
+
+    if !request.tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    body
+}
+
+fn build_message(message: &ChatMessage) -> serde_json::Value {
+    match message {
+        ChatMessage::System(content) => serde_json::json!({ "role": "system", "content": content }),
+        ChatMessage::User(content) => serde_json::json!({ "role": "user", "content": content }),
+        ChatMessage::Assistant { text, tool_calls } => {
+            let mut object = serde_json::json!({
+                "role": "assistant",
+                "content": text.clone().unwrap_or_default(),
+            });
+            if !tool_calls.is_empty() {
+                object["tool_calls"] = serde_json::Value::Array(
+                    tool_calls
+                        .iter()
+                        .map(|call| {
+                            serde_json::json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments.to_string(),
+                                }
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            object
+        }
+        ChatMessage::Tool {
+            tool_call_id,
+            content,
+        } => serde_json::json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        }),
+    }
 }
 
 /// Converts the NVIDIA `/v1/models` body into provider-neutral catalog entries.
@@ -248,33 +333,101 @@ pub fn map_stream_chunk(payload: &str) -> Result<Vec<ChatStreamEvent>, NvidiaPro
         events.push(ChatStreamEvent::RequestId(request_id.into()));
     }
 
-    let Some(choices) = object.get("choices").and_then(serde_json::Value::as_array) else {
-        return Ok(events);
-    };
+    if let Some(choices) = object.get("choices").and_then(serde_json::Value::as_array) {
+        for choice in choices {
+            if let Some(content) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|content| !content.is_empty())
+            {
+                events.push(ChatStreamEvent::TextDelta(content.into()));
+            }
 
-    for choice in choices {
-        let Some(content) = choice
-            .get("delta")
-            .and_then(|delta| delta.get("content"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|content| !content.is_empty())
-        else {
-            continue;
-        };
-        events.push(ChatStreamEvent::TextDelta(content.into()));
+            if let Some(tool_calls) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("tool_calls"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for tool_call in tool_calls {
+                    events.push(ChatStreamEvent::ToolCallDelta(map_tool_call_delta(
+                        tool_call,
+                    )));
+                }
+            }
+
+            if let Some(reason) = choice
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                events.push(ChatStreamEvent::Finished(map_finish_reason(reason)));
+            }
+        }
+    }
+
+    if let Some(usage) = object.get("usage") {
+        events.push(ChatStreamEvent::Usage(Usage {
+            input_tokens: usage
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64),
+            output_tokens: usage
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64),
+            reasoning_tokens: usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(serde_json::Value::as_u64),
+        }));
     }
 
     Ok(events)
 }
 
+fn map_tool_call_delta(tool_call: &serde_json::Value) -> ToolCallDelta {
+    let index = tool_call
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let function = tool_call.get("function");
+
+    ToolCallDelta {
+        index: usize::try_from(index).unwrap_or(usize::MAX),
+        id: tool_call
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        name_delta: function
+            .and_then(|function| function.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        arguments_delta: function
+            .and_then(|function| function.get("arguments"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+    }
+}
+
+fn map_finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "stop" => FinishReason::Stop,
+        "tool_calls" => FinishReason::ToolCalls,
+        "length" => FinishReason::Length,
+        "content_filter" => FinishReason::ContentFilter,
+        other => FinishReason::Other(other.into()),
+    }
+}
+
 /// Maps one SSE `data:` value from NVIDIA into generic events.
+///
+/// The `[DONE]` sentinel carries no information beyond what the preceding chunk's
+/// `finish_reason` already reported, so it maps to no events.
 ///
 /// # Errors
 ///
 /// Returns an error if a non-terminal data value is malformed JSON.
 pub fn map_sse_data(data: &str) -> Result<Vec<ChatStreamEvent>, NvidiaProtocolError> {
     if data == "[DONE]" {
-        return Ok(vec![ChatStreamEvent::Completed]);
+        return Ok(Vec::new());
     }
 
     map_stream_chunk(data)
@@ -318,7 +471,7 @@ pub const fn map_status_error(status: u16) -> NvidiaErrorKind {
 
 #[cfg(test)]
 mod tests {
-    use gocode_core::ChatStreamEvent;
+    use gocode_core::{ChatStreamEvent, FinishReason, ToolCallDelta, Usage};
 
     #[test]
     fn maps_openai_compatible_text_delta_to_generic_event() {
@@ -344,6 +497,44 @@ mod tests {
     }
 
     #[test]
+    fn maps_streamed_tool_call_fragments_and_finish_reason() {
+        let events = super::map_stream_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\"path\""}}]},"finish_reason":null}]}"#,
+        )
+        .expect("tool-call fragment should map");
+
+        assert_eq!(
+            events,
+            vec![ChatStreamEvent::ToolCallDelta(ToolCallDelta {
+                index: 0,
+                id: Some("call-1".into()),
+                name_delta: Some("read_file".into()),
+                arguments_delta: Some("{\"path\"".into()),
+            })]
+        );
+    }
+
+    #[test]
+    fn maps_finish_reason_and_usage() {
+        let events = super::map_stream_chunk(
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        )
+        .expect("finish reason and usage should map");
+
+        assert_eq!(
+            events,
+            vec![
+                ChatStreamEvent::Finished(FinishReason::ToolCalls),
+                ChatStreamEvent::Usage(Usage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    reasoning_tokens: None,
+                }),
+            ]
+        );
+    }
+
+    #[test]
     fn builds_an_openai_compatible_streaming_request() {
         let request = gocode_core::ChatRequest::single_user("nvidia/model", "Olá");
 
@@ -353,6 +544,38 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Olá");
+    }
+
+    #[test]
+    fn builds_tool_definitions_and_tool_result_messages() {
+        let mut request = gocode_core::ChatRequest::single_user("nvidia/model", "Olá");
+        request.tools.push(gocode_core::ToolDefinition {
+            name: "read_file".into(),
+            description: "Reads a file.".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+        request.messages.push(gocode_core::ChatMessage::Assistant {
+            text: None,
+            tool_calls: vec![gocode_core::ProviderToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "a.rs"}),
+            }],
+        });
+        request.messages.push(gocode_core::ChatMessage::Tool {
+            tool_call_id: "call-1".into(),
+            content: "fn main() {}".into(),
+        });
+
+        let body = super::build_chat_body(&request);
+
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call-1");
     }
 
     #[test]
@@ -404,9 +627,9 @@ mod tests {
     }
 
     #[test]
-    fn done_sse_marker_becomes_a_generic_completion_event() {
+    fn done_sse_marker_maps_to_no_additional_events() {
         let events = super::map_sse_data("[DONE]").expect("done marker should map");
 
-        assert_eq!(events, vec![ChatStreamEvent::Completed]);
+        assert!(events.is_empty());
     }
 }

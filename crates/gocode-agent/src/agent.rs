@@ -1,0 +1,377 @@
+//! The Agent runtime: a cancellable, multi-turn inference-then-tool loop.
+
+use std::{path::PathBuf, sync::Arc};
+
+use gocode_core::{
+    CancellationToken, ChatMessage, ChatStreamEvent, FinishReason, ModelId, Provider,
+    ProviderToolCall,
+};
+use gocode_tools::{
+    ChangeKind, FileChange, ToolCall, ToolContext, ToolError, ToolEvent, ToolEventSink,
+    ToolRegistry, ToolResult, ToolStatus, permissions::PermissionContext,
+};
+use tokio::sync::mpsc;
+
+use crate::{
+    context::build_request,
+    error::AgentError,
+    events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning},
+    ids::AgentRunId,
+    limits::{AgentLimit, AgentLimits},
+    state::AgentState,
+    toolcalls::ToolCallAssembler,
+};
+
+/// Everything one agent run needs beyond the [`Agent`]'s own configuration.
+pub struct AgentRequest {
+    /// The user's message that starts this run.
+    pub prompt: String,
+    /// The model to use for every turn of this run.
+    pub model: ModelId,
+    /// Root directory that bounds every tool's filesystem and process access.
+    pub project_root: PathBuf,
+    /// Parsed `.gocode/instructions.md` content, if any.
+    pub instructions: Option<String>,
+    /// Whether the selected model's capabilities allow tool definitions to be sent.
+    ///
+    /// The Agent does not resolve model capabilities itself; the caller gates this using
+    /// `gocode_core::ModelCapabilities` before starting the run (`docs/AGENT.md` §109).
+    pub tools_enabled: bool,
+}
+
+/// Long-lived collaborators an [`Agent`] uses to drive every run.
+pub struct Agent {
+    provider: Arc<dyn Provider>,
+    tools: Arc<ToolRegistry>,
+    permissions: PermissionContext,
+    limits: AgentLimits,
+}
+
+impl Agent {
+    /// Creates an agent from its provider, tool registry, permission policy, and limits.
+    #[must_use]
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        tools: Arc<ToolRegistry>,
+        permissions: PermissionContext,
+        limits: AgentLimits,
+    ) -> Self {
+        Self {
+            provider,
+            tools,
+            permissions,
+            limits,
+        }
+    }
+
+    /// Drives one complete agent run to completion, cancellation, or failure.
+    ///
+    /// Emits [`AgentEvent`]s on `events` throughout; the caller decides how (or whether) to
+    /// render them. Only one run should be active per [`Agent`] instance at a time
+    /// (`docs/AGENT.md` §106); nothing here prevents concurrent calls, but the MVP contract
+    /// assumes the caller serializes them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the provider fails, a configured limit stops the run, or the
+    /// run is cancelled. Recoverable tool failures do not appear here; they are returned to the
+    /// model as tool results and the run continues.
+    pub async fn run(
+        &self,
+        request: AgentRequest,
+        events: mpsc::Sender<AgentEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<AgentCompletion, AgentError> {
+        let run_id = AgentRunId::new();
+        let _ = events.send(AgentEvent::Started).await;
+
+        let outcome = self.drive(run_id, request, &events, cancellation).await;
+
+        match &outcome {
+            Ok(completion) => {
+                let _ = events.send(AgentEvent::Completed(completion.clone())).await;
+            }
+            Err(AgentError::Cancelled) => {
+                let _ = events.send(AgentEvent::Cancelled).await;
+            }
+            Err(_) => {}
+        }
+
+        outcome
+    }
+
+    async fn drive(
+        &self,
+        run_id: AgentRunId,
+        request: AgentRequest,
+        events: &mpsc::Sender<AgentEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<AgentCompletion, AgentError> {
+        let tool_cancellation = tokio_util::sync::CancellationToken::new();
+        let _bridge_guard = bridge_cancellation(cancellation.clone(), tool_cancellation.clone());
+
+        let mut stats = AgentRunStats::default();
+        let mut history = vec![ChatMessage::User(request.prompt.clone())];
+        let tool_defs = if request.tools_enabled {
+            map_tool_definitions(&self.tools)
+        } else {
+            Vec::new()
+        };
+
+        let mut consecutive_failures = 0usize;
+        let mut last_failure_signature: Option<(String, String)> = None;
+        let mut repeat_count = 0usize;
+
+        let final_text = loop {
+            if cancellation.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            if stats.turns >= self.limits.max_turns {
+                return Err(AgentError::LimitReached(AgentLimit::MaxTurns));
+            }
+            stats.turns += 1;
+            let _ = events
+                .send(AgentEvent::StateChanged(AgentState::Inference))
+                .await;
+
+            let (text, tool_calls) = self
+                .run_turn(&request, &history, &tool_defs, events, &cancellation)
+                .await?;
+
+            history.push(ChatMessage::Assistant {
+                text: text.clone(),
+                tool_calls: tool_calls.iter().map(to_provider_tool_call).collect(),
+            });
+
+            if tool_calls.is_empty() {
+                break text.unwrap_or_default();
+            }
+
+            if stats.tool_calls + tool_calls.len() > self.limits.max_total_tool_calls {
+                return Err(AgentError::LimitReached(AgentLimit::MaxTotalToolCalls));
+            }
+            if tool_calls.len() > self.limits.max_tool_calls_per_turn {
+                return Err(AgentError::LimitReached(AgentLimit::MaxToolCallsPerTurn));
+            }
+
+            let _ = events
+                .send(AgentEvent::StateChanged(AgentState::ExecutingTools))
+                .await;
+
+            for call in tool_calls {
+                if cancellation.is_cancelled() {
+                    return Err(AgentError::Cancelled);
+                }
+                stats.tool_calls += 1;
+                let _ = events.send(AgentEvent::ToolRequested(call.clone())).await;
+
+                let tool_result = self
+                    .execute_tool(&request, &call, &tool_cancellation, events)
+                    .await?;
+
+                if tool_result.status == ToolStatus::Success {
+                    consecutive_failures = 0;
+                    repeat_count = 0;
+                    last_failure_signature = None;
+                } else {
+                    stats.failed_tool_calls += 1;
+                    consecutive_failures += 1;
+                    let signature = (call.name.as_str().to_string(), call.arguments.to_string());
+                    if last_failure_signature.as_ref() == Some(&signature) {
+                        repeat_count += 1;
+                    } else {
+                        last_failure_signature = Some(signature);
+                        repeat_count = 1;
+                    }
+                }
+
+                for path in &tool_result.metadata.affected_files {
+                    let _ = events
+                        .send(AgentEvent::FileChanged(FileChange {
+                            path: path.clone(),
+                            kind: ChangeKind::Modified,
+                        }))
+                        .await;
+                }
+
+                history.push(tool_result_message(&tool_result));
+                let _ = events.send(AgentEvent::ToolFinished(tool_result)).await;
+
+                if repeat_count >= 3 {
+                    let _ = events
+                        .send(AgentEvent::Warning(AgentWarning::LoopDetected(
+                            call.name.as_str().to_string(),
+                        )))
+                        .await;
+                    return Err(AgentError::LimitReached(AgentLimit::RepeatedToolCall));
+                }
+                if consecutive_failures >= self.limits.max_consecutive_failures {
+                    return Err(AgentError::LimitReached(AgentLimit::ConsecutiveFailures));
+                }
+            }
+        };
+
+        Ok(AgentCompletion {
+            run_id,
+            final_text,
+            stats,
+        })
+    }
+
+    async fn run_turn(
+        &self,
+        request: &AgentRequest,
+        history: &[ChatMessage],
+        tool_defs: &[gocode_core::ToolDefinition],
+        events: &mpsc::Sender<AgentEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Option<String>, Vec<ToolCall>), AgentError> {
+        let chat_request = build_request(
+            request.model.clone(),
+            request.instructions.as_deref(),
+            history,
+            tool_defs.to_vec(),
+        );
+
+        let mut stream = self
+            .provider
+            .stream_chat(chat_request, cancellation.clone())
+            .await
+            .map_err(AgentError::Provider)?;
+
+        let mut text = String::new();
+        let mut assembler = ToolCallAssembler::default();
+
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => return Err(AgentError::Cancelled),
+                event = stream.recv() => match event {
+                    Some(Ok(ChatStreamEvent::TextDelta(delta))) => {
+                        text.push_str(&delta);
+                        let _ = events.send(AgentEvent::TextDelta(delta)).await;
+                    }
+                    Some(Ok(ChatStreamEvent::ToolCallDelta(delta))) => assembler.apply(delta),
+                    Some(Ok(ChatStreamEvent::Finished(FinishReason::Cancelled))) => {
+                        return Err(AgentError::Cancelled);
+                    }
+                    Some(Ok(
+                        ChatStreamEvent::Finished(_)
+                        | ChatStreamEvent::RequestId(_)
+                        | ChatStreamEvent::Usage(_),
+                    )) => {}
+                    Some(Err(error)) => return Err(AgentError::Provider(error)),
+                    None => break,
+                },
+            }
+        }
+
+        let text = (!text.is_empty()).then_some(text);
+        Ok((text, assembler.finish()))
+    }
+
+    async fn execute_tool(
+        &self,
+        request: &AgentRequest,
+        call: &ToolCall,
+        tool_cancellation: &tokio_util::sync::CancellationToken,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> Result<ToolResult, AgentError> {
+        let Some(tool) = self.tools.get(&call.name) else {
+            let _ = events
+                .send(AgentEvent::Warning(AgentWarning::UnknownTool(
+                    call.name.as_str().to_string(),
+                )))
+                .await;
+            return Ok(ToolResult::failed(
+                call.id.clone(),
+                format!("Tool \"{}\" is not available.", call.name),
+            ));
+        };
+
+        let _ = events.send(AgentEvent::ToolStarted(call.id.clone())).await;
+
+        let sink: Arc<dyn ToolEventSink> = Arc::new(AgentToolEventSink {
+            events: events.clone(),
+        });
+        let ctx = ToolContext::new(
+            call.id.clone(),
+            request.project_root.clone(),
+            self.permissions.clone(),
+        )
+        .with_cancellation(tool_cancellation.clone())
+        .with_events(sink);
+
+        match tool.execute(ctx, call.arguments.clone()).await {
+            Ok(result) => Ok(result),
+            Err(ToolError::Cancelled) => Err(AgentError::Cancelled),
+            Err(error) => Ok(ToolResult::failed(call.id.clone(), error.to_string())),
+        }
+    }
+}
+
+/// Cancels `tool_cancellation` when `core_cancellation` fires, and stops watching once dropped.
+fn bridge_cancellation(
+    core_cancellation: CancellationToken,
+    tool_cancellation: tokio_util::sync::CancellationToken,
+) -> BridgeGuard {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = core_cancellation.cancelled() => tool_cancellation.cancel(),
+            _ = done_rx => {}
+        }
+    });
+    BridgeGuard(Some(done_tx))
+}
+
+struct BridgeGuard(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for BridgeGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct AgentToolEventSink {
+    events: mpsc::Sender<AgentEvent>,
+}
+
+impl ToolEventSink for AgentToolEventSink {
+    fn emit(&self, event: ToolEvent) {
+        if let ToolEvent::OutputChunk { id, chunk } = event {
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let _ = events.send(AgentEvent::ToolOutputChunk { id, chunk }).await;
+            });
+        }
+    }
+}
+
+fn map_tool_definitions(tools: &ToolRegistry) -> Vec<gocode_core::ToolDefinition> {
+    tools
+        .definitions()
+        .into_iter()
+        .map(|definition| gocode_core::ToolDefinition {
+            name: definition.name.as_str().to_string(),
+            description: definition.description,
+            input_schema: definition.input_schema,
+        })
+        .collect()
+}
+
+fn to_provider_tool_call(call: &ToolCall) -> ProviderToolCall {
+    ProviderToolCall {
+        id: call.id.as_str().to_string(),
+        name: call.name.as_str().to_string(),
+        arguments: call.arguments.clone(),
+    }
+}
+
+fn tool_result_message(result: &ToolResult) -> ChatMessage {
+    ChatMessage::Tool {
+        tool_call_id: result.call_id.as_str().to_string(),
+        content: result.output.content.clone(),
+    }
+}

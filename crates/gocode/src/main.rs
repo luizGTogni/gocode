@@ -204,8 +204,10 @@ async fn run_application() -> Result<(), AppError> {
                                         .await;
                                 }
                                 Ok(
-                                    gocode_core::ChatStreamEvent::Completed
-                                    | gocode_core::ChatStreamEvent::RequestId(_),
+                                    gocode_core::ChatStreamEvent::RequestId(_)
+                                    | gocode_core::ChatStreamEvent::ToolCallDelta(_)
+                                    | gocode_core::ChatStreamEvent::Usage(_)
+                                    | gocode_core::ChatStreamEvent::Finished(_),
                                 ) => {}
                                 Err(_) => {
                                     let _ = event_tx

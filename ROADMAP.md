@@ -1083,7 +1083,7 @@ Initial state:
 | v0.0.1 — Foundation | Complete |
 | v0.0.2 — NVIDIA Vertical Slice | Complete |
 | v0.0.3 — Coding Tools | Release candidate |
-| v0.0.4 — Agent Loop | Planned |
+| v0.0.4 — Agent Loop | Release candidate |
 | v0.0.5 — Product UX | Planned |
 | v0.0.6 — Updater | Planned |
 | v0.0.7 — Security and Platform Hardening | Planned |

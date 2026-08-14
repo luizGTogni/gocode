@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/gocode",
+    "crates/gocode-agent",
     "crates/gocode-credentials",
     "crates/gocode-core",
     "crates/gocode-provider-nvidia",
