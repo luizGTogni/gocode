@@ -15,6 +15,10 @@ pub enum AppCommand {
     CancelProviderRequest,
     /// Answer the single active permission prompt: `true` approves, `false` denies.
     PermissionResponse(bool),
+    /// Start the user-approved update installation.
+    AcceptUpdate,
+    /// Dismiss this startup's update prompt without changing the installation.
+    RejectUpdate,
 }
 
 /// Fact emitted by the application runtime and rendered by an interface.
@@ -42,6 +46,14 @@ pub enum AppEvent {
     ProviderFailed(String),
     /// An error severe enough to require a blocking acknowledgement before work continues.
     BlockingError(String),
+    /// A newer verified release is available for user approval.
+    UpdateAvailable { version: String, notes: String },
+    /// A non-destructive preparation status for an accepted update.
+    UpdateProgress(String),
+    /// Update preparation failed; the running installation remains available.
+    UpdateFailed(String),
+    /// The external updater is launched; the interface must restore the terminal and exit.
+    ExitForUpdate,
     /// The agent run's lifecycle state changed.
     AgentStateChanged(AgentActivityState),
     /// The model requested a tool call.

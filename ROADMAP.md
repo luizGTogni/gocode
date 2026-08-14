@@ -163,16 +163,16 @@ The sequence represents release dependencies, not a prohibition on parallel work
 
 The following workstreams span multiple milestones.
 
-| Workstream | Starts | Release gate |
-|---|---:|---:|
-| Automated testing | v0.0.1 | v0.0.8 |
-| Platform manual testing (Windows and Linux) | v0.0.1 | v0.0.9 |
-| Security boundary tests | v0.0.3 | v0.0.8 |
-| User-facing documentation | v0.0.2 | v0.0.9 |
-| Structured local logging | v0.0.1 | v0.0.7 |
-| Error normalization | v0.0.2 | v0.0.8 |
-| Performance profiling | v0.0.3 | v0.0.8 |
-| Release automation | v0.0.6 | v0.0.9 |
+| Workstream                                  | Starts | Release gate |
+| ------------------------------------------- | -----: | -----------: |
+| Automated testing                           | v0.0.1 |       v0.0.8 |
+| Platform manual testing (Windows and Linux) | v0.0.1 |       v0.0.9 |
+| Security boundary tests                     | v0.0.3 |       v0.0.8 |
+| User-facing documentation                   | v0.0.2 |       v0.0.9 |
+| Structured local logging                    | v0.0.1 |       v0.0.7 |
+| Error normalization                         | v0.0.2 |       v0.0.8 |
+| Performance profiling                       | v0.0.3 |       v0.0.8 |
+| Release automation                          | v0.0.6 |       v0.0.9 |
 
 Workstream gates do not mean the work begins at the gate. They identify the milestone by which the work must be complete enough for release progression.
 
@@ -981,15 +981,15 @@ If progress stalls, prioritize restoring this path before expanding secondary fe
 
 After the v0.0.1 contracts stabilize, the following can progress in parallel with coordination:
 
-| Track | Can proceed alongside | Coordination point |
-|---|---|---|
-| NVIDIA adapter | TUI onboarding | provider events and error model |
-| Filesystem tools | Provider work | generic tool schemas and events |
-| TUI widgets | Agent runtime | `AppEvent` lifecycle |
-| Updater checker | UX polish | modal timing and app shutdown |
-| Test fixtures | All milestones | stable contracts and deterministic IDs |
-| Documentation | All milestones | verified current behavior |
-| Security tests | Tools and Agent | boundary APIs and permission semantics |
+| Track            | Can proceed alongside | Coordination point                     |
+| ---------------- | --------------------- | -------------------------------------- |
+| NVIDIA adapter   | TUI onboarding        | provider events and error model        |
+| Filesystem tools | Provider work         | generic tool schemas and events        |
+| TUI widgets      | Agent runtime         | `AppEvent` lifecycle                   |
+| Updater checker  | UX polish             | modal timing and app shutdown          |
+| Test fixtures    | All milestones        | stable contracts and deterministic IDs |
+| Documentation    | All milestones        | verified current behavior              |
+| Security tests   | Tools and Agent       | boundary APIs and permission semantics |
 
 Parallel work must not introduce duplicate event, error, credential, or capability models.
 
@@ -997,18 +997,18 @@ Parallel work must not introduce duplicate event, error, credential, or capabili
 
 # 18. Release-Blocking Risks
 
-| Risk | Impact | Required mitigation |
-|---|---|---|
-| NVIDIA model metadata is incomplete or inconsistent | Incorrect tool/thinking behavior | Centralized capability resolver with conservative defaults and fixtures |
+| Risk                                                 | Impact                                | Required mitigation                                                          |
+| ---------------------------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------- |
+| NVIDIA model metadata is incomplete or inconsistent  | Incorrect tool/thinking behavior      | Centralized capability resolver with conservative defaults and fixtures      |
 | Windows Credential Manager integration is unreliable | Credentials cannot be stored securely | Select and test the crate early; retain environment-only non-persistent flow |
-| Streamed tool-call formats vary by model | Invalid or unsafe tool execution | Provider-specific assembly, strict completion checks, recorded fixtures |
-| Windows or Linux path edge cases bypass containment | Workspace escape | Shared path service and adversarial platform tests before v0.0.7 exit |
-| Shell quoting differs across PowerShell and `cmd` | Incorrect or dangerous commands | Prefer program/args; explicit shell mode; platform quoting tests |
-| Process cancellation leaves child processes running | Continued unintended effects | Windows process-tree strategy and manual cancellation matrix |
-| Updater cannot replace locked executables safely | Failed or corrupt self-update | Separate updater, staging, backup, rollback, release-like tests |
-| Checksum and asset naming disagree with CI | Updates cannot verify or install | Freeze one release pipeline contract before v0.0.9 |
-| TUI event volume causes freezes | Poor streaming and command UX | Bounded channels, coalescing, profiling, output truncation |
-| MVP scope expands to post-MVP features | Delayed usable release | Enforce the non-goals in this roadmap and the PRD |
+| Streamed tool-call formats vary by model             | Invalid or unsafe tool execution      | Provider-specific assembly, strict completion checks, recorded fixtures      |
+| Windows or Linux path edge cases bypass containment  | Workspace escape                      | Shared path service and adversarial platform tests before v0.0.7 exit        |
+| Shell quoting differs across PowerShell and `cmd`    | Incorrect or dangerous commands       | Prefer program/args; explicit shell mode; platform quoting tests             |
+| Process cancellation leaves child processes running  | Continued unintended effects          | Windows process-tree strategy and manual cancellation matrix                 |
+| Updater cannot replace locked executables safely     | Failed or corrupt self-update         | Separate updater, staging, backup, rollback, release-like tests              |
+| Checksum and asset naming disagree with CI           | Updates cannot verify or install      | Freeze one release pipeline contract before v0.0.9                           |
+| TUI event volume causes freezes                      | Poor streaming and command UX         | Bounded channels, coalescing, profiling, output truncation                   |
+| MVP scope expands to post-MVP features               | Delayed usable release                | Enforce the non-goals in this roadmap and the PRD                            |
 
 A newly discovered critical security or data-loss issue blocks progression regardless of its milestone label.
 
@@ -1068,28 +1068,28 @@ Future-compatible abstractions are acceptable only when they simplify the MVP or
 
 Use one status for each milestone:
 
-| Status | Meaning |
-|---|---|
-| Planned | Scope is defined but implementation has not started |
-| In progress | Implementation or verification is active |
-| Blocked | A named dependency or decision prevents meaningful progress |
+| Status            | Meaning                                                          |
+| ----------------- | ---------------------------------------------------------------- |
+| Planned           | Scope is defined but implementation has not started              |
+| In progress       | Implementation or verification is active                         |
+| Blocked           | A named dependency or decision prevents meaningful progress      |
 | Release candidate | Deliverables are complete and exit criteria are under validation |
-| Complete | All exit criteria pass and the milestone artifact is available |
+| Complete          | All exit criteria pass and the milestone artifact is available   |
 
 Initial state:
 
-| Milestone | Status |
-|---|---|
-| v0.0.1 — Foundation | Complete |
-| v0.0.2 — NVIDIA Vertical Slice | Complete |
-| v0.0.3 — Coding Tools | Release candidate |
-| v0.0.4 — Agent Loop | Release candidate |
-| v0.0.5 — Product UX | Release candidate |
-| v0.0.6 — Updater | Planned |
-| v0.0.7 — Security and Platform Hardening | Planned |
-| v0.0.8 — Stability | Planned |
-| v0.0.9 — Release Candidate | Planned |
-| v0.1.0 — MVP Release | Planned |
+| Milestone                                | Status   |
+| ---------------------------------------- | -------- |
+| v0.0.1 — Foundation                      | Complete |
+| v0.0.2 — NVIDIA Vertical Slice           | Complete |
+| v0.0.3 — Coding Tools                    | Complete |
+| v0.0.4 — Agent Loop                      | Complete |
+| v0.0.5 — Product UX                      | Complete |
+| v0.0.6 — Updater                         | Release candidate |
+| v0.0.7 — Security and Platform Hardening | Planned  |
+| v0.0.8 — Stability                       | Planned  |
+| v0.0.9 — Release Candidate               | Planned  |
+| v0.1.0 — MVP Release                     | Planned  |
 
 Update milestone status only from concrete repository and test evidence. A percentage estimate is not a substitute for passing exit criteria.
 

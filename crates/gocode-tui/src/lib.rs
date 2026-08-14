@@ -78,6 +78,13 @@ pub struct PermissionPrompt {
     pub working_directory: String,
 }
 
+/// A user-approved update prompt, delayed until it cannot interrupt work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePrompt {
+    pub version: String,
+    pub notes: String,
+}
+
 /// A parsed slash command handled entirely by the interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -157,6 +164,9 @@ pub struct AppState {
     file_change_buffer: Vec<String>,
     activity: Option<AgentActivityState>,
     pending_permission: Option<PermissionPrompt>,
+    pending_update: Option<UpdatePrompt>,
+    queued_update: Option<UpdatePrompt>,
+    exit_for_update: bool,
     blocking_error: Option<String>,
     status: Option<String>,
     scroll: usize,
@@ -169,6 +179,10 @@ impl AppState {
     /// Applies a normalized application event to the render state.
     ///
     /// Returns a queued prompt to auto-submit, if the run that just ended freed one up.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the event contract is intentionally centralized in the render-state reducer"
+    )]
     pub fn apply(&mut self, event: &AppEvent) -> Option<String> {
         match event {
             AppEvent::BootStarted => self.screen = Screen::Boot,
@@ -204,6 +218,23 @@ impl AppState {
                 self.activity = None;
                 self.blocking_error = Some(message.clone());
             }
+            AppEvent::UpdateAvailable { version, notes } => {
+                let prompt = UpdatePrompt {
+                    version: version.clone(),
+                    notes: notes.clone(),
+                };
+                if self.screen == Screen::Chat
+                    && self.activity.is_none()
+                    && self.pending_permission.is_none()
+                {
+                    self.pending_update = Some(prompt);
+                } else {
+                    self.queued_update = Some(prompt);
+                }
+            }
+            AppEvent::UpdateProgress(message) => self.status = Some(message.clone()),
+            AppEvent::UpdateFailed(message) => self.entries.push(ChatEntry::Error(message.clone())),
+            AppEvent::ExitForUpdate => self.exit_for_update = true,
             AppEvent::AgentStateChanged(state) => self.activity = Some(*state),
             AppEvent::ToolActivity {
                 id,
@@ -241,6 +272,7 @@ impl AppState {
                     "Done — {turns} turn(s), {tool_calls} tool call(s), {failed_tool_calls} failed."
                 )));
                 self.last_submitted_prompt = None;
+                self.show_queued_update();
                 return self.queued.take();
             }
             AppEvent::AgentCancelled => {
@@ -250,6 +282,7 @@ impl AppState {
                 self.flush_file_changes();
                 self.entries.push(ChatEntry::Info("Cancelled.".into()));
                 self.last_submitted_prompt = None;
+                self.show_queued_update();
                 return self.queued.take();
             }
         }
@@ -265,6 +298,15 @@ impl AppState {
         }
         self.entries.push(ChatEntry::Assistant(delta.to_string()));
         self.streaming_assistant = true;
+    }
+
+    fn show_queued_update(&mut self) {
+        if self.screen == Screen::Chat
+            && self.pending_permission.is_none()
+            && self.pending_update.is_none()
+        {
+            self.pending_update = self.queued_update.take();
+        }
     }
 
     fn apply_tool_activity(
@@ -580,9 +622,29 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
 
     if let Some(prompt) = &state.pending_permission {
         render_permission_modal(frame, prompt, area);
+    } else if let Some(prompt) = &state.pending_update {
+        render_update_modal(frame, prompt, area);
     } else if let Some(message) = &state.blocking_error {
         render_blocking_error_modal(frame, message, area);
     }
+}
+
+fn render_update_modal(frame: &mut Frame, prompt: &UpdatePrompt, area: Rect) {
+    let modal = centered(area, 64, 9);
+    let notes = prompt.notes.lines().next().unwrap_or_default();
+    let content = format!(
+        "Gocode {} is available.\n\n{}\n\n[y] Update now   [n] Not now",
+        prompt.version, notes
+    );
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Update available")
+                .borders(Borders::ALL),
+        ),
+        modal,
+    );
 }
 
 fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -747,6 +809,10 @@ fn run_terminal(
                 state.begin_run(prompt.clone());
                 send_command(&command_tx, AppCommand::SubmitChat(prompt))?;
             }
+            if state.exit_for_update {
+                send_command(&command_tx, AppCommand::Exit)?;
+                return Ok(());
+            }
         }
 
         if !event::poll(Duration::from_millis(50))? {
@@ -760,6 +826,18 @@ fn run_terminal(
 
         if let Some(approved) = handle_permission_event(&mut state, &terminal_event) {
             send_command(&command_tx, AppCommand::PermissionResponse(approved))?;
+            continue;
+        }
+
+        if let Some(approved) = handle_update_event(&mut state, &terminal_event) {
+            send_command(
+                &command_tx,
+                if approved {
+                    AppCommand::AcceptUpdate
+                } else {
+                    AppCommand::RejectUpdate
+                },
+            )?;
             continue;
         }
 
@@ -981,6 +1059,31 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
     }
 }
 
+/// Applies Y/N confirmation keys to a pending update prompt.
+#[must_use]
+pub fn handle_update_event(state: &mut AppState, event: &Event) -> Option<bool> {
+    state.pending_update.as_ref()?;
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    match code {
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+            state.pending_update = None;
+            Some(true)
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            state.pending_update = None;
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
 /// Applies text input, navigation, and control keys to the chat composer.
 ///
 /// Returns a submission on Enter: a prompt for the model, or a recognized slash command.
@@ -989,6 +1092,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     if state.screen != Screen::Chat
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
+        || state.pending_update.is_some()
     {
         return None;
     }
@@ -1060,8 +1164,8 @@ mod tests {
 
     use super::{
         AppState, ChatEntry, ChatSubmission, InputAction, Screen, SlashCommand, classify_event,
-        handle_chat_event, handle_permission_event, render, run_with_event_source,
-        slash_suggestions,
+        handle_chat_event, handle_permission_event, handle_update_event, render,
+        run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -1099,6 +1203,38 @@ mod tests {
 
         state.apply(&AppEvent::BootCompleted);
         assert_eq!(state.screen, Screen::Chat);
+    }
+
+    #[test]
+    fn update_waits_for_the_active_run_then_requires_explicit_confirmation() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            activity: Some(AgentActivityState::Thinking),
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::UpdateAvailable {
+            version: "0.0.2".into(),
+            notes: "A safer updater.".into(),
+        });
+        assert!(state.pending_update.is_none());
+        state.apply(&AppEvent::AgentCompleted {
+            final_text: None,
+            turns: 1,
+            tool_calls: 0,
+            failed_tool_calls: 0,
+        });
+        assert_eq!(
+            state
+                .pending_update
+                .as_ref()
+                .map(|prompt| prompt.version.as_str()),
+            Some("0.0.2")
+        );
+        assert_eq!(
+            handle_update_event(&mut state, &press(KeyCode::Char('n'))),
+            Some(false)
+        );
+        assert!(state.pending_update.is_none());
     }
 
     #[test]

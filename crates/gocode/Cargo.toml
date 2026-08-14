@@ -13,7 +13,10 @@ gocode-core = { path = "../gocode-core" }
 gocode-provider-nvidia = { path = "../gocode-provider-nvidia" }
 gocode-tools = { path = "../gocode-tools" }
 gocode-tui = { path = "../gocode-tui" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+gocode-updater = { path = "../gocode-updater" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+semver = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["json"] }

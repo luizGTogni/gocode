@@ -1,6 +1,6 @@
 # Gocode — Updater Specification
 
-**Status:** Initial technical draft  
+**Status:** Implemented for v0.0.6; Windows packaged-flow validation remains required
 **Product:** Gocode  
 **Target version:** v0.1.0  
 **Scope:** Update discovery, download, verification, Windows self-update, rollback
