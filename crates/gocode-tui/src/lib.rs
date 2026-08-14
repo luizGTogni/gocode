@@ -1164,7 +1164,7 @@ mod tests {
 
     use super::{
         AppState, ChatEntry, ChatSubmission, InputAction, Screen, SlashCommand, classify_event,
-        handle_chat_event, handle_permission_event, handle_update_event, render,
+        handle_chat_event, handle_onboarding_event, handle_permission_event, handle_update_event, render,
         run_with_event_source, slash_suggestions,
     };
 
@@ -1282,6 +1282,18 @@ mod tests {
 
         assert_eq!(state.take_credential_submission(), Some("a".into()));
         assert_eq!(state.take_credential_submission(), None);
+    }
+
+    #[test]
+    fn onboarding_paste_appends_the_api_key_without_submitting_it() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::CredentialRequired);
+
+        assert_eq!(
+            handle_onboarding_event(&mut state, &Event::Paste("nvapi-secret".into())),
+            None
+        );
+        assert_eq!(state.take_credential_submission(), Some("nvapi-secret".into()));
     }
 
     #[test]

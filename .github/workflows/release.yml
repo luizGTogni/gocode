@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - id: version
+        shell: bash
+        run: |
+          version=$(cargo pkgid -p gocode | sed -E 's/.*[#@]//')
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+
+  package:
+    needs: validate-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            script: scripts/release/package-linux.sh
+          - os: windows-latest
+            script: scripts/release/package-windows.ps1
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Package Linux archive
+        if: runner.os == 'Linux'
+        run: bash ${{ matrix.script }} dist
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./${{ matrix.script }} -OutputDirectory dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [validate-tag, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify expected assets and create checksums
+        shell: bash
+        run: |
+          cd dist
+          test -f "gocode-${{ needs.validate-tag.outputs.version }}-linux-x86_64.tar.gz"
+          test -f "gocode-${{ needs.validate-tag.outputs.version }}-windows-x86_64.zip"
+          sha256sum gocode-* > SHA256SUMS
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*
