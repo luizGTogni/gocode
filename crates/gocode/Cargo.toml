@@ -1,0 +1,18 @@
+[package]
+name = "gocode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gocode-core = { path = "../gocode-core" }
+gocode-tui = { path = "../gocode-tui" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+
+[lints]
+workspace = true

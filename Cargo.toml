@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/gocode",
+    "crates/gocode-core",
+    "crates/gocode-tui",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/gocode/gocode"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

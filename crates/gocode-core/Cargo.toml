@@ -1,0 +1,15 @@
+[package]
+name = "gocode-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
+toml = "0.9"
+
+[lints]
+workspace = true
