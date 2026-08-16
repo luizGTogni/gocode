@@ -13,7 +13,7 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-pub const RELEASES_URL: &str = "https://api.github.com/repos/gocode/gocode/releases";
+pub const RELEASES_URL: &str = "https://api.github.com/repos/luizGTogni/gocode/releases";
 pub const WINDOWS_ARCHIVE_SUFFIX: &str = "windows-x86_64.zip";
 pub const LINUX_ARCHIVE_SUFFIX: &str = "linux-x86_64.tar.gz";
 pub const CHECKSUM_ASSET: &str = "SHA256SUMS";
