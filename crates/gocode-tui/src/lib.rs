@@ -3105,6 +3105,9 @@ fn run_terminal(
     let mut state = AppState::default();
     let mut last_ctrl_c: Option<Instant> = None;
     let mut copy_notification_deadline: Option<Instant> = None;
+    // On X11, clipboard ownership ends when this handle is dropped. Keep it for the terminal
+    // lifetime so clipboard managers have time to persist a copied selection.
+    let mut clipboard: Option<arboard::Clipboard> = None;
 
     let send_command = |command_tx: &mpsc::Sender<AppCommand>, command: AppCommand| {
         command_tx.blocking_send(command).map_err(|error| {
@@ -3149,7 +3152,12 @@ fn run_terminal(
             let terminal_area: Rect = terminal.size().map_err(std::io::Error::other)?.into();
             let handled = handle_mouse_event(&mut state, mouse_event, terminal_area);
             if handled && matches!(mouse_event.kind, MouseEventKind::Up(MouseButton::Left)) {
-                try_copy_selection(&mut state, terminal_area, &mut copy_notification_deadline);
+                try_copy_selection(
+                    &mut state,
+                    terminal_area,
+                    &mut copy_notification_deadline,
+                    &mut clipboard,
+                );
             }
             if handled {
                 continue;
@@ -3166,7 +3174,12 @@ fn run_terminal(
         {
             if state.selection.is_some() {
                 let terminal_area: Rect = terminal.size().map_err(std::io::Error::other)?.into();
-                try_copy_selection(&mut state, terminal_area, &mut copy_notification_deadline);
+                try_copy_selection(
+                    &mut state,
+                    terminal_area,
+                    &mut copy_notification_deadline,
+                    &mut clipboard,
+                );
                 continue;
             }
             let now = Instant::now();
@@ -4252,13 +4265,19 @@ fn try_copy_selection(
     state: &mut AppState,
     terminal_area: Rect,
     notification_deadline: &mut Option<Instant>,
+    clipboard: &mut Option<arboard::Clipboard>,
 ) {
     let Some(text) = extract_selected_text(state, terminal_area) else {
         return;
     };
     let char_count = text.chars().count();
-    let copied = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text));
-    if copied.is_ok() {
+    if clipboard.is_none() {
+        *clipboard = arboard::Clipboard::new().ok();
+    }
+    if clipboard
+        .as_mut()
+        .is_some_and(|clipboard| clipboard.set_text(text).is_ok())
+    {
         state.copy_notification = Some(format!("Copied {char_count} chars to clipboard"));
         *notification_deadline = Some(Instant::now() + COPY_NOTIFICATION_DURATION);
     }
