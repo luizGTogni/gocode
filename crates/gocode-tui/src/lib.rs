@@ -173,6 +173,8 @@ pub enum SlashCommand {
     Init,
     /// Open the discovered-skills popup.
     Skills,
+    /// Open the MCP server manager: list servers, connect/disconnect, inspect their tools.
+    Mcp,
     /// Switch permission mode to Plan (read-only).
     PlanMode,
     /// Review a diff, branch, or the working tree's uncommitted changes. The `String` is the
@@ -192,6 +194,18 @@ enum SkillsView {
     List,
     /// A checkbox list for toggling skills on or off for this project.
     EnableDisable,
+}
+
+/// Which screen the `/mcp` popup is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum McpView {
+    /// The "Choose an action" menu.
+    #[default]
+    Menu,
+    /// Every configured server and its live connection status.
+    ServerList,
+    /// The tools discovered from one connected server.
+    ServerDetail,
 }
 
 /// One tab of the `/help` popup.
@@ -280,6 +294,11 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "/skills",
         "List discovered skills (global and project)",
         SlashCommand::Skills,
+    ),
+    (
+        "/mcp",
+        "Manage MCP servers: list, connect, disconnect, inspect tools",
+        SlashCommand::Mcp,
     ),
     (
         "/plan",
@@ -404,6 +423,17 @@ pub struct AppState {
     custom_commands: Vec<gocode_core::CustomCommand>,
     /// Global and project skills discovered at boot.
     skills: Vec<gocode_core::SkillSummary>,
+    /// Whether the `/mcp` popup is currently shown over the chat screen.
+    mcp_visible: bool,
+    /// Which screen of the `/mcp` popup is currently shown.
+    mcp_view: McpView,
+    /// Selected row within the current `/mcp` screen (menu action, or server index).
+    mcp_selected: usize,
+    /// Configured MCP servers and their live connection status, refreshed after every
+    /// connect/disconnect.
+    mcp_servers: Vec<gocode_core::McpServerStatus>,
+    /// Lines scrolled down from the top of the `/mcp` server detail screen.
+    mcp_detail_scroll: u16,
     /// Display form of the detected project root, shown by `/status`.
     working_directory: String,
     /// The active session's id, shown by `/status`.
@@ -455,6 +485,7 @@ impl AppState {
                 self.custom_commands.clone_from(commands);
             }
             AppEvent::SkillsAvailable(skills) => self.skills.clone_from(skills),
+            AppEvent::McpServersAvailable(servers) => self.mcp_servers.clone_from(servers),
             AppEvent::TerminalResized { .. } => {}
             AppEvent::CredentialRequired => self.screen = Screen::Onboarding,
             AppEvent::CredentialValidationStarted => {
@@ -1341,6 +1372,8 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
         render_help_modal(frame, state, area);
     } else if state.skills_visible {
         render_skills_modal(frame, state, area);
+    } else if state.mcp_visible {
+        render_mcp_modal(frame, state, area);
     }
 }
 
@@ -1622,6 +1655,170 @@ fn render_skills_enable_disable(frame: &mut Frame, state: &AppState, area: Rect)
         Paragraph::new("Enter/Space to toggle · Esc to go back")
             .style(Style::default().fg(Color::DarkGray)),
         chunks[2],
+    );
+}
+
+/// The `/mcp` menu's actions, in display order.
+const MCP_MENU_ITEMS: [(&str, &str); 1] = [(
+    "Servers",
+    "List configured MCP servers, connect/disconnect, and inspect their tools.",
+)];
+
+fn render_mcp_modal(frame: &mut Frame, state: &AppState, area: Rect) {
+    match state.mcp_view {
+        McpView::Menu => render_mcp_menu(frame, state, area),
+        McpView::ServerList => render_mcp_server_list(frame, state, area),
+        McpView::ServerDetail => render_mcp_server_detail(frame, state, area),
+    }
+}
+
+fn render_mcp_menu(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 76, 10);
+    let mut content = String::from("Choose an action\n\n");
+    for (index, (label, description)) in MCP_MENU_ITEMS.iter().enumerate() {
+        let cursor = if index == state.mcp_selected {
+            ">"
+        } else {
+            " "
+        };
+        let _ = writeln!(content, "{cursor} {}. {label} — {description}", index + 1);
+    }
+    content.push_str("\nEnter to select · Esc to close");
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title("Gocode · MCP").borders(Borders::ALL)),
+        modal,
+    );
+}
+
+/// One row of the `/mcp` server list: cursor, name, transport, and live status.
+fn mcp_server_row(server: &gocode_core::McpServerStatus, selected: bool) -> String {
+    let cursor = if selected { ">" } else { " " };
+    let status = if let Some(error) = &server.error {
+        format!("Error: {error}")
+    } else if server.connected {
+        format!("Connected ({} tools)", server.tool_count)
+    } else {
+        "Disconnected".into()
+    };
+    format!("{cursor} {} ({}) — {status}", server.name, server.transport)
+}
+
+fn render_mcp_server_list(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 76, 24);
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title("Gocode · MCP Servers")
+        .borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new("Configured MCP servers\n"), chunks[0]);
+
+    if state.mcp_servers.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "None configured. Add one to ~/.config/gocode/mcp.toml or \
+                 .gocode/mcp.toml, then reopen /mcp.",
+            )
+            .wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    } else {
+        let visible_rows = usize::from(chunks[1].height).max(1);
+        let first_visible = state
+            .mcp_selected
+            .saturating_sub(visible_rows.saturating_sub(1));
+        let content = state.mcp_servers[first_visible..]
+            .iter()
+            .enumerate()
+            .take(visible_rows)
+            .map(|(offset, server)| {
+                let index = first_visible + offset;
+                mcp_server_row(server, index == state.mcp_selected)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        frame.render_widget(Paragraph::new(content), chunks[1]);
+    }
+
+    frame.render_widget(
+        Paragraph::new("Enter to connect/disconnect · → to inspect tools · Esc to go back")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn render_mcp_server_detail(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 76, 24);
+    frame.render_widget(Clear, modal);
+    let server = state.mcp_servers.get(state.mcp_selected);
+    let title = server.map_or_else(
+        || "Gocode · MCP Server".to_string(),
+        |server| format!("Gocode · MCP · {}", server.name),
+    );
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut content = String::new();
+    match server {
+        None => content.push_str("This server is no longer configured."),
+        Some(server) => {
+            let _ = writeln!(content, "Transport: {}", server.transport);
+            let status = if let Some(error) = &server.error {
+                format!("Error: {error}")
+            } else if server.connected {
+                "Connected".to_string()
+            } else {
+                "Disconnected".to_string()
+            };
+            let _ = writeln!(content, "Status: {status}\n");
+            if server.tool_names.is_empty() {
+                content.push_str("No tools discovered yet. Connect this server to list them.");
+            } else {
+                content.push_str("Tools:\n");
+                for tool in &server.tool_names {
+                    let _ = writeln!(content, "  - {tool}");
+                }
+            }
+        }
+    }
+
+    let content_lines = content.lines().count();
+    let visible_rows = usize::from(chunks[0].height).max(1);
+    let max_scroll = u16::try_from(content_lines.saturating_sub(visible_rows)).unwrap_or(u16::MAX);
+    let scroll = state.mcp_detail_scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        chunks[0],
+    );
+
+    let footer = if max_scroll > 0 {
+        "Up/Down to scroll · Esc to go back"
+    } else {
+        "Esc to go back"
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
     );
 }
 
@@ -2292,6 +2489,19 @@ fn run_terminal(
             }
         }
 
+        match handle_mcp_event(&mut state, &terminal_event) {
+            McpEventOutcome::NotHandled => {}
+            McpEventOutcome::Handled => continue,
+            McpEventOutcome::Connect(name) => {
+                send_command(&command_tx, AppCommand::McpConnect(name))?;
+                continue;
+            }
+            McpEventOutcome::Disconnect(name) => {
+                send_command(&command_tx, AppCommand::McpDisconnect(name))?;
+                continue;
+            }
+        }
+
         if let Some(submission) = handle_chat_event(&mut state, &terminal_event) {
             match submission {
                 ChatSubmission::Prompt(text) => {
@@ -2397,6 +2607,11 @@ fn run_terminal(
                     state.skills_visible = true;
                     state.skills_view = SkillsView::Menu;
                     state.skills_selected = 0;
+                }
+                ChatSubmission::Command(SlashCommand::Mcp) => {
+                    state.mcp_visible = true;
+                    state.mcp_view = McpView::Menu;
+                    state.mcp_selected = 0;
                 }
                 ChatSubmission::Command(SlashCommand::PlanMode) => {
                     state.permission_mode = PermissionMode::Plan;
@@ -3186,6 +3401,111 @@ pub fn handle_skills_event(state: &mut AppState, event: &Event) -> SkillsEventOu
     }
 }
 
+/// Outcome of dispatching a terminal event to the `/mcp` popup.
+#[derive(Debug)]
+pub enum McpEventOutcome {
+    /// The popup is not shown, or the event isn't one it cares about.
+    NotHandled,
+    /// The event was consumed by the popup with no further side effect.
+    Handled,
+    /// Connect the named configured server.
+    Connect(String),
+    /// Disconnect the named connected server.
+    Disconnect(String),
+}
+
+/// Drives the `/mcp` popup: its menu, the server list, and one server's detail view.
+///
+/// Returns [`McpEventOutcome::NotHandled`] when the popup isn't shown or the event doesn't
+/// belong to it, so callers can fall through to other handlers.
+pub fn handle_mcp_event(state: &mut AppState, event: &Event) -> McpEventOutcome {
+    if !state.mcp_visible {
+        return McpEventOutcome::NotHandled;
+    }
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return McpEventOutcome::NotHandled;
+    };
+
+    match state.mcp_view {
+        McpView::Menu => match code {
+            KeyCode::Enter => {
+                state.mcp_view = McpView::ServerList;
+                state.mcp_selected = 0;
+                McpEventOutcome::Handled
+            }
+            KeyCode::Esc => {
+                state.mcp_visible = false;
+                McpEventOutcome::Handled
+            }
+            _ => McpEventOutcome::Handled,
+        },
+        McpView::ServerList => match code {
+            KeyCode::Up => {
+                state.mcp_selected = state.mcp_selected.saturating_sub(1);
+                McpEventOutcome::Handled
+            }
+            KeyCode::Down => {
+                if !state.mcp_servers.is_empty() {
+                    state.mcp_selected = (state.mcp_selected + 1).min(state.mcp_servers.len() - 1);
+                }
+                McpEventOutcome::Handled
+            }
+            KeyCode::Right => {
+                if state.mcp_servers.get(state.mcp_selected).is_some() {
+                    state.mcp_view = McpView::ServerDetail;
+                    state.mcp_detail_scroll = 0;
+                }
+                McpEventOutcome::Handled
+            }
+            KeyCode::Enter => {
+                let Some(server) = state.mcp_servers.get(state.mcp_selected) else {
+                    return McpEventOutcome::Handled;
+                };
+                if server.connected {
+                    McpEventOutcome::Disconnect(server.name.clone())
+                } else {
+                    McpEventOutcome::Connect(server.name.clone())
+                }
+            }
+            KeyCode::Esc => {
+                state.mcp_view = McpView::Menu;
+                state.mcp_selected = 0;
+                McpEventOutcome::Handled
+            }
+            _ => McpEventOutcome::Handled,
+        },
+        McpView::ServerDetail => match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Left => {
+                state.mcp_view = McpView::ServerList;
+                state.mcp_detail_scroll = 0;
+                McpEventOutcome::Handled
+            }
+            KeyCode::Up => {
+                state.mcp_detail_scroll = state.mcp_detail_scroll.saturating_sub(1);
+                McpEventOutcome::Handled
+            }
+            KeyCode::Down => {
+                state.mcp_detail_scroll = state.mcp_detail_scroll.saturating_add(1);
+                McpEventOutcome::Handled
+            }
+            KeyCode::PageUp => {
+                state.mcp_detail_scroll = state.mcp_detail_scroll.saturating_sub(5);
+                McpEventOutcome::Handled
+            }
+            KeyCode::PageDown => {
+                state.mcp_detail_scroll = state.mcp_detail_scroll.saturating_add(5);
+                McpEventOutcome::Handled
+            }
+            _ => McpEventOutcome::Handled,
+        },
+    }
+}
+
 /// Applies text input, navigation, and control keys to the chat composer.
 ///
 /// Returns a submission on Enter: a prompt for the model, or a recognized slash command.
@@ -3322,18 +3642,18 @@ mod tests {
         MouseEventKind,
     };
     use gocode_core::{
-        AgentActivityState, AppEvent, ChatMessage, ErrorSeverity, SessionSummary, SkillSource,
-        SkillSummary, ToolActivityStatus,
+        AgentActivityState, AppEvent, ChatMessage, ErrorSeverity, McpServerStatus, SessionSummary,
+        SkillSource, SkillSummary, ToolActivityStatus,
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
-        AppState, ChatEntry, ChatSubmission, HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS, Screen,
-        SkillsEventOutcome, SkillsView, SlashCommand, UpdateEventOutcome, UpdateStage,
-        classify_event, handle_chat_event, handle_effort_picker_event, handle_help_event,
-        handle_model_picker_event, handle_onboarding_event, handle_permission_event,
-        handle_session_picker_event, handle_skills_event, handle_update_event, render,
-        run_with_event_source, slash_suggestions,
+        AppState, ChatEntry, ChatSubmission, HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS,
+        McpEventOutcome, McpView, Screen, SkillsEventOutcome, SkillsView, SlashCommand,
+        UpdateEventOutcome, UpdateStage, classify_event, handle_chat_event,
+        handle_effort_picker_event, handle_help_event, handle_mcp_event, handle_model_picker_event,
+        handle_onboarding_event, handle_permission_event, handle_session_picker_event,
+        handle_skills_event, handle_update_event, render, run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -4994,5 +5314,132 @@ mod tests {
             other => panic!("expected a toggle outcome, got a different result: {other:?}"),
         }
         assert!(state.skills[0].enabled);
+    }
+
+    fn sample_mcp_servers() -> Vec<McpServerStatus> {
+        vec![
+            McpServerStatus {
+                name: "filesystem".into(),
+                transport: "stdio",
+                connected: true,
+                tool_count: 2,
+                tool_names: vec![
+                    "mcp__filesystem__read".into(),
+                    "mcp__filesystem__write".into(),
+                ],
+                error: None,
+            },
+            McpServerStatus {
+                name: "broken".into(),
+                transport: "http",
+                connected: false,
+                tool_count: 0,
+                tool_names: Vec::new(),
+                error: Some("connection refused".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn mcp_servers_available_event_updates_the_server_list() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::McpServersAvailable(sample_mcp_servers()));
+        assert_eq!(state.mcp_servers.len(), 2);
+        assert_eq!(state.mcp_servers[0].name, "filesystem");
+    }
+
+    #[test]
+    fn mcp_popup_opens_on_the_choose_an_action_menu_then_enter_shows_the_server_list() {
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_servers: sample_mcp_servers(),
+            ..AppState::default()
+        };
+        assert_eq!(state.mcp_view, McpView::Menu);
+
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Enter)),
+            McpEventOutcome::Handled
+        ));
+        assert_eq!(state.mcp_view, McpView::ServerList);
+    }
+
+    #[test]
+    fn esc_on_the_mcp_menu_closes_the_whole_popup() {
+        let mut state = AppState {
+            mcp_visible: true,
+            ..AppState::default()
+        };
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Esc)),
+            McpEventOutcome::Handled
+        ));
+        assert!(!state.mcp_visible);
+    }
+
+    #[test]
+    fn server_list_enter_connects_a_disconnected_server_and_disconnects_a_connected_one() {
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_view: McpView::ServerList,
+            mcp_servers: sample_mcp_servers(),
+            mcp_selected: 0,
+            ..AppState::default()
+        };
+
+        match handle_mcp_event(&mut state, &press(KeyCode::Enter)) {
+            McpEventOutcome::Disconnect(name) => assert_eq!(name, "filesystem"),
+            other => panic!("expected a disconnect outcome, got {other:?}"),
+        }
+
+        state.mcp_selected = 1;
+        match handle_mcp_event(&mut state, &press(KeyCode::Enter)) {
+            McpEventOutcome::Connect(name) => assert_eq!(name, "broken"),
+            other => panic!("expected a connect outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_list_navigation_stays_within_bounds() {
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_view: McpView::ServerList,
+            mcp_servers: sample_mcp_servers(),
+            mcp_selected: 0,
+            ..AppState::default()
+        };
+
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Up)),
+            McpEventOutcome::Handled
+        ));
+        assert_eq!(state.mcp_selected, 0);
+
+        handle_mcp_event(&mut state, &press(KeyCode::Down));
+        handle_mcp_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(state.mcp_selected, 1);
+    }
+
+    #[test]
+    fn right_arrow_opens_server_detail_then_esc_returns_to_the_list() {
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_view: McpView::ServerList,
+            mcp_servers: sample_mcp_servers(),
+            mcp_selected: 0,
+            ..AppState::default()
+        };
+
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Right)),
+            McpEventOutcome::Handled
+        ));
+        assert_eq!(state.mcp_view, McpView::ServerDetail);
+
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Esc)),
+            McpEventOutcome::Handled
+        ));
+        assert_eq!(state.mcp_view, McpView::ServerList);
     }
 }

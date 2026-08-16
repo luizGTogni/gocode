@@ -33,6 +33,17 @@ pub enum McpTransportConfig {
     },
 }
 
+impl McpTransportConfig {
+    /// Short, user-facing transport label, as shown in the `/mcp` server list.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Stdio { .. } => "stdio",
+            Self::Http { .. } => "http",
+        }
+    }
+}
+
 /// How gocode authenticates to an MCP server, if at all.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -74,6 +85,26 @@ fn is_no_auth(auth: &McpAuthConfig) -> bool {
 
 fn default_enabled() -> bool {
     true
+}
+
+/// One configured MCP server's live status, for the `/mcp` server list. Distinct from
+/// [`McpServerEntry`]: this is runtime state (is it actually connected right now?), not
+/// persisted configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerStatus {
+    /// Matches the corresponding [`McpServerEntry::name`].
+    pub name: String,
+    /// Short transport label (`"stdio"` or `"http"`), from [`McpTransportConfig::label`].
+    pub transport: &'static str,
+    /// Whether this server currently has a live connection.
+    pub connected: bool,
+    /// Number of tools discovered from this server, `0` when not connected.
+    pub tool_count: usize,
+    /// Model-facing names of the tools discovered from this server (`mcp__<server>__<tool>`),
+    /// for the `/mcp` server detail view. Empty when not connected.
+    pub tool_names: Vec<String>,
+    /// The most recent connection error, if any. Cleared on a successful connect.
+    pub error: Option<String>,
 }
 
 /// MCP server configuration for one precedence layer (global or project).

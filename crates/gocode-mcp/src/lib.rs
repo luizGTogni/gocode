@@ -8,7 +8,9 @@ pub mod tool_bridge;
 pub mod transport;
 
 pub use client::{McpClient, McpToolInfo, ToolCallOutcome};
-pub use manager::{McpConnectOutcome, connect_configured_servers};
+pub use manager::{
+    McpConnectOutcome, McpServerConnection, connect_configured_servers, connect_server,
+};
 pub use tool_bridge::McpTool;
 pub use transport::{McpTransport, stdio::StdioTransport};
 

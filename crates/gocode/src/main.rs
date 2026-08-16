@@ -173,46 +173,120 @@ fn describe_warning(warning: &gocode_agent::AgentWarning) -> String {
     }
 }
 
-/// Loads the merged global+project MCP server configuration, connects every enabled server,
-/// and returns a tool registry with the built-ins plus every discovered MCP tool. Best-effort:
-/// a server that fails to connect is reported as an [`gocode_core::AppEvent::AgentWarning`] and
-/// simply contributes no tools, rather than preventing startup.
-async fn connect_configured_mcp_servers(
-    paths: &PlatformPaths,
-    project: &ProjectContext,
-    event_tx: &mpsc::Sender<gocode_core::AppEvent>,
-) -> ToolRegistry {
-    let mut registry = builtin_registry();
+/// Configured MCP servers and their live connection state, owned by the runtime loop. Rebuilt
+/// into a fresh [`ToolRegistry`] after every connect/disconnect; `/mcp` never mutates the tool
+/// registry directly, only this state.
+struct McpRuntime {
+    /// Every configured server (global + project, merged), in file order.
+    servers: Vec<gocode_core::McpServerEntry>,
+    /// Tools discovered from each currently-connected server, keyed by server name.
+    connected: HashMap<String, Vec<Arc<dyn gocode_tools::contract::Tool>>>,
+    /// The most recent connection error for a server, keyed by server name. Cleared on connect.
+    errors: HashMap<String, String>,
+}
 
-    let load_layer = |path: &Path, layer: &str| match gocode_core::load_or_default_mcp_config(path)
-    {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!("could not load {layer} mcp.toml: {error}");
-            gocode_core::McpConfig::default()
+impl McpRuntime {
+    /// Loads the merged global+project MCP server configuration and connects every enabled
+    /// server. Best-effort: a server that fails to connect contributes no tools and is recorded
+    /// in `errors`, rather than preventing startup.
+    async fn bootstrap(paths: &PlatformPaths, project: &ProjectContext) -> Self {
+        let load_layer =
+            |path: &Path, layer: &str| match gocode_core::load_or_default_mcp_config(path) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::warn!("could not load {layer} mcp.toml: {error}");
+                    gocode_core::McpConfig::default()
+                }
+            };
+        let global_mcp = load_layer(&paths.mcp_config_path(), "global");
+        let project_mcp = load_layer(&project.mcp_config_path(), "project");
+        let servers = gocode_core::merge_mcp_servers(&global_mcp, &project_mcp);
+
+        let mut runtime = Self {
+            servers,
+            connected: HashMap::new(),
+            errors: HashMap::new(),
+        };
+
+        let enabled: Vec<_> = runtime
+            .servers
+            .iter()
+            .filter(|server| server.enabled)
+            .cloned()
+            .collect();
+        if !enabled.is_empty() {
+            let outcome = gocode_mcp::connect_configured_servers(&enabled).await;
+            for connection in outcome.connections {
+                runtime.connected.insert(connection.name, connection.tools);
+            }
+            for (server_name, error) in outcome.failures {
+                runtime.errors.insert(server_name, error.to_string());
+            }
         }
-    };
-    let global_mcp = load_layer(&paths.mcp_config_path(), "global");
-    let project_mcp = load_layer(&project.mcp_config_path(), "project");
-    let servers = gocode_core::merge_mcp_servers(&global_mcp, &project_mcp);
 
-    if servers.is_empty() {
-        return registry;
+        runtime
     }
 
-    let outcome = gocode_mcp::connect_configured_servers(&servers).await;
-    for tool in outcome.tools {
-        registry.register(tool);
-    }
-    for (server_name, error) in outcome.failures {
-        let _ = event_tx
-            .send(gocode_core::AppEvent::AgentWarning(format!(
-                "MCP server '{server_name}' failed to connect: {error}"
-            )))
-            .await;
+    /// Connects one configured server by name, regardless of its persisted `enabled` flag.
+    async fn connect(&mut self, name: &str) -> Result<(), String> {
+        let Some(server) = self.servers.iter().find(|server| server.name == name) else {
+            return Err(format!("no MCP server named '{name}' is configured"));
+        };
+        match gocode_mcp::connect_server(server).await {
+            Ok(connection) => {
+                self.connected.insert(connection.name, connection.tools);
+                self.errors.remove(name);
+                Ok(())
+            }
+            Err(error) => {
+                self.errors.insert(name.to_string(), error.to_string());
+                Err(error.to_string())
+            }
+        }
     }
 
-    registry
+    /// Disconnects one currently-connected server by name, dropping its tools (and, once the
+    /// last reference to its client is gone, its subprocess).
+    fn disconnect(&mut self, name: &str) -> bool {
+        self.errors.remove(name);
+        self.connected.remove(name).is_some()
+    }
+
+    /// One status per configured server, for [`gocode_core::AppEvent::McpServersAvailable`].
+    fn statuses(&self) -> Vec<gocode_core::McpServerStatus> {
+        self.servers
+            .iter()
+            .map(|server| {
+                let tools = self.connected.get(&server.name);
+                let tool_names = tools.map_or_else(Vec::new, |tools| {
+                    tools
+                        .iter()
+                        .map(|tool| tool.definition().name.as_str().to_string())
+                        .collect()
+                });
+                gocode_core::McpServerStatus {
+                    name: server.name.clone(),
+                    transport: server.transport.label(),
+                    connected: tools.is_some(),
+                    tool_count: tools.map_or(0, Vec::len),
+                    tool_names,
+                    error: self.errors.get(&server.name).cloned(),
+                }
+            })
+            .collect()
+    }
+
+    /// Rebuilds a tool registry from the built-ins plus every currently-connected server's
+    /// tools.
+    fn build_registry(&self) -> ToolRegistry {
+        let mut registry = builtin_registry();
+        for tools in self.connected.values() {
+            for tool in tools {
+                registry.register(Arc::clone(tool));
+            }
+        }
+        registry
+    }
 }
 
 fn first_line(text: &str, max_chars: usize) -> String {
@@ -380,9 +454,17 @@ async fn run_application() -> Result<(), AppError> {
             Arc::new(Mutex::new(gocode_core::SessionRecord::new()));
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
-        let tool_registry: Arc<ToolRegistry> = Arc::new(
-            connect_configured_mcp_servers(&paths, &bootstrap.project, &driver.event_tx).await,
-        );
+        let mut mcp_runtime = McpRuntime::bootstrap(&paths, &bootstrap.project).await;
+        let mut tool_registry: Arc<ToolRegistry> = Arc::new(mcp_runtime.build_registry());
+        driver
+            .event_tx
+            .send(gocode_core::AppEvent::McpServersAvailable(
+                mcp_runtime.statuses(),
+            ))
+            .await
+            .map_err(|error| {
+                AppError::Initialization(format!("could not send configured MCP servers: {error}"))
+            })?;
         let permission_pending: PendingPermission = Arc::new(Mutex::new(None));
         let instructions =
             std::fs::read_to_string(bootstrap.project.gocode_dir.join("instructions.md")).ok();
@@ -914,6 +996,43 @@ async fn run_application() -> Result<(), AppError> {
                                 })?;
                         }
                     }
+                }
+                AppCommand::McpConnect(name) => {
+                    if let Err(error) = mcp_runtime.connect(&name).await {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentWarning(format!(
+                                "MCP server '{name}' failed to connect: {error}"
+                            )))
+                            .await;
+                    }
+                    tool_registry = Arc::new(mcp_runtime.build_registry());
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::McpServersAvailable(
+                            mcp_runtime.statuses(),
+                        ))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not report MCP server status: {error}"
+                            ))
+                        })?;
+                }
+                AppCommand::McpDisconnect(name) => {
+                    mcp_runtime.disconnect(&name);
+                    tool_registry = Arc::new(mcp_runtime.build_registry());
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::McpServersAvailable(
+                            mcp_runtime.statuses(),
+                        ))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not report MCP server status: {error}"
+                            ))
+                        })?;
                 }
                 AppCommand::AcceptUpdate => {
                     match prepare_update(&paths.cache_dir, driver.event_tx.clone()).await {

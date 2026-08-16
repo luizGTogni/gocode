@@ -6,8 +6,8 @@ pub use markdown_doc::{
     load_disabled_skills, load_skills, parse_frontmatter, save_disabled_skills, set_skill_enabled,
 };
 pub use mcp_config::{
-    McpAuthConfig, McpConfig, McpServerEntry, McpTransportConfig, load_or_default_mcp_config,
-    merge_mcp_servers, save_mcp_config,
+    McpAuthConfig, McpConfig, McpServerEntry, McpServerStatus, McpTransportConfig,
+    load_or_default_mcp_config, merge_mcp_servers, save_mcp_config,
 };
 pub use session::{
     SessionRecord, SessionSummary, list_sessions, load_session, save_session, sessions_dir,
@@ -60,6 +60,10 @@ pub enum AppCommand {
     ResumeSession(String),
     /// Enable or disable a discovered skill by name for this project.
     SetSkillEnabled { name: String, enabled: bool },
+    /// Connect a configured-but-not-yet-connected MCP server by name.
+    McpConnect(String),
+    /// Disconnect a currently connected MCP server by name, stopping its subprocess.
+    McpDisconnect(String),
 }
 
 /// How permissively an agent run is allowed to act without asking the user first.
@@ -237,6 +241,9 @@ pub enum AppEvent {
     SessionListAvailable(Vec<SessionSummary>),
     /// A session could not be resumed; the current session is unchanged.
     SessionResumeFailed(String),
+    /// Configured MCP servers and their live connection status; sent once after bootstrap and
+    /// resent in full after every connect/disconnect.
+    McpServersAvailable(Vec<McpServerStatus>),
 }
 
 /// Coarse lifecycle phase of an active agent run, for a concise status indicator.

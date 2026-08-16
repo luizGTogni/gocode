@@ -9,12 +9,20 @@ use gocode_tools::contract::Tool;
 
 use crate::{McpClient, McpError, tool_bridge::McpTool, transport::stdio::StdioTransport};
 
-/// Result of attempting to connect every configured server: the tools successfully discovered,
-/// plus one diagnostic per server that failed.
+/// One server's tools, discovered after a successful connect.
+pub struct McpServerConnection {
+    /// Matches the connected [`McpServerEntry::name`].
+    pub name: String,
+    /// Every tool this server advertised.
+    pub tools: Vec<Arc<dyn Tool>>,
+}
+
+/// Result of attempting to connect every configured server: one [`McpServerConnection`] per
+/// server that connected successfully, plus one diagnostic per server that failed.
 #[derive(Default)]
 pub struct McpConnectOutcome {
-    /// Every tool discovered across every server that connected successfully.
-    pub tools: Vec<Arc<dyn Tool>>,
+    /// Every server that connected successfully, in `servers` order.
+    pub connections: Vec<McpServerConnection>,
     /// `(server_name, error)` for each server that failed to connect or initialize.
     pub failures: Vec<(String, McpError)>,
 }
@@ -23,15 +31,21 @@ pub struct McpConnectOutcome {
 pub async fn connect_configured_servers(servers: &[McpServerEntry]) -> McpConnectOutcome {
     let mut outcome = McpConnectOutcome::default();
     for server in servers.iter().filter(|server| server.enabled) {
-        match connect_one(server).await {
-            Ok(tools) => outcome.tools.extend(tools),
+        match connect_server(server).await {
+            Ok(connection) => outcome.connections.push(connection),
             Err(error) => outcome.failures.push((server.name.clone(), error)),
         }
     }
     outcome
 }
 
-async fn connect_one(server: &McpServerEntry) -> Result<Vec<Arc<dyn Tool>>, McpError> {
+/// Connects a single server, regardless of its `enabled` flag — used both by
+/// [`connect_configured_servers`] and by an explicit `/mcp connect <name>` action.
+///
+/// # Errors
+/// Returns an error if the server cannot be spawned/reached, fails the `initialize` handshake,
+/// or its transport is not yet implemented (streamable HTTP).
+pub async fn connect_server(server: &McpServerEntry) -> Result<McpServerConnection, McpError> {
     match &server.transport {
         McpTransportConfig::Stdio { command, args, env } => {
             let env_pairs: Vec<(String, String)> = env
@@ -41,13 +55,17 @@ async fn connect_one(server: &McpServerEntry) -> Result<Vec<Arc<dyn Tool>>, McpE
             let transport = StdioTransport::spawn(command, args, &env_pairs)?;
             let client = Arc::new(McpClient::connect(transport).await?);
             let infos = client.list_tools().await?;
-            Ok(infos
+            let tools = infos
                 .into_iter()
                 .map(|info| {
                     Arc::new(McpTool::new(Arc::clone(&client), server.name.clone(), info))
                         as Arc<dyn Tool>
                 })
-                .collect())
+                .collect();
+            Ok(McpServerConnection {
+                name: server.name.clone(),
+                tools,
+            })
         }
         McpTransportConfig::Http { .. } => Err(McpError::Transport(
             "the streamable-HTTP MCP transport is not implemented yet".into(),
@@ -88,9 +106,11 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":
         let outcome = connect_configured_servers(&servers).await;
 
         assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
-        assert_eq!(outcome.tools.len(), 1);
+        assert_eq!(outcome.connections.len(), 1);
+        assert_eq!(outcome.connections[0].name, "fake");
+        assert_eq!(outcome.connections[0].tools.len(), 1);
         assert_eq!(
-            outcome.tools[0].definition().name.as_str(),
+            outcome.connections[0].tools[0].definition().name.as_str(),
             "mcp__fake__echo"
         );
     }
@@ -101,7 +121,7 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":
         server.enabled = false;
         let outcome = connect_configured_servers(&[server]).await;
 
-        assert!(outcome.tools.is_empty());
+        assert!(outcome.connections.is_empty());
         assert!(outcome.failures.is_empty());
     }
 
@@ -116,7 +136,7 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":
         };
 
         let outcome = connect_configured_servers(&servers).await;
-        assert!(outcome.tools.is_empty());
+        assert!(outcome.connections.is_empty());
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].0, "broken");
     }
@@ -130,7 +150,7 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":
         };
 
         let outcome = connect_configured_servers(&[server]).await;
-        assert!(outcome.tools.is_empty());
+        assert!(outcome.connections.is_empty());
         assert_eq!(outcome.failures.len(), 1);
     }
 }
