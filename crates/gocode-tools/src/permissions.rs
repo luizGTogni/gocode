@@ -214,11 +214,13 @@ const PLAN_WRITABLE_EXTENSIONS: &[&str] = &[
 ];
 
 fn is_plan_writable(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-        PLAN_WRITABLE_EXTENSIONS
-            .iter()
-            .any(|allowed| ext.eq_ignore_ascii_case(allowed))
-    })
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            PLAN_WRITABLE_EXTENSIONS
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        })
 }
 
 /// The MVP default policy described in `docs/TOOLS.md` §25.

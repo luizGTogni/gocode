@@ -595,7 +595,9 @@ impl AppState {
     fn move_cursor_vertical(&mut self, delta: isize) {
         let lines: Vec<&str> = self.chat_input.split('\n').collect();
         let (line, col) = cursor_line_col(&lines, self.cursor);
-        let Some(target_line) = line.checked_add_signed(delta).filter(|line| *line < lines.len())
+        let Some(target_line) = line
+            .checked_add_signed(delta)
+            .filter(|line| *line < lines.len())
         else {
             return;
         };
@@ -644,7 +646,10 @@ fn banner_lines(state: &AppState) -> Vec<String> {
         .map(|line| (*line).to_string())
         .collect();
     lines.push(String::new());
-    let model = state.current_model.as_deref().unwrap_or("no model selected");
+    let model = state
+        .current_model
+        .as_deref()
+        .unwrap_or("no model selected");
     lines.push(format!("Gocode v{VERSION} · {model} · NVIDIA NIM"));
     if let Ok(cwd) = std::env::current_dir() {
         lines.push(cwd.display().to_string());
@@ -1104,7 +1109,9 @@ fn visible_suggestion_window(count: usize, selected: usize) -> (usize, usize, bo
         return (0, count, false);
     }
     let rows = MAX_VISIBLE_SUGGESTIONS - 1;
-    let first = selected.saturating_sub(rows.saturating_sub(1)).min(count - rows);
+    let first = selected
+        .saturating_sub(rows.saturating_sub(1))
+        .min(count - rows);
     (first, first + rows, true)
 }
 
@@ -1136,13 +1143,25 @@ impl Selection {
 
 /// The character range selected on one wrapped line, if any: the full line for lines strictly
 /// between the two endpoints, and a partial range on the endpoint lines themselves.
-fn selected_char_range(selection: &Selection, line_index: usize, line_len: usize) -> Option<(usize, usize)> {
+fn selected_char_range(
+    selection: &Selection,
+    line_index: usize,
+    line_len: usize,
+) -> Option<(usize, usize)> {
     let (start, end) = selection.normalized();
     if line_index < start.line || line_index > end.line {
         return None;
     }
-    let from = if line_index == start.line { start.col.min(line_len) } else { 0 };
-    let to = if line_index == end.line { end.col.min(line_len) } else { line_len };
+    let from = if line_index == start.line {
+        start.col.min(line_len)
+    } else {
+        0
+    };
+    let to = if line_index == end.line {
+        end.col.min(line_len)
+    } else {
+        line_len
+    };
     (from < to).then_some((from, to))
 }
 
@@ -1833,7 +1852,11 @@ fn composer_input_click_position(
     let col_in_line = local_col
         .saturating_sub(prefix_len)
         .min(input_lines[local_row].chars().count());
-    Some(char_index_from_line_col(&input_lines, local_row, col_in_line))
+    Some(char_index_from_line_col(
+        &input_lines,
+        local_row,
+        col_in_line,
+    ))
 }
 
 /// Applies a mouse event to the transcript's text selection.
@@ -1854,16 +1877,18 @@ pub fn handle_mouse_event(state: &mut AppState, event: &MouseEvent, terminal_are
                 state.selection = None;
             } else {
                 state.selection =
-                    point_from_terminal_coords(state, terminal_area, event.column, event.row)
-                        .map(|point| Selection {
+                    point_from_terminal_coords(state, terminal_area, event.column, event.row).map(
+                        |point| Selection {
                             anchor: point,
                             cursor: point,
-                        });
+                        },
+                    );
             }
             true
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(point) = point_from_terminal_coords(state, terminal_area, event.column, event.row)
+            if let Some(point) =
+                point_from_terminal_coords(state, terminal_area, event.column, event.row)
                 && let Some(selection) = state.selection.as_mut()
             {
                 selection.cursor = point;
@@ -1908,7 +1933,12 @@ fn extract_selected_text(state: &AppState, terminal_area: Rect) -> Option<String
     let (start, end) = selection.normalized();
 
     let mut collected = Vec::new();
-    for (line_index, line) in wrapped.iter().enumerate().take(end.line + 1).skip(start.line) {
+    for (line_index, line) in wrapped
+        .iter()
+        .enumerate()
+        .take(end.line + 1)
+        .skip(start.line)
+    {
         let chars: Vec<char> = line.chars().collect();
         if let Some((from, to)) = selected_char_range(&selection, line_index, chars.len()) {
             collected.push(chars[from..to].iter().collect::<String>());
@@ -1922,7 +1952,11 @@ fn extract_selected_text(state: &AppState, terminal_area: Rect) -> Option<String
 ///
 /// Silently does nothing when there is no selection, or the clipboard cannot be reached (a
 /// missing clipboard service should not crash the interface).
-fn try_copy_selection(state: &mut AppState, terminal_area: Rect, notification_deadline: &mut Option<Instant>) {
+fn try_copy_selection(
+    state: &mut AppState,
+    terminal_area: Rect,
+    notification_deadline: &mut Option<Instant>,
+) {
     let Some(text) = extract_selected_text(state, terminal_area) else {
         return;
     };
@@ -2030,8 +2064,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
             state.suggestion_selected = state.suggestion_selected.saturating_sub(1);
         }
         KeyCode::Down if suggestion_count > 0 => {
-            state.suggestion_selected =
-                (state.suggestion_selected + 1).min(suggestion_count - 1);
+            state.suggestion_selected = (state.suggestion_selected + 1).min(suggestion_count - 1);
         }
         KeyCode::Up => {
             let lines: Vec<&str> = state.chat_input.split('\n').collect();
@@ -2226,7 +2259,11 @@ mod tests {
             ..AppState::default()
         };
         let empty_lines = super::compose_lines(&state);
-        assert!(empty_lines.iter().any(|line| line.contains("GOCODE") || line.contains('█')));
+        assert!(
+            empty_lines
+                .iter()
+                .any(|line| line.contains("GOCODE") || line.contains('█'))
+        );
 
         state.begin_run("hello".into());
         let busy_lines = super::compose_lines(&state);
@@ -2957,7 +2994,10 @@ mod tests {
         };
 
         let _ = handle_chat_event(&mut state, &press(KeyCode::Down));
-        assert_eq!(state.cursor, super::char_index_from_line_col(&["first", "second"], 1, 3));
+        assert_eq!(
+            state.cursor,
+            super::char_index_from_line_col(&["first", "second"], 1, 3)
+        );
 
         let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
         assert_eq!(state.cursor, 3);
@@ -3030,7 +3070,10 @@ mod tests {
         // On the last line: Up moves the cursor up a line, not history.
         let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
         assert_eq!(state.chat_input, "first\nsecond");
-        assert_eq!(state.cursor, super::char_index_from_line_col(&["first", "second"], 0, 2));
+        assert_eq!(
+            state.cursor,
+            super::char_index_from_line_col(&["first", "second"], 0, 2)
+        );
 
         // Now on the first line: Up recalls history instead of moving further up.
         let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
@@ -3046,7 +3089,10 @@ mod tests {
             ..AppState::default()
         };
         let total = slash_suggestions("/").len();
-        assert!(total >= 6, "test assumes at least 6 commands share the '/' prefix");
+        assert!(
+            total >= 6,
+            "test assumes at least 6 commands share the '/' prefix"
+        );
 
         let (start, end, truncated) = super::visible_suggestion_window(total, 0);
         assert!(truncated);
@@ -3107,14 +3153,8 @@ mod tests {
             cursor: super::SelectionPoint { line: 2, col: 3 },
         };
 
-        assert_eq!(
-            super::selected_char_range(&selection, 0, 10),
-            Some((5, 10))
-        );
-        assert_eq!(
-            super::selected_char_range(&selection, 1, 10),
-            Some((0, 10))
-        );
+        assert_eq!(super::selected_char_range(&selection, 0, 10), Some((5, 10)));
+        assert_eq!(super::selected_char_range(&selection, 1, 10), Some((0, 10)));
         assert_eq!(super::selected_char_range(&selection, 2, 10), Some((0, 3)));
         assert_eq!(super::selected_char_range(&selection, 3, 10), None);
     }
@@ -3147,7 +3187,8 @@ mod tests {
             .position(|window| window == needle.as_slice())
             .expect("hello is on the line");
         let visible_rows = usize::from(history_area.height.saturating_sub(2)).max(1);
-        let (start, _end) = super::compute_visible_window(wrapped.len(), visible_rows, state.scroll);
+        let (start, _end) =
+            super::compute_visible_window(wrapped.len(), visible_rows, state.scroll);
         let row = history_area.y + 1 + u16::try_from(line_index - start).unwrap();
 
         let down = MouseEvent {

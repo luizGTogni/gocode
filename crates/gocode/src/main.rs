@@ -217,7 +217,8 @@ async fn run_application() -> Result<(), AppError> {
         let mut provider = None;
         let mut selected_model = None;
         let mut model_catalog: Vec<gocode_core::Model> = Vec::new();
-        let mut reasoning_effort: Option<String> = bootstrap.resolved_config.reasoning_effort.clone();
+        let mut reasoning_effort: Option<String> =
+            bootstrap.resolved_config.reasoning_effort.clone();
         let mut permission_mode = gocode_core::PermissionMode::default();
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
@@ -419,9 +420,7 @@ async fn run_application() -> Result<(), AppError> {
                             Arc::new(DefaultPermissionPolicy::editing())
                         }
                         gocode_core::PermissionMode::Plan => Arc::new(PlanPermissionPolicy),
-                        gocode_core::PermissionMode::Approve => {
-                            Arc::new(ApproveEverythingPolicy)
-                        }
+                        gocode_core::PermissionMode::Approve => Arc::new(ApproveEverythingPolicy),
                     };
                     let permissions = PermissionContext::new(policy, resolver);
                     let agent = Agent::new(
