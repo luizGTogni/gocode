@@ -21,6 +21,53 @@ pub const DEFAULT_CREDENTIAL_ENV_VARS: &[&str] = &["NVIDIA_API_KEY"];
 /// Maximum bytes of `stdout` or `stderr` retained per stream before head/tail truncation.
 pub const DEFAULT_OUTPUT_LIMIT: usize = 100_000;
 
+/// Removes values that commonly appear in copied diagnostic output before that output is shown,
+/// streamed, or retained. This deliberately favours redacting too much over exposing a secret.
+#[must_use]
+pub fn redact_secrets(output: &str) -> String {
+    [
+        "token=",
+        "token:",
+        "password=",
+        "password:",
+        "secret=",
+        "secret:",
+        "api_key=",
+        "api_key:",
+        "authorization: bearer ",
+        "cookie:",
+    ]
+    .into_iter()
+    .fold(output.to_string(), |value, marker| {
+        redact_after(&value, marker)
+    })
+}
+
+fn redact_after(value: &str, marker: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let marker_lowercase = marker.to_ascii_lowercase();
+    let mut result = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some(found) = lowercase[cursor..].find(&marker_lowercase) {
+        let start = cursor + found;
+        let value_start = start + marker.len();
+        let secret_start = value_start
+            + value[value_start..]
+                .chars()
+                .take_while(|character| character.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+        result.push_str(&value[cursor..secret_start]);
+        let value_end = value[secret_start..]
+            .find(char::is_whitespace)
+            .map_or(value.len(), |offset| secret_start + offset);
+        result.push_str("[REDACTED]");
+        cursor = value_end;
+    }
+    result.push_str(&value[cursor..]);
+    result
+}
+
 /// A structured request to execute one external process.
 #[derive(Debug, Clone)]
 pub struct CommandRequest {
@@ -182,9 +229,9 @@ async fn run_process(
                 match result {
                     Some(text) => {
                         if let Some(sink) = &sink {
-                            sink.on_chunk(ProcessStream::Stdout, &text);
+                            sink.on_chunk(ProcessStream::Stdout, &redact_secrets(&text));
                         }
-                        stdout_buffer.push(&text);
+                        stdout_buffer.push(&redact_secrets(&text));
                     }
                     None => stdout_open = false,
                 }
@@ -193,9 +240,9 @@ async fn run_process(
                 match result {
                     Some(text) => {
                         if let Some(sink) = &sink {
-                            sink.on_chunk(ProcessStream::Stderr, &text);
+                            sink.on_chunk(ProcessStream::Stderr, &redact_secrets(&text));
                         }
-                        stderr_buffer.push(&text);
+                        stderr_buffer.push(&redact_secrets(&text));
                     }
                     None => stderr_open = false,
                 }
@@ -267,9 +314,9 @@ async fn drain_remaining(
     let mut remaining = String::new();
     if reader.read_to_string(&mut remaining).await.is_ok() && !remaining.is_empty() {
         if let Some(sink) = sink {
-            sink.on_chunk(stream, &remaining);
+            sink.on_chunk(stream, &redact_secrets(&remaining));
         }
-        buffer.push(&remaining);
+        buffer.push(&redact_secrets(&remaining));
     }
 }
 
@@ -479,5 +526,15 @@ mod tests {
 
         assert!(removed_nvidia_key);
         assert_eq!(DEFAULT_CREDENTIAL_ENV_VARS, &["NVIDIA_API_KEY"]);
+    }
+
+    #[test]
+    fn redacts_common_secrets_from_process_output() {
+        let output = "token=abc123 password: hunter2 Authorization: Bearer xyz";
+        let redacted = super::redact_secrets(output);
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("xyz"));
+        assert!(redacted.contains("[REDACTED]"));
     }
 }

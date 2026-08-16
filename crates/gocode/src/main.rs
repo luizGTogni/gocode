@@ -506,6 +506,24 @@ fn first_line(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn debug_agent_prompt(debug: &gocode_core::DebugInvestigation) -> String {
+    let description = debug
+        .description
+        .as_deref()
+        .unwrap_or("Problema descrito no fluxo guiado");
+    let answers = debug.answers.join("\n");
+    format!(
+        "Você está no fluxo /debug. Mostre explicitamente as etapas: Triagem, Reproduzindo, Investigando, Hipótese, Corrigindo e Validando.\n\
+Problema: {description}\n\
+Informações coletadas:\n{answers}\n\n\
+Primeiro resuma apenas fatos recebidos e lacunas, classifique o tipo provável e investigue com leitura/busca e comandos diagnósticos seguros. \n\
+Não invente erros, logs ou resultados. Apresente hipóteses ordenadas, com evidência e próximo teste. \n\
+Não edite antes de ter evidência suficiente de causa provável. Em modo Plan, não edite. Em modo Approve, apresente causa, arquivos, estratégia e risco antes de solicitar a edição. \n\
+Em Auto, ainda pare para ações destrutivas, rede, banco, deploy ou fora do workspace. Use a menor correção, valide a reprodução e as verificações proporcionais. \n\
+Ao concluir, entregue: Debug concluído; Causa raiz; Correção; Arquivos alterados; Validação executada; Resultado; Próximo passo quando necessário."
+    )
+}
+
 /// Everything a compaction (automatic or `/compact`) needs to read and update the active session.
 struct CompactionContext<'a> {
     provider: &'a NvidiaProvider,
@@ -676,7 +694,7 @@ async fn run_application() -> Result<(), AppError> {
         let mut project_root = bootstrap.project.root.clone();
         let undo: UndoRegistry = Arc::new(Mutex::new(HashMap::new()));
         let undo_dir = gocode_tools::undo_dir(&paths.state_dir);
-        let mut active_cancellation = None;
+        let mut active_cancellation: Option<gocode_core::CancellationToken> = None;
         let mut active_personality = loaded_preferences.preferences.personality;
         let config_path = paths.config_dir.join("config.toml");
         let mut mcp_runtime = McpRuntime::bootstrap(&paths, &bootstrap.project).await;
@@ -768,6 +786,15 @@ async fn run_application() -> Result<(), AppError> {
             .await
             .map_err(|error| {
                 AppError::Initialization(format!("could not confirm the initial session: {error}"))
+            })?;
+        driver
+            .event_tx
+            .send(gocode_core::AppEvent::DebugStateUpdated(
+                current_session.lock().await.debug.clone(),
+            ))
+            .await
+            .map_err(|error| {
+                AppError::Initialization(format!("could not publish initial debug state: {error}"))
             })?;
 
         if let Some(effort) = reasoning_effort.clone() {
@@ -927,6 +954,133 @@ async fn run_application() -> Result<(), AppError> {
                         .map_err(|error| {
                             AppError::Initialization(format!(
                                 "could not confirm model selection: {error}"
+                            ))
+                        })?;
+                }
+                AppCommand::DebugStart(description) => {
+                    let (debug, ready) = {
+                        let mut session = current_session.lock().await;
+                        session.debug = gocode_core::DebugInvestigation {
+                            started: true,
+                            description: description.filter(|value| !value.trim().is_empty()),
+                            ..Default::default()
+                        };
+                        let debug = session.debug.clone();
+                        let _ = gocode_core::save_session(&sessions_dir, &session);
+                        (debug.clone(), debug.ready_for_investigation())
+                    };
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::DebugStateUpdated(debug.clone()))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not update debug state: {error}"
+                            ))
+                        })?;
+                    if ready {
+                        driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::DebugInvestigationReady(
+                                debug_agent_prompt(&debug),
+                            ))
+                            .await
+                            .map_err(|error| {
+                                AppError::Initialization(format!(
+                                    "could not start debug investigation: {error}"
+                                ))
+                            })?;
+                    } else if let Some(question) = debug.next_question() {
+                        driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentWarning(format!(
+                                "Triagem\n\n{question}"
+                            )))
+                            .await
+                            .map_err(|error| {
+                                AppError::Initialization(format!(
+                                    "could not request debug detail: {error}"
+                                ))
+                            })?;
+                    }
+                }
+                AppCommand::DebugAnswer(answer) => {
+                    let (debug, ready) = {
+                        let mut session = current_session.lock().await;
+                        if session.debug.next_question().is_some() {
+                            session
+                                .debug
+                                .answers
+                                .push(gocode_tools::process::redact_secrets(&answer));
+                        }
+                        let debug = session.debug.clone();
+                        let _ = gocode_core::save_session(&sessions_dir, &session);
+                        (debug.clone(), debug.ready_for_investigation())
+                    };
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::DebugStateUpdated(debug.clone()))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not update debug answer: {error}"
+                            ))
+                        })?;
+                    if ready {
+                        driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::DebugInvestigationReady(
+                                debug_agent_prompt(&debug),
+                            ))
+                            .await
+                            .map_err(|error| {
+                                AppError::Initialization(format!(
+                                    "could not begin debug investigation: {error}"
+                                ))
+                            })?;
+                    } else if let Some(question) = debug.next_question() {
+                        driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentWarning(format!(
+                                "Triagem\n\n{question}"
+                            )))
+                            .await
+                            .map_err(|error| {
+                                AppError::Initialization(format!(
+                                    "could not request next debug detail: {error}"
+                                ))
+                            })?;
+                    }
+                }
+                AppCommand::DebugStop => {
+                    let debug = {
+                        let mut session = current_session.lock().await;
+                        session.debug.stopped = true;
+                        let debug = session.debug.clone();
+                        let _ = gocode_core::save_session(&sessions_dir, &session);
+                        debug
+                    };
+                    if let Some(cancellation) = active_cancellation.take() {
+                        cancellation.cancel();
+                    }
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::DebugStateUpdated(debug))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not stop debug investigation: {error}"
+                            ))
+                        })?;
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::AgentWarning(
+                            "Investigação interrompida; evidências preservadas.".into(),
+                        ))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not report debug stop: {error}"
                             ))
                         })?;
                 }
@@ -1174,6 +1328,17 @@ async fn run_application() -> Result<(), AppError> {
                                 "could not confirm the new session: {error}"
                             ))
                         })?;
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::DebugStateUpdated(
+                            current_session.lock().await.debug.clone(),
+                        ))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not publish new debug state: {error}"
+                            ))
+                        })?;
                 }
                 AppCommand::RequestSessionList => {
                     let summaries = gocode_core::list_sessions(&sessions_dir)
@@ -1203,6 +1368,7 @@ async fn run_application() -> Result<(), AppError> {
                             let id = session.id.clone();
                             let name = session.name.clone();
                             let history = session.history.clone();
+                            let debug = session.debug.clone();
                             *current_session.lock().await = session;
                             driver
                                 .event_tx
@@ -1216,6 +1382,15 @@ async fn run_application() -> Result<(), AppError> {
                                 .map_err(|error| {
                                     AppError::Initialization(format!(
                                         "could not confirm the resumed session: {error}"
+                                    ))
+                                })?;
+                            driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::DebugStateUpdated(debug))
+                                .await
+                                .map_err(|error| {
+                                    AppError::Initialization(format!(
+                                        "could not publish resumed debug state: {error}"
                                     ))
                                 })?;
                         }
@@ -1235,7 +1410,7 @@ async fn run_application() -> Result<(), AppError> {
                     }
                 }
                 AppCommand::ForkSession => {
-                    let (id, name, history) = {
+                    let (id, name, history, debug) = {
                         let mut session = current_session.lock().await;
                         let _ = gocode_core::save_session(&sessions_dir, &session);
                         let fork = session.fork();
@@ -1245,6 +1420,7 @@ async fn run_application() -> Result<(), AppError> {
                             session.id.clone(),
                             session.name.clone(),
                             session.history.clone(),
+                            session.debug.clone(),
                         )
                     };
                     driver
@@ -1259,6 +1435,15 @@ async fn run_application() -> Result<(), AppError> {
                         .map_err(|error| {
                             AppError::Initialization(format!(
                                 "could not confirm the forked session: {error}"
+                            ))
+                        })?;
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::DebugStateUpdated(debug))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not publish forked debug state: {error}"
                             ))
                         })?;
                 }

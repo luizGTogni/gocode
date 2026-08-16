@@ -71,6 +71,32 @@ mod preference_tests {
         assert!(help.contains("/theme"));
         assert!(help.contains("/personality"));
     }
+
+    #[test]
+    fn parses_debug_description_and_auxiliary_commands() {
+        let mut state = AppState::default();
+        state.screen = Screen::Chat;
+        state.set_chat_input("/debug login fails after refresh".into());
+        assert_eq!(
+            handle_chat_event(
+                &mut state,
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            ),
+            Some(ChatSubmission::Command(SlashCommand::Debug(
+                "login fails after refresh".into()
+            )))
+        );
+        state.set_chat_input("/debug status".into());
+        assert_eq!(
+            handle_chat_event(
+                &mut state,
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            ),
+            Some(ChatSubmission::Command(SlashCommand::Debug(
+                "status".into()
+            )))
+        );
+    }
 }
 
 /// Reasoning-effort choices offered by the effort picker, paired with the provider value sent
@@ -342,6 +368,8 @@ pub enum SlashCommand {
     /// Redo the last `n` transactions undone with `/undo`. The `String` is the raw text typed
     /// after `/redo` (a positive integer, or empty for `1`).
     Redo(String),
+    /// Start, resume, inspect, stop, or summarize a guided bug investigation.
+    Debug(String),
     /// Exit Gocode.
     Exit,
 }
@@ -526,6 +554,11 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "Redo the last undone edit (or `/redo n` for the last n)",
         SlashCommand::Redo(String::new()),
     ),
+    (
+        "/debug",
+        "Investigate a bug safely (`status`, `stop`, or `summary`)",
+        SlashCommand::Debug(String::new()),
+    ),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
     ("/quit", "Exit Gocode", SlashCommand::Exit),
 ];
@@ -558,6 +591,54 @@ fn resolve_slash_command(input: &str) -> Option<SlashCommand> {
         .map(|(_, _, command)| command.clone())
 }
 
+fn debug_status(debug: &gocode_core::DebugInvestigation) -> String {
+    if !debug.is_active() {
+        return "Nenhuma investigação /debug ativa.".into();
+    }
+    let evidence = if debug.evidence.is_empty() {
+        "nenhuma"
+    } else {
+        "coletada"
+    };
+    format!(
+        "Debug — Investigando\nHipótese atual: {}\nEvidências: {evidence}\nComandos executados: {}\n{}",
+        debug.hypothesis.as_deref().unwrap_or("ainda não definida"),
+        debug.commands.len(),
+        debug.next_question().map_or_else(
+            || "Triagem concluída; aguardando investigação.".into(),
+            |question| format!("Informação pendente: {question}"),
+        )
+    )
+}
+
+fn debug_summary(debug: &gocode_core::DebugInvestigation) -> String {
+    let description = debug
+        .description
+        .as_deref()
+        .unwrap_or("Fluxo guiado /debug");
+    format!(
+        "Debug summary\nProblema: {description}\nHipótese: {}\nEvidências: {}\nComandos: {}\nEstado: {}",
+        debug.hypothesis.as_deref().unwrap_or("não confirmada"),
+        if debug.evidence.is_empty() {
+            "nenhuma"
+        } else {
+            "coletadas"
+        },
+        if debug.commands.is_empty() {
+            "nenhum"
+        } else {
+            "registrados"
+        },
+        if debug.stopped {
+            "interrompido"
+        } else if debug.is_active() {
+            "em andamento"
+        } else {
+            "não iniciado"
+        },
+    )
+}
+
 /// Finds the custom command exactly named `name` (including the leading `/`), if any.
 fn resolve_custom_command<'a>(
     custom_commands: &'a [gocode_core::CustomCommand],
@@ -581,6 +662,8 @@ pub enum ChatSubmission {
     Prompt(String),
     /// A recognized slash command.
     Command(SlashCommand),
+    /// One answer to `/debug`'s guided intake.
+    DebugAnswer(String),
 }
 
 /// Renderable interface state derived from application events.
@@ -608,6 +691,8 @@ pub struct AppState {
     cursor: usize,
     suggestion_selected: usize,
     permission_mode: PermissionMode,
+    /// The active session's persisted `/debug` investigation.
+    debug: gocode_core::DebugInvestigation,
     /// Inverted so the derived `Default` (false) means automatic compaction is on, matching the
     /// documented default.
     auto_compact_disabled: bool,
@@ -767,6 +852,8 @@ impl AppState {
                 self.status = Some(format!("Model: {model}"));
             }
             AppEvent::AssistantTextDelta(delta) => self.push_assistant_delta(delta),
+            AppEvent::DebugStateUpdated(debug) => self.debug.clone_from(debug),
+            AppEvent::DebugInvestigationReady(prompt) => return Some(prompt.clone()),
             AppEvent::ProviderFailed(message) => {
                 self.activity = None;
                 self.entries.push(ChatEntry::Error(message.clone()));
@@ -3636,6 +3723,37 @@ fn run_terminal(
                         Err(message) => state.entries.push(ChatEntry::Error(message)),
                     }
                 }
+                ChatSubmission::Command(SlashCommand::Debug(raw)) => {
+                    let argument = raw.trim();
+                    match argument {
+                        "status" => state
+                            .entries
+                            .push(ChatEntry::Info(debug_status(&state.debug))),
+                        "summary" => state
+                            .entries
+                            .push(ChatEntry::Info(debug_summary(&state.debug))),
+                        "stop" => send_command(&command_tx, AppCommand::DebugStop)?,
+                        "" if state.debug.is_active() => {
+                            state
+                                .entries
+                                .push(ChatEntry::Info(state.debug.next_question().map_or_else(
+                                || {
+                                    "Debug em andamento. Use `/debug status` ou `/debug summary`."
+                                        .into()
+                                },
+                                |question| format!("Retomando investigação\n\n{question}"),
+                            )));
+                        }
+                        "" => send_command(&command_tx, AppCommand::DebugStart(None))?,
+                        description => send_command(
+                            &command_tx,
+                            AppCommand::DebugStart(Some(description.to_string())),
+                        )?,
+                    }
+                }
+                ChatSubmission::DebugAnswer(answer) => {
+                    send_command(&command_tx, AppCommand::DebugAnswer(answer))?;
+                }
                 ChatSubmission::Command(SlashCommand::Init) => {
                     let prompt = "Explore this repository (its structure, languages, build \
                                    system, tests, and conventions) and write a complete \
@@ -4986,6 +5104,11 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
                     state.clear_chat_input();
                     return Some(ChatSubmission::Command(SlashCommand::Redo(count)));
                 }
+                if name == "/debug" {
+                    let argument = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Debug(argument)));
+                }
                 if name == "/keymap" {
                     let arguments = arguments.trim().to_string();
                     state.clear_chat_input();
@@ -5011,6 +5134,9 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
             }
             let text = std::mem::take(&mut state.chat_input);
             state.cursor = 0;
+            if state.debug.next_question().is_some() {
+                return Some(ChatSubmission::DebugAnswer(text));
+            }
             state.remember_prompt(&text);
             if state.activity.is_some() {
                 state.queued = Some(text);

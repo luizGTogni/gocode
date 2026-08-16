@@ -28,6 +28,65 @@ pub struct SessionRecord {
     pub summary: String,
     /// This session's own conversation turns, oldest first. Never shared with another session.
     pub history: Vec<ChatMessage>,
+    /// Investigation state owned by `/debug`, persisted with this session.
+    #[serde(default)]
+    pub debug: DebugInvestigation,
+}
+
+/// A guided debugging investigation containing only user-supplied facts and observed evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DebugInvestigation {
+    /// Set once `/debug` starts, including the no-description guided flow.
+    #[serde(default)]
+    pub started: bool,
+    /// Original problem description when `/debug <description>` was used.
+    pub description: Option<String>,
+    /// Guided answers in the order requested by the CLI.
+    #[serde(default)]
+    pub answers: Vec<String>,
+    /// Redacted evidence observed while investigating.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// Current evidence-backed hypothesis, when available.
+    pub hypothesis: Option<String>,
+    /// Commands actually executed during the investigation.
+    #[serde(default)]
+    pub commands: Vec<String>,
+    /// Set by `/debug stop`; evidence remains available for resume or summary.
+    #[serde(default)]
+    pub stopped: bool,
+}
+
+impl DebugInvestigation {
+    /// Questions asked one at a time by `/debug` without a description.
+    pub const QUESTIONS: [&str; 6] = [
+        "Qual é o comportamento esperado?",
+        "Qual é o comportamento atual?",
+        "Quais são os passos para reproduzir?",
+        "Qual mensagem de erro, log ou stack trace foi observado?",
+        "Qual ambiente é afetado?",
+        "Quando o problema começou?",
+    ];
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.started && !self.stopped
+    }
+
+    #[must_use]
+    pub fn next_question(&self) -> Option<&'static str> {
+        self.started.then_some(()).and(
+            self.description
+                .is_none()
+                .then(|| Self::QUESTIONS.get(self.answers.len()).copied())
+                .flatten(),
+        )
+    }
+
+    #[must_use]
+    pub fn ready_for_investigation(&self) -> bool {
+        self.started && (self.description.is_some() || self.answers.len() == Self::QUESTIONS.len())
+    }
 }
 
 impl SessionRecord {
@@ -42,6 +101,7 @@ impl SessionRecord {
             last_used_at_unix: now,
             summary: String::new(),
             history: Vec::new(),
+            debug: DebugInvestigation::default(),
         }
     }
 
@@ -72,6 +132,7 @@ impl SessionRecord {
             last_used_at_unix: now,
             summary: self.summary.clone(),
             history: self.history.clone(),
+            debug: self.debug.clone(),
         }
     }
 }
@@ -205,7 +266,9 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<SessionRecord>, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionRecord, list_sessions, load_session, save_session, sessions_dir};
+    use super::{
+        DebugInvestigation, SessionRecord, list_sessions, load_session, save_session, sessions_dir,
+    };
     use std::{
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -238,6 +301,21 @@ mod tests {
 
         assert_eq!(session.name, "first prompt");
         assert_eq!(session.summary, "second reply");
+    }
+
+    #[test]
+    fn debug_without_a_description_collects_one_fact_at_a_time() {
+        let mut debug = DebugInvestigation {
+            started: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            debug.next_question(),
+            Some("Qual é o comportamento esperado?")
+        );
+        debug.answers.push("A tela deve abrir.".into());
+        assert_eq!(debug.next_question(), Some("Qual é o comportamento atual?"));
+        assert!(!debug.ready_for_investigation());
     }
 
     #[test]

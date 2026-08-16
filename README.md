@@ -23,6 +23,8 @@ Gocode has no telemetry in v0.1.0. See [security](docs/SECURITY.md),
 connect to [MCP servers](docs/MCP.md) — read that guide before adding one, since a server's
 tools run with the same permissions as Gocode's own.
 
+For a guided, evidence-first bug investigation, see [debugging](docs/DEBUG.md).
+
 ## Support
 
 For setup, recovery, and known limitations, see [troubleshooting](docs/TROUBLESHOOTING.md).

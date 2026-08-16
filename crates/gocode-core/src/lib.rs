@@ -15,8 +15,8 @@ pub use preferences::{
     load_or_default_preferences, save_preferences, valid_shortcut,
 };
 pub use session::{
-    SessionRecord, SessionSummary, SessionTransition, list_sessions, load_session, save_session,
-    sessions_dir,
+    DebugInvestigation, SessionRecord, SessionSummary, SessionTransition, list_sessions,
+    load_session, save_session, sessions_dir,
 };
 
 /// Conservative trigger for automatic compaction: the provider's reported input-token count for
@@ -38,6 +38,12 @@ pub enum AppCommand {
     SelectModel(String),
     /// Send a user message using the currently selected model.
     SubmitChat(String),
+    /// Start a persisted `/debug` investigation. `None` starts the guided intake.
+    DebugStart(Option<String>),
+    /// Store one answer from the guided `/debug` intake.
+    DebugAnswer(String),
+    /// Stop the active `/debug` investigation without discarding its evidence.
+    DebugStop,
     /// Persist presentation preferences. This never changes provider, tools, or permissions.
     SetPreferences(Preferences),
     /// Set the response style for this process only; it is intentionally not persisted.
@@ -206,6 +212,10 @@ pub enum AppEvent {
     ModelSelected(String),
     /// Incremental assistant text normalized from the provider stream.
     AssistantTextDelta(String),
+    /// The persisted `/debug` investigation changed; the interface mirrors it for status/help.
+    DebugStateUpdated(DebugInvestigation),
+    /// Guided intake is complete and the agent can begin a safe investigation with this prompt.
+    DebugInvestigationReady(String),
     /// The provider request ended with a safe, user-actionable error; recoverable inline.
     ProviderFailed(String),
     /// An error severe enough to require a blocking acknowledgement before work continues.
