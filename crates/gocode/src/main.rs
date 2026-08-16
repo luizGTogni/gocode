@@ -217,13 +217,27 @@ async fn run_application() -> Result<(), AppError> {
         let mut provider = None;
         let mut selected_model = None;
         let mut model_catalog: Vec<gocode_core::Model> = Vec::new();
-        let mut reasoning_effort: Option<String> = None;
+        let mut reasoning_effort: Option<String> = bootstrap.resolved_config.reasoning_effort.clone();
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
         let tool_registry: Arc<ToolRegistry> = Arc::new(builtin_registry());
         let permission_pending: PendingPermission = Arc::new(Mutex::new(None));
         let instructions =
             std::fs::read_to_string(bootstrap.project.gocode_dir.join("instructions.md")).ok();
+
+        if let Some(effort) = reasoning_effort.clone() {
+            driver
+                .event_tx
+                .send(gocode_core::AppEvent::ReasoningEffortChanged(Some(
+                    effort,
+                )))
+                .await
+                .map_err(|error| {
+                    AppError::Initialization(format!(
+                        "could not restore the saved reasoning effort: {error}"
+                    ))
+                })?;
+        }
 
         let stored_credential = environment_credential
             .map(SecretString::new)
@@ -353,7 +367,12 @@ async fn run_application() -> Result<(), AppError> {
                     }
                 }
                 AppCommand::SelectModel(model) => {
-                    gocode_core::save_global_model_selection(&config_path, "nvidia", &model)?;
+                    gocode_core::save_global_config(
+                        &config_path,
+                        Some("nvidia"),
+                        Some(&model),
+                        reasoning_effort.as_deref(),
+                    )?;
                     selected_model = Some(model.clone());
                     driver
                         .event_tx
@@ -463,6 +482,12 @@ async fn run_application() -> Result<(), AppError> {
                 }
                 AppCommand::SetReasoningEffort(effort) => {
                     reasoning_effort = effort.clone();
+                    gocode_core::save_global_config(
+                        &config_path,
+                        Some("nvidia"),
+                        selected_model.as_deref(),
+                        reasoning_effort.as_deref(),
+                    )?;
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::ReasoningEffortChanged(effort))

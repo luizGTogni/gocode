@@ -618,6 +618,7 @@ mod tests {
             &ConfigValues {
                 provider: Some("global-provider".into()),
                 model: Some("global-model".into()),
+                ..ConfigValues::default()
             },
             &ConfigValues::default(),
             &ConfigValues::default(),
@@ -689,22 +690,27 @@ mod tests {
             &ConfigValues {
                 provider: Some("cli-provider".into()),
                 model: None,
+                ..ConfigValues::default()
             },
             &ConfigValues {
                 provider: Some("project-provider".into()),
                 model: Some("project-model".into()),
+                ..ConfigValues::default()
             },
             &ConfigValues {
                 provider: Some("global-provider".into()),
                 model: Some("global-model".into()),
+                ..ConfigValues::default()
             },
             &ConfigValues {
                 provider: Some("provider-default".into()),
                 model: Some("provider-model".into()),
+                ..ConfigValues::default()
             },
             &ConfigValues {
                 provider: Some("built-in-provider".into()),
                 model: Some("built-in-model".into()),
+                ..ConfigValues::default()
             },
         );
 
@@ -1015,6 +1021,8 @@ pub struct ConfigValues {
     pub provider: Option<String>,
     /// Selected model identifier.
     pub model: Option<String>,
+    /// Selected reasoning-effort level.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Global configuration persisted in `config.toml`.
@@ -1059,6 +1067,7 @@ impl ProjectConfig {
             values: ConfigValues {
                 provider: model.provider,
                 model: model.model,
+                reasoning_effort: None,
             },
         })
     }
@@ -1099,6 +1108,7 @@ impl GlobalConfig {
             values: ConfigValues {
                 provider: raw.default_provider,
                 model: raw.default_model,
+                reasoning_effort: raw.default_reasoning_effort,
             },
         })
     }
@@ -1128,22 +1138,33 @@ pub fn load_or_create_global_config(path: &Path) -> Result<GlobalConfig, AppErro
     }
 }
 
-/// Persists the selected provider and model without ever writing a credential.
+/// Persists the selected provider, model, and reasoning-effort level, without ever writing a
+/// credential. Fields left `None` are simply omitted, not cleared from a future read — callers
+/// should pass every field they currently know so an update to one does not appear to erase the
+/// others.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration cannot be replaced atomically.
-pub fn save_global_model_selection(
+pub fn save_global_config(
     path: &Path,
-    provider: &str,
-    model: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> Result<(), AppError> {
-    atomic_write(
-        path,
-        &format!(
-            "schema_version = 1\ndefault_provider = \"{provider}\"\ndefault_model = \"{model}\"\n"
-        ),
-    )
+    let mut contents = String::from("schema_version = 1\n");
+    if let Some(provider) = provider {
+        contents.push_str(&format!("default_provider = \"{provider}\"\n"));
+    }
+    if let Some(model) = model {
+        contents.push_str(&format!("default_model = \"{model}\"\n"));
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        contents.push_str(&format!(
+            "default_reasoning_effort = \"{reasoning_effort}\"\n"
+        ));
+    }
+    atomic_write(path, &contents)
 }
 
 #[derive(Deserialize)]
@@ -1151,6 +1172,7 @@ struct RawGlobalConfig {
     schema_version: u32,
     default_provider: Option<String>,
     default_model: Option<String>,
+    default_reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1172,6 +1194,8 @@ pub struct ResolvedConfig {
     pub provider: Option<String>,
     /// Effective model identifier, if configured.
     pub model: Option<String>,
+    /// Effective reasoning-effort level, if configured.
+    pub reasoning_effort: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -1198,6 +1222,13 @@ impl ResolvedConfig {
                 &global.model,
                 &provider_defaults.model,
                 &built_in_defaults.model,
+            ]),
+            reasoning_effort: first_defined(&[
+                &cli.reasoning_effort,
+                &project.reasoning_effort,
+                &global.reasoning_effort,
+                &provider_defaults.reasoning_effort,
+                &built_in_defaults.reasoning_effort,
             ]),
         }
     }

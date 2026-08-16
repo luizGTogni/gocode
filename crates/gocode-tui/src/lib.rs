@@ -114,8 +114,8 @@ pub enum SlashCommand {
     Settings,
     /// Show the active provider.
     Provider,
-    /// Show the resolved model and provider.
-    Config,
+    /// Show the resolved model, provider, and reasoning effort.
+    Status,
     /// Clear the conversation view.
     Clear,
     /// List available commands.
@@ -138,13 +138,14 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         SlashCommand::Provider,
     ),
     (
-        "/config",
-        "Show the resolved model and provider",
-        SlashCommand::Config,
+        "/status",
+        "Show the resolved model, provider, and reasoning effort",
+        SlashCommand::Status,
     ),
     ("/clear", "Clear the conversation view", SlashCommand::Clear),
     ("/help", "List available commands", SlashCommand::Help),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
+    ("/quit", "Exit Gocode", SlashCommand::Exit),
 ];
 
 /// Slash-command suggestions matching the current composer prefix.
@@ -1006,7 +1007,7 @@ fn run_terminal(
                         .entries
                         .push(ChatEntry::Info("Provider: NVIDIA NIM (hosted).".into()));
                 }
-                ChatSubmission::Command(SlashCommand::Config) => {
+                ChatSubmission::Command(SlashCommand::Status) => {
                     let model = state
                         .current_model
                         .clone()
@@ -1018,7 +1019,8 @@ fn run_terminal(
                 }
                 ChatSubmission::Command(SlashCommand::Help) => {
                     state.entries.push(ChatEntry::Info(
-                        "Commands: /model /settings /provider /config /clear /help /exit".into(),
+                        "Commands: /model /settings /provider /status /clear /help /exit /quit"
+                            .into(),
                     ));
                 }
             }
@@ -1125,6 +1127,11 @@ pub fn handle_onboarding_event(state: &mut AppState, event: &Event) -> Option<St
             state.credential_input.pop();
         }
         KeyCode::Enter => return state.take_credential_submission(),
+        KeyCode::Esc if state.current_model.is_some() => {
+            state.credential_input.clear();
+            state.status = None;
+            state.screen = Screen::Chat;
+        }
         _ => {}
     }
     None
@@ -1152,6 +1159,7 @@ pub fn handle_model_picker_event(state: &mut AppState, event: &Event) -> Option<
             state.selected_model = (state.selected_model + 1).min(state.models.len() - 1);
         }
         KeyCode::Enter => return state.selected_model(),
+        KeyCode::Esc if state.current_model.is_some() => state.screen = Screen::Chat,
         _ => {}
     }
     None
@@ -1539,6 +1547,50 @@ mod tests {
     }
 
     #[test]
+    fn esc_cancels_the_model_picker_only_when_a_model_was_already_selected() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::ModelsAvailable(vec!["nvidia/model".into()]));
+
+        assert_eq!(
+            super::handle_model_picker_event(&mut state, &press(KeyCode::Esc)),
+            None
+        );
+        assert_eq!(state.screen, Screen::ModelPicker);
+
+        state.apply(&AppEvent::ModelSelected("nvidia/model".into()));
+        state.screen = Screen::ModelPicker;
+
+        assert_eq!(
+            super::handle_model_picker_event(&mut state, &press(KeyCode::Esc)),
+            None
+        );
+        assert_eq!(state.screen, Screen::Chat);
+    }
+
+    #[test]
+    fn esc_cancels_credential_onboarding_only_when_a_model_was_already_selected() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::CredentialRequired);
+        state.push_credential_character('a');
+
+        assert_eq!(
+            handle_onboarding_event(&mut state, &press(KeyCode::Esc)),
+            None
+        );
+        assert_eq!(state.screen, Screen::Onboarding);
+
+        state.apply(&AppEvent::ModelSelected("nvidia/model".into()));
+        state.screen = Screen::Onboarding;
+        state.push_credential_character('a');
+
+        assert_eq!(
+            handle_onboarding_event(&mut state, &press(KeyCode::Esc)),
+            None
+        );
+        assert_eq!(state.screen, Screen::Chat);
+    }
+
+    #[test]
     fn terminal_loop_renders_then_exits_on_ctrl_c() {
         let mut terminal =
             Terminal::new(TestBackend::new(40, 10)).expect("terminal should initialize");
@@ -1776,7 +1828,7 @@ mod tests {
     fn arrow_keys_move_the_highlighted_suggestion_and_tab_completes_it() {
         let mut state = AppState {
             screen: Screen::Chat,
-            chat_input: "/c".into(),
+            chat_input: "/s".into(),
             ..AppState::default()
         };
         assert_eq!(slash_suggestions(&state.chat_input).len(), 2);
@@ -1785,7 +1837,7 @@ mod tests {
         assert_eq!(state.suggestion_selected, 1);
 
         let _ = handle_chat_event(&mut state, &press(KeyCode::Tab));
-        assert_eq!(state.chat_input, slash_suggestions("/c")[1].0);
+        assert_eq!(state.chat_input, slash_suggestions("/s")[1].0);
     }
 
     #[test]
@@ -1807,7 +1859,7 @@ mod tests {
     fn typing_resets_the_highlighted_suggestion_back_to_the_first_match() {
         let mut state = AppState {
             screen: Screen::Chat,
-            chat_input: "/c".into(),
+            chat_input: "/s".into(),
             ..AppState::default()
         };
         let _ = handle_chat_event(&mut state, &press(KeyCode::Down));
@@ -1819,7 +1871,7 @@ mod tests {
 
     #[test]
     fn slash_suggestions_filter_by_prefix() {
-        assert_eq!(slash_suggestions("/c").len(), 2);
+        assert_eq!(slash_suggestions("/s").len(), 2);
         assert!(slash_suggestions("hello").is_empty());
     }
 
