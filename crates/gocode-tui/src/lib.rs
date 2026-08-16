@@ -154,6 +154,8 @@ pub enum SlashCommand {
     Init,
     /// Open the discovered-skills popup.
     Skills,
+    /// Switch permission mode to Plan (read-only).
+    PlanMode,
     /// Exit Gocode.
     Exit,
 }
@@ -211,6 +213,11 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "/skills",
         "List discovered skills (global and project)",
         SlashCommand::Skills,
+    ),
+    (
+        "/plan",
+        "Switch to Plan mode (read-only, no writes or risky commands)",
+        SlashCommand::PlanMode,
     ),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
     ("/quit", "Exit Gocode", SlashCommand::Exit),
@@ -1932,6 +1939,13 @@ fn run_terminal(
                 }
                 ChatSubmission::Command(SlashCommand::Skills) => {
                     state.skills_visible = true;
+                }
+                ChatSubmission::Command(SlashCommand::PlanMode) => {
+                    state.permission_mode = PermissionMode::Plan;
+                    send_command(
+                        &command_tx,
+                        AppCommand::SetPermissionMode(PermissionMode::Plan),
+                    )?;
                 }
                 ChatSubmission::Command(SlashCommand::Init) => {
                     let prompt = "Explore this repository (its structure, languages, build \
