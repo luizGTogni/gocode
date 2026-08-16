@@ -216,6 +216,70 @@ impl NativeCredentialStore {
     pub const fn account_name(&self) -> &'static str {
         self.account
     }
+
+    /// Gets a secret stored under an arbitrary account name (e.g. `"mcp/<server>"`), under the
+    /// same service identity as [`Self::get_nvidia`]. Unlike the NVIDIA slot, callers choose
+    /// their own account naming — used for per-MCP-server API keys and OAuth tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error reported by the native credential service.
+    pub fn get_secret(&self, account: &str) -> Result<Option<SecretString>, CredentialStoreError> {
+        let entry = keyring::Entry::new(self.service, account)
+            .map_err(|error| CredentialStoreError::ReadFailed(error.to_string()))?;
+
+        match entry.get_password() {
+            Ok(value) => Ok(Some(SecretString::new(value))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(
+                keyring::Error::NoStorageAccess(error) | keyring::Error::PlatformFailure(error),
+            ) => Err(CredentialStoreError::Unavailable(error.to_string())),
+            Err(error) => Err(CredentialStoreError::ReadFailed(error.to_string())),
+        }
+    }
+
+    /// Persists a secret under an arbitrary account name. See [`Self::get_secret`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error reported by the native credential service.
+    pub fn save_secret(
+        &self,
+        account: &str,
+        secret: &SecretString,
+    ) -> Result<(), CredentialStoreError> {
+        let entry = keyring::Entry::new(self.service, account)
+            .map_err(|error| CredentialStoreError::ReadFailed(error.to_string()))?;
+
+        entry
+            .set_password(secret.expose())
+            .map_err(|error| match error {
+                keyring::Error::NoStorageAccess(error) | keyring::Error::PlatformFailure(error) => {
+                    CredentialStoreError::Unavailable(error.to_string())
+                }
+                other => CredentialStoreError::ReadFailed(other.to_string()),
+            })
+    }
+
+    /// Removes a secret stored under an arbitrary account name, if present. See
+    /// [`Self::get_secret`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error reported by the native credential service; a missing entry is not an
+    /// error.
+    pub fn delete_secret(&self, account: &str) -> Result<(), CredentialStoreError> {
+        let entry = keyring::Entry::new(self.service, account)
+            .map_err(|error| CredentialStoreError::ReadFailed(error.to_string()))?;
+
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(
+                keyring::Error::NoStorageAccess(error) | keyring::Error::PlatformFailure(error),
+            ) => Err(CredentialStoreError::Unavailable(error.to_string())),
+            Err(error) => Err(CredentialStoreError::ReadFailed(error.to_string())),
+        }
+    }
 }
 
 impl Default for NativeCredentialStore {

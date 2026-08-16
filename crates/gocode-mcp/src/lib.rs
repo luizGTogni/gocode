@@ -1,5 +1,5 @@
-//! MCP (Model Context Protocol) client support: JSON-RPC framing, transports (stdio today,
-//! streamable HTTP planned), and the `initialize`/`tools/list`/`tools/call` client.
+//! MCP (Model Context Protocol) client support: JSON-RPC framing, transports (stdio and
+//! streamable HTTP), and the `initialize`/`tools/list`/`tools/call` client.
 
 pub mod client;
 pub mod jsonrpc;
@@ -9,10 +9,11 @@ pub mod transport;
 
 pub use client::{McpClient, McpToolInfo, ToolCallOutcome};
 pub use manager::{
-    McpConnectOutcome, McpServerConnection, connect_configured_servers, connect_server,
+    McpConnectOutcome, McpServerConnection, api_key_account, connect_configured_servers,
+    connect_server,
 };
 pub use tool_bridge::McpTool;
-pub use transport::{McpTransport, stdio::StdioTransport};
+pub use transport::{McpTransport, http::HttpTransport, stdio::StdioTransport};
 
 /// Everything that can go wrong talking to an MCP server.
 #[derive(Debug, Clone)]

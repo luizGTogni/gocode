@@ -206,6 +206,25 @@ enum McpView {
     ServerList,
     /// The tools discovered from one connected server.
     ServerDetail,
+    /// The guided "Add server" wizard.
+    AddServer,
+}
+
+/// One step of the `/mcp` "Add server" wizard, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum McpAddStep {
+    #[default]
+    Name,
+    /// Choosing stdio vs. streamable HTTP.
+    TransportChoice,
+    /// Stdio only: `command arg1 arg2 ...`, split on whitespace.
+    CommandLine,
+    /// HTTP only: the server's endpoint URL.
+    Url,
+    /// Choosing none vs. a static API key.
+    AuthChoice,
+    /// Only reached when the API-key auth choice was made.
+    ApiKey,
 }
 
 /// One tab of the `/help` popup.
@@ -434,6 +453,20 @@ pub struct AppState {
     mcp_servers: Vec<gocode_core::McpServerStatus>,
     /// Lines scrolled down from the top of the `/mcp` server detail screen.
     mcp_detail_scroll: u16,
+    /// Current step of the `/mcp` "Add server" wizard.
+    mcp_add_step: McpAddStep,
+    /// Wizard draft: server name.
+    mcp_add_name: String,
+    /// Wizard draft: `true` for HTTP, `false` (default) for stdio.
+    mcp_add_http: bool,
+    /// Wizard draft: stdio command line (`command arg1 arg2 ...`).
+    mcp_add_command_line: String,
+    /// Wizard draft: HTTP endpoint URL.
+    mcp_add_url: String,
+    /// Wizard draft: `true` for a static API key, `false` (default) for no auth.
+    mcp_add_api_key_auth: bool,
+    /// Wizard draft: the API key itself, shown masked.
+    mcp_add_api_key: String,
     /// Display form of the detected project root, shown by `/status`.
     working_directory: String,
     /// The active session's id, shown by `/status`.
@@ -1659,16 +1692,23 @@ fn render_skills_enable_disable(frame: &mut Frame, state: &AppState, area: Rect)
 }
 
 /// The `/mcp` menu's actions, in display order.
-const MCP_MENU_ITEMS: [(&str, &str); 1] = [(
-    "Servers",
-    "List configured MCP servers, connect/disconnect, and inspect their tools.",
-)];
+const MCP_MENU_ITEMS: [(&str, &str); 2] = [
+    (
+        "Servers",
+        "List configured MCP servers, connect/disconnect, and inspect their tools.",
+    ),
+    (
+        "Add server",
+        "Configure a new MCP server and save it to this project.",
+    ),
+];
 
 fn render_mcp_modal(frame: &mut Frame, state: &AppState, area: Rect) {
     match state.mcp_view {
         McpView::Menu => render_mcp_menu(frame, state, area),
         McpView::ServerList => render_mcp_server_list(frame, state, area),
         McpView::ServerDetail => render_mcp_server_detail(frame, state, area),
+        McpView::AddServer => render_mcp_add_server(frame, state, area),
     }
 }
 
@@ -1819,6 +1859,67 @@ fn render_mcp_server_detail(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         chunks[1],
+    );
+}
+
+/// Renders a masked stand-in for a secret value, e.g. an in-progress API key.
+fn masked(value: &str) -> String {
+    "•".repeat(value.chars().count())
+}
+
+fn render_mcp_add_server(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 76, 12);
+    frame.render_widget(Clear, modal);
+
+    let (prompt, input, footer): (&str, String, &str) = match state.mcp_add_step {
+        McpAddStep::Name => (
+            "Server name",
+            format!("{}_", state.mcp_add_name),
+            "Enter to continue · Esc to cancel",
+        ),
+        McpAddStep::TransportChoice => {
+            let stdio_cursor = if state.mcp_add_http { " " } else { ">" };
+            let http_cursor = if state.mcp_add_http { ">" } else { " " };
+            (
+                "Transport",
+                format!("{stdio_cursor} stdio (local command)\n{http_cursor} http (remote server)"),
+                "Up/Down to choose · Enter to continue · Esc to go back",
+            )
+        }
+        McpAddStep::CommandLine => (
+            "Command, with args (e.g. npx -y @modelcontextprotocol/server-filesystem /path)",
+            format!("{}_", state.mcp_add_command_line),
+            "Enter to continue · Esc to go back",
+        ),
+        McpAddStep::Url => (
+            "Server URL (e.g. https://mcp.example.com/mcp)",
+            format!("{}_", state.mcp_add_url),
+            "Enter to continue · Esc to go back",
+        ),
+        McpAddStep::AuthChoice => {
+            let none_cursor = if state.mcp_add_api_key_auth { " " } else { ">" };
+            let key_cursor = if state.mcp_add_api_key_auth { ">" } else { " " };
+            (
+                "Authentication",
+                format!("{none_cursor} None\n{key_cursor} API key"),
+                "Up/Down to choose · Enter to continue · Esc to go back",
+            )
+        }
+        McpAddStep::ApiKey => (
+            "API key (stored in your OS keyring, never written to mcp.toml)",
+            format!("{}_", masked(&state.mcp_add_api_key)),
+            "Enter to save · Esc to go back",
+        ),
+    };
+
+    let content = format!("Add MCP server\n\n{prompt}\n\n{input}\n\n{footer}");
+    frame.render_widget(
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Gocode · Add MCP Server")
+                .borders(Borders::ALL),
+        ),
+        modal,
     );
 }
 
@@ -2498,6 +2599,10 @@ fn run_terminal(
             }
             McpEventOutcome::Disconnect(name) => {
                 send_command(&command_tx, AppCommand::McpDisconnect(name))?;
+                continue;
+            }
+            McpEventOutcome::AddServer { entry, api_key } => {
+                send_command(&command_tx, AppCommand::McpAddServer { entry, api_key })?;
                 continue;
             }
         }
@@ -3412,12 +3517,69 @@ pub enum McpEventOutcome {
     Connect(String),
     /// Disconnect the named connected server.
     Disconnect(String),
+    /// Persist and connect a newly configured server; `api_key` is set only when the wizard's
+    /// auth choice was "API key".
+    AddServer {
+        entry: gocode_core::McpServerEntry,
+        api_key: Option<String>,
+    },
 }
 
-/// Drives the `/mcp` popup: its menu, the server list, and one server's detail view.
+/// Resets every `/mcp` "Add server" wizard draft field back to its default.
+fn reset_mcp_add_form(state: &mut AppState) {
+    state.mcp_add_step = McpAddStep::Name;
+    state.mcp_add_name.clear();
+    state.mcp_add_http = false;
+    state.mcp_add_command_line.clear();
+    state.mcp_add_url.clear();
+    state.mcp_add_api_key_auth = false;
+    state.mcp_add_api_key.clear();
+}
+
+/// Builds the [`gocode_core::McpServerEntry`] (and, if chosen, the plaintext API key) from a
+/// completed wizard draft.
+fn build_mcp_add_server_outcome(state: &AppState) -> McpEventOutcome {
+    let transport = if state.mcp_add_http {
+        gocode_core::McpTransportConfig::Http {
+            url: state.mcp_add_url.trim().to_string(),
+            headers: std::collections::BTreeMap::new(),
+        }
+    } else {
+        let mut parts = state.mcp_add_command_line.split_whitespace();
+        let command = parts.next().unwrap_or_default().to_string();
+        let args = parts.map(str::to_string).collect();
+        gocode_core::McpTransportConfig::Stdio {
+            command,
+            args,
+            env: std::collections::BTreeMap::new(),
+        }
+    };
+    let auth = if state.mcp_add_api_key_auth {
+        gocode_core::McpAuthConfig::ApiKey
+    } else {
+        gocode_core::McpAuthConfig::None
+    };
+    let entry = gocode_core::McpServerEntry {
+        name: state.mcp_add_name.trim().to_string(),
+        transport,
+        auth,
+        enabled: true,
+    };
+    let api_key = state
+        .mcp_add_api_key_auth
+        .then(|| state.mcp_add_api_key.clone());
+    McpEventOutcome::AddServer { entry, api_key }
+}
+
+/// Drives the `/mcp` popup: its menu, the server list, one server's detail view, and the "Add
+/// server" wizard.
 ///
 /// Returns [`McpEventOutcome::NotHandled`] when the popup isn't shown or the event doesn't
 /// belong to it, so callers can fall through to other handlers.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the wizard's per-step key dispatch is clearer as one flat match than split further"
+)]
 pub fn handle_mcp_event(state: &mut AppState, event: &Event) -> McpEventOutcome {
     if !state.mcp_visible {
         return McpEventOutcome::NotHandled;
@@ -3433,9 +3595,18 @@ pub fn handle_mcp_event(state: &mut AppState, event: &Event) -> McpEventOutcome 
 
     match state.mcp_view {
         McpView::Menu => match code {
-            KeyCode::Enter => {
+            KeyCode::Up | KeyCode::Down => {
+                state.mcp_selected = 1 - state.mcp_selected.min(1);
+                McpEventOutcome::Handled
+            }
+            KeyCode::Enter if state.mcp_selected == 0 => {
                 state.mcp_view = McpView::ServerList;
                 state.mcp_selected = 0;
+                McpEventOutcome::Handled
+            }
+            KeyCode::Enter => {
+                reset_mcp_add_form(state);
+                state.mcp_view = McpView::AddServer;
                 McpEventOutcome::Handled
             }
             KeyCode::Esc => {
@@ -3502,6 +3673,130 @@ pub fn handle_mcp_event(state: &mut AppState, event: &Event) -> McpEventOutcome 
                 McpEventOutcome::Handled
             }
             _ => McpEventOutcome::Handled,
+        },
+        McpView::AddServer => match state.mcp_add_step {
+            McpAddStep::Name => match code {
+                KeyCode::Enter if !state.mcp_add_name.trim().is_empty() => {
+                    state.mcp_add_step = McpAddStep::TransportChoice;
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Backspace => {
+                    state.mcp_add_name.pop();
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Char(character) => {
+                    state.mcp_add_name.push(*character);
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Esc => {
+                    state.mcp_view = McpView::Menu;
+                    McpEventOutcome::Handled
+                }
+                _ => McpEventOutcome::Handled,
+            },
+            McpAddStep::TransportChoice => match code {
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                    state.mcp_add_http = !state.mcp_add_http;
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Enter => {
+                    state.mcp_add_step = if state.mcp_add_http {
+                        McpAddStep::Url
+                    } else {
+                        McpAddStep::CommandLine
+                    };
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Esc => {
+                    state.mcp_add_step = McpAddStep::Name;
+                    McpEventOutcome::Handled
+                }
+                _ => McpEventOutcome::Handled,
+            },
+            McpAddStep::CommandLine => match code {
+                KeyCode::Enter if !state.mcp_add_command_line.trim().is_empty() => {
+                    state.mcp_add_step = McpAddStep::AuthChoice;
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Backspace => {
+                    state.mcp_add_command_line.pop();
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Char(character) => {
+                    state.mcp_add_command_line.push(*character);
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Esc => {
+                    state.mcp_add_step = McpAddStep::TransportChoice;
+                    McpEventOutcome::Handled
+                }
+                _ => McpEventOutcome::Handled,
+            },
+            McpAddStep::Url => match code {
+                KeyCode::Enter if !state.mcp_add_url.trim().is_empty() => {
+                    state.mcp_add_step = McpAddStep::AuthChoice;
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Backspace => {
+                    state.mcp_add_url.pop();
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Char(character) => {
+                    state.mcp_add_url.push(*character);
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Esc => {
+                    state.mcp_add_step = McpAddStep::TransportChoice;
+                    McpEventOutcome::Handled
+                }
+                _ => McpEventOutcome::Handled,
+            },
+            McpAddStep::AuthChoice => match code {
+                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                    state.mcp_add_api_key_auth = !state.mcp_add_api_key_auth;
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Enter if state.mcp_add_api_key_auth => {
+                    state.mcp_add_step = McpAddStep::ApiKey;
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Enter => {
+                    let outcome = build_mcp_add_server_outcome(state);
+                    state.mcp_view = McpView::Menu;
+                    state.mcp_selected = 0;
+                    outcome
+                }
+                KeyCode::Esc => {
+                    state.mcp_add_step = if state.mcp_add_http {
+                        McpAddStep::Url
+                    } else {
+                        McpAddStep::CommandLine
+                    };
+                    McpEventOutcome::Handled
+                }
+                _ => McpEventOutcome::Handled,
+            },
+            McpAddStep::ApiKey => match code {
+                KeyCode::Enter if !state.mcp_add_api_key.is_empty() => {
+                    let outcome = build_mcp_add_server_outcome(state);
+                    state.mcp_view = McpView::Menu;
+                    state.mcp_selected = 0;
+                    outcome
+                }
+                KeyCode::Backspace => {
+                    state.mcp_add_api_key.pop();
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Char(character) => {
+                    state.mcp_add_api_key.push(*character);
+                    McpEventOutcome::Handled
+                }
+                KeyCode::Esc => {
+                    state.mcp_add_step = McpAddStep::AuthChoice;
+                    McpEventOutcome::Handled
+                }
+                _ => McpEventOutcome::Handled,
+            },
         },
     }
 }
@@ -3649,7 +3944,7 @@ mod tests {
 
     use super::{
         AppState, ChatEntry, ChatSubmission, HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS,
-        McpEventOutcome, McpView, Screen, SkillsEventOutcome, SkillsView, SlashCommand,
+        McpAddStep, McpEventOutcome, McpView, Screen, SkillsEventOutcome, SkillsView, SlashCommand,
         UpdateEventOutcome, UpdateStage, classify_event, handle_chat_event,
         handle_effort_picker_event, handle_help_event, handle_mcp_event, handle_model_picker_event,
         handle_onboarding_event, handle_permission_event, handle_session_picker_event,
@@ -5441,5 +5736,141 @@ mod tests {
             McpEventOutcome::Handled
         ));
         assert_eq!(state.mcp_view, McpView::ServerList);
+    }
+
+    fn type_str(state: &mut AppState, text: &str) {
+        for character in text.chars() {
+            handle_mcp_event(state, &press(KeyCode::Char(character)));
+        }
+    }
+
+    #[test]
+    fn menu_down_selects_add_server_and_enter_opens_the_wizard_on_the_name_step() {
+        let mut state = AppState {
+            mcp_visible: true,
+            ..AppState::default()
+        };
+        handle_mcp_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(state.mcp_selected, 1);
+
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Enter)),
+            McpEventOutcome::Handled
+        ));
+        assert_eq!(state.mcp_view, McpView::AddServer);
+        assert_eq!(state.mcp_add_step, McpAddStep::Name);
+    }
+
+    #[test]
+    fn add_server_wizard_builds_a_stdio_entry_with_no_auth() {
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_view: McpView::AddServer,
+            ..AppState::default()
+        };
+
+        type_str(&mut state, "filesystem");
+        handle_mcp_event(&mut state, &press(KeyCode::Enter));
+        assert_eq!(state.mcp_add_step, McpAddStep::TransportChoice);
+
+        // Default transport is stdio; Enter accepts it without toggling.
+        handle_mcp_event(&mut state, &press(KeyCode::Enter));
+        assert_eq!(state.mcp_add_step, McpAddStep::CommandLine);
+
+        type_str(&mut state, "npx -y server-filesystem /tmp");
+        handle_mcp_event(&mut state, &press(KeyCode::Enter));
+        assert_eq!(state.mcp_add_step, McpAddStep::AuthChoice);
+
+        // Default auth is none; Enter submits immediately.
+        match handle_mcp_event(&mut state, &press(KeyCode::Enter)) {
+            McpEventOutcome::AddServer { entry, api_key } => {
+                assert_eq!(entry.name, "filesystem");
+                assert_eq!(
+                    entry.transport,
+                    gocode_core::McpTransportConfig::Stdio {
+                        command: "npx".into(),
+                        args: vec!["-y".into(), "server-filesystem".into(), "/tmp".into()],
+                        env: std::collections::BTreeMap::new(),
+                    }
+                );
+                assert_eq!(entry.auth, gocode_core::McpAuthConfig::None);
+                assert!(api_key.is_none());
+            }
+            other => panic!("expected an AddServer outcome, got {other:?}"),
+        }
+        assert_eq!(state.mcp_view, McpView::Menu);
+    }
+
+    #[test]
+    fn add_server_wizard_builds_an_http_entry_with_an_api_key() {
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_view: McpView::AddServer,
+            ..AppState::default()
+        };
+
+        type_str(&mut state, "remote");
+        handle_mcp_event(&mut state, &press(KeyCode::Enter));
+
+        handle_mcp_event(&mut state, &press(KeyCode::Right)); // toggle to http
+        handle_mcp_event(&mut state, &press(KeyCode::Enter));
+        assert_eq!(state.mcp_add_step, McpAddStep::Url);
+
+        type_str(&mut state, "https://mcp.example.com/mcp");
+        handle_mcp_event(&mut state, &press(KeyCode::Enter));
+        assert_eq!(state.mcp_add_step, McpAddStep::AuthChoice);
+
+        handle_mcp_event(&mut state, &press(KeyCode::Down)); // toggle to API key
+        handle_mcp_event(&mut state, &press(KeyCode::Enter));
+        assert_eq!(state.mcp_add_step, McpAddStep::ApiKey);
+
+        type_str(&mut state, "secret-token");
+        match handle_mcp_event(&mut state, &press(KeyCode::Enter)) {
+            McpEventOutcome::AddServer { entry, api_key } => {
+                assert_eq!(entry.name, "remote");
+                assert_eq!(
+                    entry.transport,
+                    gocode_core::McpTransportConfig::Http {
+                        url: "https://mcp.example.com/mcp".into(),
+                        headers: std::collections::BTreeMap::new(),
+                    }
+                );
+                assert_eq!(entry.auth, gocode_core::McpAuthConfig::ApiKey);
+                assert_eq!(api_key.as_deref(), Some("secret-token"));
+            }
+            other => panic!("expected an AddServer outcome, got {other:?}"),
+        }
+        assert_eq!(state.mcp_view, McpView::Menu);
+    }
+
+    #[test]
+    fn add_server_wizard_rejects_an_empty_name() {
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_view: McpView::AddServer,
+            ..AppState::default()
+        };
+
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Enter)),
+            McpEventOutcome::Handled
+        ));
+        assert_eq!(state.mcp_add_step, McpAddStep::Name);
+    }
+
+    #[test]
+    fn esc_on_the_name_step_returns_to_the_menu_without_side_effects() {
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_view: McpView::AddServer,
+            ..AppState::default()
+        };
+        type_str(&mut state, "abandoned");
+
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Esc)),
+            McpEventOutcome::Handled
+        ));
+        assert_eq!(state.mcp_view, McpView::Menu);
     }
 }

@@ -1,6 +1,6 @@
-//! Transport abstraction MCP clients speak over: a stdio subprocess today, streamable HTTP
-//! planned next (see the `/mcp` implementation plan).
+//! Transport abstraction MCP clients speak over: a stdio subprocess, or streamable HTTP.
 
+pub mod http;
 pub mod stdio;
 
 use std::{future::Future, pin::Pin};

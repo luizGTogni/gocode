@@ -4,10 +4,22 @@
 
 use std::sync::Arc;
 
-use gocode_core::{McpServerEntry, McpTransportConfig};
+use gocode_core::{McpAuthConfig, McpServerEntry, McpTransportConfig};
+use gocode_credentials::NativeCredentialStore;
 use gocode_tools::contract::Tool;
 
-use crate::{McpClient, McpError, tool_bridge::McpTool, transport::stdio::StdioTransport};
+use crate::{
+    McpClient, McpError,
+    tool_bridge::McpTool,
+    transport::{http::HttpTransport, stdio::StdioTransport},
+};
+
+/// The OS keyring account an MCP server's static API key is stored under. Shared between
+/// connecting (reads it) and the `/mcp` add-server flow (writes it), so both agree on the name.
+#[must_use]
+pub fn api_key_account(server_name: &str) -> String {
+    format!("mcp/{server_name}")
+}
 
 /// One server's tools, discovered after a successful connect.
 pub struct McpServerConnection {
@@ -44,7 +56,7 @@ pub async fn connect_configured_servers(servers: &[McpServerEntry]) -> McpConnec
 ///
 /// # Errors
 /// Returns an error if the server cannot be spawned/reached, fails the `initialize` handshake,
-/// or its transport is not yet implemented (streamable HTTP).
+/// its auth is not yet implemented (OAuth), or an `ApiKey` server has no key stored.
 pub async fn connect_server(server: &McpServerEntry) -> Result<McpServerConnection, McpError> {
     match &server.transport {
         McpTransportConfig::Stdio { command, args, env } => {
@@ -53,24 +65,65 @@ pub async fn connect_server(server: &McpServerEntry) -> Result<McpServerConnecti
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             let transport = StdioTransport::spawn(command, args, &env_pairs)?;
-            let client = Arc::new(McpClient::connect(transport).await?);
-            let infos = client.list_tools().await?;
-            let tools = infos
-                .into_iter()
-                .map(|info| {
-                    Arc::new(McpTool::new(Arc::clone(&client), server.name.clone(), info))
-                        as Arc<dyn Tool>
-                })
-                .collect();
-            Ok(McpServerConnection {
-                name: server.name.clone(),
-                tools,
-            })
+            connect_and_discover(transport, server).await
         }
-        McpTransportConfig::Http { .. } => Err(McpError::Transport(
-            "the streamable-HTTP MCP transport is not implemented yet".into(),
+        McpTransportConfig::Http { url, headers } => {
+            let mut header_pairs: Vec<(String, String)> = headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            if let Some(bearer) = resolve_bearer_token(server)? {
+                header_pairs.push(("Authorization".to_string(), format!("Bearer {bearer}")));
+            }
+            let transport = HttpTransport::new(url, &header_pairs)?;
+            connect_and_discover(transport, server).await
+        }
+    }
+}
+
+/// Resolves the `Authorization: Bearer` value for a server's configured auth, if any.
+fn resolve_bearer_token(server: &McpServerEntry) -> Result<Option<String>, McpError> {
+    match &server.auth {
+        McpAuthConfig::None => Ok(None),
+        McpAuthConfig::ApiKey => {
+            let account = api_key_account(&server.name);
+            let store = NativeCredentialStore::new();
+            let secret = store.get_secret(&account).map_err(|error| {
+                McpError::Transport(format!(
+                    "could not read the stored API key for '{}': {error:?}",
+                    server.name
+                ))
+            })?;
+            let Some(secret) = secret else {
+                return Err(McpError::Transport(format!(
+                    "no API key is stored for MCP server '{}' — add one via /mcp",
+                    server.name
+                )));
+            };
+            Ok(Some(secret.expose().to_string()))
+        }
+        McpAuthConfig::OAuth { .. } => Err(McpError::Transport(
+            "OAuth authentication for MCP servers is not implemented yet".into(),
         )),
     }
+}
+
+async fn connect_and_discover<T: crate::McpTransport + 'static>(
+    transport: T,
+    server: &McpServerEntry,
+) -> Result<McpServerConnection, McpError> {
+    let client = Arc::new(McpClient::connect(transport).await?);
+    let infos = client.list_tools().await?;
+    let tools = infos
+        .into_iter()
+        .map(|info| {
+            Arc::new(McpTool::new(Arc::clone(&client), server.name.clone(), info)) as Arc<dyn Tool>
+        })
+        .collect();
+    Ok(McpServerConnection {
+        name: server.name.clone(),
+        tools,
+    })
 }
 
 #[cfg(test)]
@@ -142,15 +195,77 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":
     }
 
     #[tokio::test]
-    async fn records_a_failure_for_an_unimplemented_http_server() {
+    async fn records_a_failure_for_an_unreachable_http_server() {
         let mut server = fake_server_entry("remote", FAKE_SERVER);
+        // Port 1 is a privileged, essentially always-unbound port, so this connection fails
+        // immediately without any dependency on network access or a real MCP server.
         server.transport = McpTransportConfig::Http {
-            url: "https://example.com/mcp".into(),
+            url: "http://127.0.0.1:1/mcp".into(),
             headers: BTreeMap::new(),
         };
 
         let outcome = connect_configured_servers(&[server]).await;
         assert!(outcome.connections.is_empty());
         assert_eq!(outcome.failures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn records_a_failure_for_an_invalid_http_url() {
+        let mut server = fake_server_entry("remote", FAKE_SERVER);
+        server.transport = McpTransportConfig::Http {
+            url: "not a url".into(),
+            headers: BTreeMap::new(),
+        };
+
+        let outcome = connect_configured_servers(&[server]).await;
+        assert!(outcome.connections.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn records_a_failure_for_an_oauth_server_since_oauth_is_not_implemented_yet() {
+        let mut server = fake_server_entry("remote", FAKE_SERVER);
+        server.transport = McpTransportConfig::Http {
+            url: "http://127.0.0.1:1/mcp".into(),
+            headers: BTreeMap::new(),
+        };
+        server.auth = McpAuthConfig::OAuth {
+            authorization_url: "https://example.com/authorize".into(),
+            token_url: "https://example.com/token".into(),
+            client_id: "gocode".into(),
+            scopes: vec![],
+        };
+
+        let outcome = connect_configured_servers(&[server]).await;
+        assert!(outcome.connections.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn records_a_failure_for_an_api_key_server_with_no_stored_key() {
+        // Uses whatever the test environment's keyring backend reports for an account that was
+        // never written to — either "no entry" or "unavailable" — both must surface as a
+        // connect failure rather than silently proceeding unauthenticated.
+        let mut server = fake_server_entry("remote", FAKE_SERVER);
+        server.transport = McpTransportConfig::Http {
+            url: "http://127.0.0.1:1/mcp".into(),
+            headers: BTreeMap::new(),
+        };
+        server.auth = McpAuthConfig::ApiKey;
+        server.name = format!("gocode-mcp-test-no-such-server-{}", uuid_like_suffix());
+
+        let outcome = connect_configured_servers(&[server]).await;
+        assert!(outcome.connections.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+    }
+
+    /// A cheap process/time-derived suffix, good enough to keep this test's keyring account
+    /// name from colliding with a real one, without adding a `uuid` dev-dependency.
+    fn uuid_like_suffix() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        format!("{}-{nanos}", std::process::id())
     }
 }

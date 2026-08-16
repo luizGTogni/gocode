@@ -64,6 +64,13 @@ pub enum AppCommand {
     McpConnect(String),
     /// Disconnect a currently connected MCP server by name, stopping its subprocess.
     McpDisconnect(String),
+    /// Persist a new MCP server to the project configuration and try to connect it. When
+    /// `api_key` is set, it is saved to the OS keyring under the server's name rather than
+    /// written to the config file.
+    McpAddServer {
+        entry: McpServerEntry,
+        api_key: Option<String>,
+    },
 }
 
 /// How permissively an agent run is allowed to act without asking the user first.

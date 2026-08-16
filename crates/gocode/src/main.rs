@@ -252,6 +252,16 @@ impl McpRuntime {
         self.connected.remove(name).is_some()
     }
 
+    /// Adds a newly configured server (or replaces one of the same name) to the in-memory
+    /// server list. Callers persist it to `mcp.toml` separately.
+    fn add_or_replace_server(&mut self, entry: gocode_core::McpServerEntry) {
+        if let Some(existing) = self.servers.iter_mut().find(|s| s.name == entry.name) {
+            *existing = entry;
+        } else {
+            self.servers.push(entry);
+        }
+    }
+
     /// One status per configured server, for [`gocode_core::AppEvent::McpServersAvailable`].
     fn statuses(&self) -> Vec<gocode_core::McpServerStatus> {
         self.servers
@@ -1021,6 +1031,60 @@ async fn run_application() -> Result<(), AppError> {
                 }
                 AppCommand::McpDisconnect(name) => {
                     mcp_runtime.disconnect(&name);
+                    tool_registry = Arc::new(mcp_runtime.build_registry());
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::McpServersAvailable(
+                            mcp_runtime.statuses(),
+                        ))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not report MCP server status: {error}"
+                            ))
+                        })?;
+                }
+                AppCommand::McpAddServer { entry, api_key } => {
+                    if let Some(api_key) = &api_key {
+                        let account = gocode_mcp::api_key_account(&entry.name);
+                        if let Err(error) = NativeCredentialStore::new()
+                            .save_secret(&account, &SecretString::new(api_key.clone()))
+                        {
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::AgentWarning(format!(
+                                    "could not store the API key for '{}': {error:?}",
+                                    entry.name
+                                )))
+                                .await;
+                        }
+                    }
+
+                    let mcp_path = bootstrap.project.mcp_config_path();
+                    let mut project_mcp =
+                        gocode_core::load_or_default_mcp_config(&mcp_path).unwrap_or_default();
+                    project_mcp.upsert_server(entry.clone());
+                    if let Err(error) = gocode_core::save_mcp_config(&mcp_path, &project_mcp) {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentWarning(format!(
+                                "could not save MCP server '{}' to {}: {error}",
+                                entry.name,
+                                mcp_path.display()
+                            )))
+                            .await;
+                    }
+
+                    let name = entry.name.clone();
+                    mcp_runtime.add_or_replace_server(entry);
+                    if let Err(error) = mcp_runtime.connect(&name).await {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentWarning(format!(
+                                "MCP server '{name}' failed to connect: {error}"
+                            )))
+                            .await;
+                    }
                     tool_registry = Arc::new(mcp_runtime.build_registry());
                     driver
                         .event_tx
