@@ -7,6 +7,7 @@ use std::{
     process::Command,
 };
 
+use futures_util::StreamExt;
 use reqwest::Url;
 use semver::Version;
 use serde::Deserialize;
@@ -14,7 +15,24 @@ use sha2::{Digest, Sha256};
 
 pub const RELEASES_URL: &str = "https://api.github.com/repos/gocode/gocode/releases";
 pub const WINDOWS_ARCHIVE_SUFFIX: &str = "windows-x86_64.zip";
+pub const LINUX_ARCHIVE_SUFFIX: &str = "linux-x86_64.tar.gz";
 pub const CHECKSUM_ASSET: &str = "SHA256SUMS";
+
+/// This platform's release archive suffix, or [`UpdateError::UnsupportedPlatform`] on anything
+/// other than Windows or Linux.
+///
+/// # Errors
+///
+/// Returns [`UpdateError::UnsupportedPlatform`] on unsupported platforms.
+pub fn current_platform_archive_suffix() -> Result<&'static str, UpdateError> {
+    if cfg!(windows) {
+        Ok(WINDOWS_ARCHIVE_SUFFIX)
+    } else if cfg!(target_os = "linux") {
+        Ok(LINUX_ARCHIVE_SUFFIX)
+    } else {
+        Err(UpdateError::UnsupportedPlatform)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseAsset {
@@ -61,14 +79,14 @@ impl std::fmt::Display for UpdateError {
             | Self::Replace(error)
             | Self::Rollback(error) => f.write_str(error),
             Self::AssetNotFound => {
-                f.write_str("The release does not contain the required Windows update files.")
+                f.write_str("The release does not contain the required update files.")
             }
             Self::ChecksumMissing => {
                 f.write_str("The release does not provide a checksum for the update archive.")
             }
             Self::ChecksumMismatch => f.write_str("Gocode could not verify the downloaded update."),
             Self::UnsupportedPlatform => {
-                f.write_str("Automatic updates are currently available only on Windows.")
+                f.write_str("Automatic updates are currently available only on Windows and Linux.")
             }
         }
     }
@@ -80,11 +98,14 @@ impl From<io::Error> for UpdateError {
     }
 }
 
-/// Parses release metadata from GitHub and selects only a newer, stable Windows release.
+/// Parses release metadata from GitHub and selects only a newer, stable release that ships an
+/// archive matching `archive_suffix` (see [`WINDOWS_ARCHIVE_SUFFIX`], [`LINUX_ARCHIVE_SUFFIX`],
+/// or [`current_platform_archive_suffix`]).
 #[must_use]
 pub fn available_update(
     current: &Version,
     releases: impl IntoIterator<Item = ReleaseInfo>,
+    archive_suffix: &str,
 ) -> Option<UpdateInfo> {
     releases
         .into_iter()
@@ -95,7 +116,7 @@ pub fn available_update(
             let archive = release
                 .assets
                 .iter()
-                .find(|asset| asset.name == format!("{prefix}{WINDOWS_ARCHIVE_SUFFIX}"))
+                .find(|asset| asset.name == format!("{prefix}{archive_suffix}"))
                 .cloned()?;
             let checksums = release
                 .assets
@@ -209,7 +230,9 @@ pub fn official_download_url(url: &str) -> Result<Url, UpdateError> {
     }
 }
 
-/// Stores a fully downloaded artifact only after the partial file has been completed.
+/// Stores a fully downloaded artifact only after the partial file has been completed, reporting
+/// `(downloaded_bytes, total_bytes)` to `on_progress` as each chunk arrives. `total_bytes` is
+/// `None` when the server does not report a `Content-Length`.
 ///
 /// # Errors
 ///
@@ -218,25 +241,34 @@ pub async fn download_to_staging(
     client: &reqwest::Client,
     url: &str,
     staging: &Path,
+    mut on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf, UpdateError> {
     let url = official_download_url(url)?;
     fs::create_dir_all(staging)?;
     let partial = staging.join("download.partial");
-    let final_path = staging.join("release.zip");
+    let final_path = staging.join("release.download");
     let result = async {
-        let bytes = client
+        let response = client
             .get(url)
             .send()
             .await
             .map_err(|e| UpdateError::Network(e.to_string()))?
             .error_for_status()
-            .map_err(|e| UpdateError::Network(e.to_string()))?
-            .bytes()
-            .await
             .map_err(|e| UpdateError::Network(e.to_string()))?;
-        tokio::fs::write(&partial, bytes)
+        let total = response.content_length();
+        let mut file = tokio::fs::File::create(&partial)
             .await
             .map_err(|e| UpdateError::Io(e.to_string()))?;
+        let mut downloaded: u64 = 0;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| UpdateError::Network(e.to_string()))?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                .await
+                .map_err(|e| UpdateError::Io(e.to_string()))?;
+            downloaded += chunk.len() as u64;
+            on_progress(downloaded, total);
+        }
         tokio::fs::rename(&partial, &final_path)
             .await
             .map_err(|e| UpdateError::Io(e.to_string()))?;
@@ -333,18 +365,79 @@ pub fn extract_windows_archive(
     }
 }
 
-/// Replaces a stopped executable transactionally, restoring its backup if replacement fails.
+/// Extracts the `gocode` executable from a `.tar.gz` release archive. Every entry must live
+/// directly under a single top-level directory; the `gocode` file there is extracted, other
+/// files there (`LICENSE`, install scripts, …) are skipped, and anything outside that one
+/// top-level directory (e.g. a path-traversal entry) is rejected as unsafe.
 ///
 /// # Errors
 ///
-/// Returns an error when the source/target is invalid, replacement fails, or rollback fails.
+/// Returns an error for malformed archives, unsafe entries, a missing executable, or I/O failure.
+pub fn extract_linux_archive(archive: &Path, staging: &Path) -> Result<PathBuf, UpdateError> {
+    fs::create_dir_all(staging)?;
+    let file = fs::File::open(archive)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let mut app = None;
+    for entry in tar
+        .entries()
+        .map_err(|e| UpdateError::UnsafeArchive(e.to_string()))?
+    {
+        let mut entry = entry.map_err(|e| UpdateError::UnsafeArchive(e.to_string()))?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        let path = entry
+            .path()
+            .map_err(|e| UpdateError::UnsafeArchive(e.to_string()))?
+            .into_owned();
+        let mut components = path.components();
+        let (
+            Some(std::path::Component::Normal(_top_level)),
+            Some(std::path::Component::Normal(name)),
+            None,
+        ) = (components.next(), components.next(), components.next())
+        else {
+            return Err(UpdateError::UnsafeArchive(format!(
+                "unexpected archive entry: {}",
+                path.display()
+            )));
+        };
+        if name != "gocode" {
+            continue;
+        }
+        let destination = staging.join("gocode");
+        entry
+            .unpack(&destination)
+            .map_err(|e| UpdateError::UnsafeArchive(e.to_string()))?;
+        app = Some(destination);
+    }
+    let app = app.ok_or_else(|| {
+        UpdateError::UnsafeArchive("archive must contain a gocode executable".into())
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&app)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&app, permissions)?;
+    }
+    Ok(app)
+}
+
+/// Replaces a stopped (Windows) or running (Linux, via atomic rename) executable transactionally,
+/// restoring its backup if replacement fails.
+///
+/// # Errors
+///
+/// Returns an error when the source is invalid, replacement fails, or rollback fails.
 pub fn replace_with_rollback(staged: &Path, installed: &Path) -> Result<(), UpdateError> {
-    if !staged.is_file() || installed.file_name() != Some(std::ffi::OsStr::new("gocode.exe")) {
+    if !staged.is_file() {
         return Err(UpdateError::Replace(
             "invalid update source or target".into(),
         ));
     }
-    let backup = installed.with_extension("exe.previous");
+    let backup = installed.with_extension("previous");
     let _ = fs::remove_file(&backup);
     fs::rename(installed, &backup).map_err(|e| UpdateError::Replace(e.to_string()))?;
     if let Err(error) = fs::rename(staged, installed) {
@@ -392,9 +485,13 @@ mod tests {
     #[test]
     fn a_newer_stable_release_is_offered() {
         assert_eq!(
-            available_update(&Version::parse("0.1.0").unwrap(), [release("0.2.0")])
-                .unwrap()
-                .version,
+            available_update(
+                &Version::parse("0.1.0").unwrap(),
+                [release("0.2.0")],
+                WINDOWS_ARCHIVE_SUFFIX
+            )
+            .unwrap()
+            .version,
             Version::parse("0.2.0").unwrap()
         );
     }
@@ -403,7 +500,8 @@ mod tests {
         assert!(
             available_update(
                 &Version::parse("0.2.0").unwrap(),
-                [release("0.2.0"), release("0.1.9")]
+                [release("0.2.0"), release("0.1.9")],
+                WINDOWS_ARCHIVE_SUFFIX
             )
             .is_none()
         );
@@ -412,7 +510,48 @@ mod tests {
     fn missing_release_assets_are_not_offered() {
         let mut release = release("0.2.0");
         release.assets.pop();
-        assert!(available_update(&Version::parse("0.1.0").unwrap(), [release]).is_none());
+        assert!(
+            available_update(
+                &Version::parse("0.1.0").unwrap(),
+                [release],
+                WINDOWS_ARCHIVE_SUFFIX
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn a_release_without_a_linux_archive_is_not_offered_on_linux() {
+        let release = release("0.2.0");
+        assert!(
+            available_update(
+                &Version::parse("0.1.0").unwrap(),
+                [release],
+                LINUX_ARCHIVE_SUFFIX
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn a_release_with_a_linux_archive_is_offered_on_linux() {
+        let version = "0.2.0";
+        let release = ReleaseInfo {
+            version: Version::parse(version).unwrap(),
+            notes: "notes".into(),
+            assets: vec![
+                asset(&format!("gocode-{version}-{LINUX_ARCHIVE_SUFFIX}")),
+                asset(CHECKSUM_ASSET),
+            ],
+        };
+        assert_eq!(
+            available_update(
+                &Version::parse("0.1.0").unwrap(),
+                [release],
+                LINUX_ARCHIVE_SUFFIX
+            )
+            .unwrap()
+            .version,
+            Version::parse(version).unwrap()
+        );
     }
     #[test]
     fn only_https_urls_are_accepted() {
@@ -452,7 +591,18 @@ mod tests {
         fs::write(&staged, "new").unwrap();
         replace_with_rollback(&staged, &installed).unwrap();
         assert_eq!(fs::read_to_string(&installed).unwrap(), "new");
-        assert!(!installed.with_extension("exe.previous").exists());
+        assert!(!installed.with_extension("previous").exists());
+    }
+    #[test]
+    fn replacement_works_on_an_extensionless_linux_binary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("gocode");
+        let staged = dir.path().join("gocode.new");
+        fs::write(&installed, "old").unwrap();
+        fs::write(&staged, "new").unwrap();
+        replace_with_rollback(&staged, &installed).unwrap();
+        assert_eq!(fs::read_to_string(&installed).unwrap(), "new");
+        assert!(!installed.with_extension("previous").exists());
     }
     #[test]
     fn archive_rejects_path_traversal() {
@@ -467,6 +617,67 @@ mod tests {
         writer.finish().unwrap();
         assert!(matches!(
             extract_windows_archive(&archive, &dir.path().join("staging")),
+            Err(UpdateError::UnsafeArchive(_))
+        ));
+    }
+    #[test]
+    fn linux_archive_extracts_only_the_gocode_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("release.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(11);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "gocode-0.2.0-linux-x86_64/gocode",
+                "new binary!".as_bytes(),
+            )
+            .unwrap();
+        let mut license_header = tar::Header::new_gnu();
+        license_header.set_size(7);
+        license_header.set_mode(0o644);
+        license_header.set_cksum();
+        builder
+            .append_data(
+                &mut license_header,
+                "gocode-0.2.0-linux-x86_64/LICENSE",
+                "license".as_bytes(),
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let staging = dir.path().join("staging");
+        let extracted = extract_linux_archive(&archive, &staging).unwrap();
+        assert_eq!(fs::read_to_string(extracted).unwrap(), "new binary!");
+    }
+    #[test]
+    fn linux_archive_rejects_entries_outside_a_single_top_level_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("release.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o755);
+        header.set_cksum();
+        // No wrapping top-level directory, unlike every real release archive.
+        builder
+            .append_data(&mut header, "gocode", "bad".as_bytes())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        assert!(matches!(
+            extract_linux_archive(&archive, &dir.path().join("staging")),
             Err(UpdateError::UnsafeArchive(_))
         ));
     }

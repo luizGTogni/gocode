@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph, Tabs, Wrap},
 };
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -120,11 +120,30 @@ pub struct PermissionPrompt {
     pub working_directory: String,
 }
 
-/// A user-approved update prompt, delayed until it cannot interrupt work.
+/// Which screen the update popup is currently showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateStage {
+    /// "New update" with the version change and Yes/No buttons.
+    Prompt,
+    /// Downloading and verifying the update, with a percentage when known.
+    Downloading {
+        percent: Option<u8>,
+        message: String,
+    },
+    /// The update is staged and ready; a Close button finishes the install and restarts.
+    Completed { message: String },
+    /// Something went wrong; a Close button dismisses the popup.
+    Failed(String),
+}
+
+/// A user-approved update prompt, delayed until it cannot interrupt work, and the screen its
+/// popup is currently showing (menu, download progress, completion, or failure).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePrompt {
+    pub current_version: String,
     pub version: String,
     pub notes: String,
+    pub stage: UpdateStage,
 }
 
 /// A parsed slash command handled entirely by the interface.
@@ -356,6 +375,9 @@ pub struct AppState {
     activity: Option<AgentActivityState>,
     pending_permission: Option<PermissionPrompt>,
     pending_update: Option<UpdatePrompt>,
+    /// Which button is highlighted on the update popup's Yes/No prompt screen: `false` selects
+    /// Yes (the default), `true` selects No.
+    update_selected_no: bool,
     /// Whether the `/help` popup is currently shown over the chat screen.
     help_visible: bool,
     /// Which tab of the `/help` popup is currently selected.
@@ -456,22 +478,49 @@ impl AppState {
                 self.activity = None;
                 self.blocking_error = Some(message.clone());
             }
-            AppEvent::UpdateAvailable { version, notes } => {
+            AppEvent::UpdateAvailable {
+                current_version,
+                version,
+                notes,
+            } => {
                 let prompt = UpdatePrompt {
+                    current_version: current_version.clone(),
                     version: version.clone(),
                     notes: notes.clone(),
+                    stage: UpdateStage::Prompt,
                 };
                 if self.screen == Screen::Chat
                     && self.activity.is_none()
                     && self.pending_permission.is_none()
                 {
                     self.pending_update = Some(prompt);
+                    self.update_selected_no = false;
                 } else {
                     self.queued_update = Some(prompt);
                 }
             }
-            AppEvent::UpdateProgress(message) => self.status = Some(message.clone()),
-            AppEvent::UpdateFailed(message) => self.entries.push(ChatEntry::Error(message.clone())),
+            AppEvent::UpdateProgress { percent, message } => {
+                if let Some(prompt) = &mut self.pending_update {
+                    prompt.stage = UpdateStage::Downloading {
+                        percent: *percent,
+                        message: message.clone(),
+                    };
+                }
+            }
+            AppEvent::UpdateReady { message } => {
+                if let Some(prompt) = &mut self.pending_update {
+                    prompt.stage = UpdateStage::Completed {
+                        message: message.clone(),
+                    };
+                }
+            }
+            AppEvent::UpdateFailed(message) => {
+                if let Some(prompt) = &mut self.pending_update {
+                    prompt.stage = UpdateStage::Failed(message.clone());
+                } else {
+                    self.entries.push(ChatEntry::Error(message.clone()));
+                }
+            }
             AppEvent::ExitForUpdate => self.exit_for_update = true,
             AppEvent::AgentStateChanged(state) => self.activity = Some(*state),
             AppEvent::ToolActivity {
@@ -609,8 +658,22 @@ impl AppState {
         if self.screen == Screen::Chat
             && self.pending_permission.is_none()
             && self.pending_update.is_none()
+            && self.queued_update.is_some()
         {
             self.pending_update = self.queued_update.take();
+            self.update_selected_no = false;
+        }
+    }
+
+    /// Optimistically switches the update popup to the download-progress screen the instant
+    /// the user accepts, instead of leaving the Yes/No prompt on screen until the first
+    /// [`AppEvent::UpdateProgress`] arrives.
+    fn begin_update_download(&mut self) {
+        if let Some(prompt) = &mut self.pending_update {
+            prompt.stage = UpdateStage::Downloading {
+                percent: None,
+                message: "Downloading update…".into(),
+            };
         }
     }
 
@@ -1263,7 +1326,7 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
     if let Some(prompt) = &state.pending_permission {
         render_permission_modal(frame, prompt, area);
     } else if let Some(prompt) = &state.pending_update {
-        render_update_modal(frame, prompt, area);
+        render_update_modal(frame, state, prompt, area);
     } else if let Some(message) = &state.blocking_error {
         render_blocking_error_modal(frame, message, area);
     } else if state.help_visible {
@@ -1591,20 +1654,120 @@ fn render_copy_notification(frame: &mut Frame, message: &str, history_area: Rect
     );
 }
 
-fn render_update_modal(frame: &mut Frame, prompt: &UpdatePrompt, area: Rect) {
-    let modal = centered(area, 64, 9);
-    let notes = prompt.notes.lines().next().unwrap_or_default();
-    let content = format!(
-        "Gocode {} is available.\n\n{}\n\n[y] Update now   [n] Not now",
-        prompt.version, notes
-    );
+/// Style for a Yes/No (or single Close) button; `selected` draws it highlighted.
+fn button_span(label: &str, selected: bool) -> Span<'static> {
+    let style = if selected {
+        Style::default()
+            .fg(SELECTION_COLOR)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Span::styled(format!(" {label} "), style)
+}
+
+fn render_update_modal(frame: &mut Frame, state: &AppState, prompt: &UpdatePrompt, area: Rect) {
+    match &prompt.stage {
+        UpdateStage::Prompt => render_update_prompt(frame, state, prompt, area),
+        UpdateStage::Downloading { percent, message } => {
+            render_update_downloading(frame, prompt, *percent, message, area);
+        }
+        UpdateStage::Completed { message } => {
+            render_update_result(
+                frame,
+                "Gocode · Update completed",
+                "Completed",
+                message,
+                area,
+            );
+        }
+        UpdateStage::Failed(message) => {
+            render_update_result(frame, "Gocode · Update failed", "Failed", message, area);
+        }
+    }
+}
+
+fn render_update_prompt(frame: &mut Frame, state: &AppState, prompt: &UpdatePrompt, area: Rect) {
+    let modal = centered(area, 64, 10);
     frame.render_widget(Clear, modal);
+
+    let notes = prompt.notes.lines().next().unwrap_or_default();
+    let lines = vec![
+        Line::from("New update"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                prompt.current_version.clone(),
+                Style::default().fg(Color::Red),
+            ),
+            Span::raw("  ->  "),
+            Span::styled(prompt.version.clone(), Style::default().fg(Color::Green)),
+        ]),
+        Line::from(""),
+        Line::from(notes),
+        Line::from(""),
+        Line::from(vec![
+            button_span("Yes", !state.update_selected_no),
+            Span::raw("  "),
+            button_span("No", state.update_selected_no),
+        ]),
+    ];
     frame.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title("Update available")
+                .title("Gocode · Update available")
                 .borders(Borders::ALL),
         ),
+        modal,
+    );
+}
+
+fn render_update_downloading(
+    frame: &mut Frame,
+    prompt: &UpdatePrompt,
+    percent: Option<u8>,
+    message: &str,
+    area: Rect,
+) {
+    let modal = centered(area, 64, 9);
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(format!("Gocode · Updating to {}", prompt.version))
+        .borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(message.to_string()), chunks[0]);
+
+    let ratio = f64::from(percent.unwrap_or(0)) / 100.0;
+    let label = percent.map_or_else(|| "…".to_string(), |percent| format!("{percent}%"));
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(Style::default().fg(SELECTION_COLOR))
+            .label(label)
+            .ratio(ratio.clamp(0.0, 1.0)),
+        chunks[1],
+    );
+}
+
+fn render_update_result(frame: &mut Frame, title: &str, heading: &str, message: &str, area: Rect) {
+    let modal = centered(area, 64, 9);
+    frame.render_widget(Clear, modal);
+    let lines = vec![
+        Line::from(heading),
+        Line::from(""),
+        Line::from(message.to_string()),
+        Line::from(""),
+        Line::from(button_span("Close", true)),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(title).borders(Borders::ALL)),
         modal,
     );
 }
@@ -2049,16 +2212,21 @@ fn run_terminal(
             continue;
         }
 
-        if let Some(approved) = handle_update_event(&mut state, &terminal_event) {
-            send_command(
-                &command_tx,
-                if approved {
-                    AppCommand::AcceptUpdate
-                } else {
-                    AppCommand::RejectUpdate
-                },
-            )?;
-            continue;
+        match handle_update_event(&mut state, &terminal_event) {
+            UpdateEventOutcome::NotHandled => {}
+            UpdateEventOutcome::Handled => continue,
+            UpdateEventOutcome::Accepted => {
+                send_command(&command_tx, AppCommand::AcceptUpdate)?;
+                continue;
+            }
+            UpdateEventOutcome::Rejected => {
+                send_command(&command_tx, AppCommand::RejectUpdate)?;
+                continue;
+            }
+            UpdateEventOutcome::RestartRequested => {
+                send_command(&command_tx, AppCommand::RestartForUpdate)?;
+                continue;
+            }
         }
 
         if let Some(credential) = handle_onboarding_event(&mut state, &terminal_event) {
@@ -2763,28 +2931,76 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
     }
 }
 
-/// Applies Y/N confirmation keys to a pending update prompt.
-#[must_use]
-pub fn handle_update_event(state: &mut AppState, event: &Event) -> Option<bool> {
-    state.pending_update.as_ref()?;
+/// Outcome of dispatching a terminal event to the update popup.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateEventOutcome {
+    /// The popup is not shown, or the event isn't one it cares about.
+    NotHandled,
+    /// The event was consumed by the popup with no further side effect.
+    Handled,
+    /// The user chose to install the update; download and staging should begin.
+    Accepted,
+    /// The user declined; nothing more to do this run.
+    Rejected,
+    /// The user confirmed the "Completed" screen; the update should now be installed and the
+    /// application restarted.
+    RestartRequested,
+}
+
+/// Drives the update popup: the Yes/No prompt, the (non-interactive) download progress screen,
+/// and the Completed/Failed screens' Close button.
+pub fn handle_update_event(state: &mut AppState, event: &Event) -> UpdateEventOutcome {
+    let Some(prompt) = state.pending_update.as_ref() else {
+        return UpdateEventOutcome::NotHandled;
+    };
     let Event::Key(KeyEvent {
         code,
         kind: KeyEventKind::Press,
         ..
     }) = event
     else {
-        return None;
+        return UpdateEventOutcome::NotHandled;
     };
-    match code {
-        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-            state.pending_update = None;
-            Some(true)
-        }
-        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-            state.pending_update = None;
-            Some(false)
-        }
-        _ => None,
+
+    match &prompt.stage {
+        UpdateStage::Prompt => match code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                state.update_selected_no = !state.update_selected_no;
+                UpdateEventOutcome::Handled
+            }
+            KeyCode::Char('y' | 'Y') => {
+                state.begin_update_download();
+                UpdateEventOutcome::Accepted
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                state.pending_update = None;
+                UpdateEventOutcome::Rejected
+            }
+            KeyCode::Enter => {
+                if state.update_selected_no {
+                    state.pending_update = None;
+                    UpdateEventOutcome::Rejected
+                } else {
+                    state.begin_update_download();
+                    UpdateEventOutcome::Accepted
+                }
+            }
+            _ => UpdateEventOutcome::Handled,
+        },
+        UpdateStage::Downloading { .. } => UpdateEventOutcome::Handled,
+        UpdateStage::Completed { .. } => match code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                UpdateEventOutcome::RestartRequested
+            }
+            _ => UpdateEventOutcome::Handled,
+        },
+        UpdateStage::Failed(_) => match code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                state.pending_update = None;
+                UpdateEventOutcome::Handled
+            }
+            _ => UpdateEventOutcome::Handled,
+        },
     }
 }
 
@@ -3075,10 +3291,11 @@ mod tests {
 
     use super::{
         AppState, ChatEntry, ChatSubmission, HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS, Screen,
-        SkillsEventOutcome, SkillsView, SlashCommand, classify_event, handle_chat_event,
-        handle_effort_picker_event, handle_help_event, handle_model_picker_event,
-        handle_onboarding_event, handle_permission_event, handle_session_picker_event,
-        handle_skills_event, handle_update_event, render, run_with_event_source, slash_suggestions,
+        SkillsEventOutcome, SkillsView, SlashCommand, UpdateEventOutcome, UpdateStage,
+        classify_event, handle_chat_event, handle_effort_picker_event, handle_help_event,
+        handle_model_picker_event, handle_onboarding_event, handle_permission_event,
+        handle_session_picker_event, handle_skills_event, handle_update_event, render,
+        run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -3146,6 +3363,7 @@ mod tests {
             ..AppState::default()
         };
         state.apply(&AppEvent::UpdateAvailable {
+            current_version: "0.0.1".into(),
             version: "0.0.2".into(),
             notes: "A safer updater.".into(),
         });
@@ -3166,9 +3384,136 @@ mod tests {
         );
         assert_eq!(
             handle_update_event(&mut state, &press(KeyCode::Char('n'))),
-            Some(false)
+            UpdateEventOutcome::Rejected
         );
         assert!(state.pending_update.is_none());
+    }
+
+    fn update_prompt_state() -> AppState {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::UpdateAvailable {
+            current_version: "0.1.0".into(),
+            version: "0.2.0".into(),
+            notes: "Release notes.".into(),
+        });
+        state
+    }
+
+    #[test]
+    fn accepting_the_update_moves_straight_to_the_downloading_stage() {
+        let mut state = update_prompt_state();
+        assert_eq!(
+            handle_update_event(&mut state, &press(KeyCode::Char('y'))),
+            UpdateEventOutcome::Accepted
+        );
+        assert!(matches!(
+            state.pending_update.as_ref().map(|prompt| &prompt.stage),
+            Some(UpdateStage::Downloading { percent: None, .. })
+        ));
+    }
+
+    #[test]
+    fn progress_and_ready_events_drive_the_popup_through_to_completion() {
+        let mut state = update_prompt_state();
+        handle_update_event(&mut state, &press(KeyCode::Char('y')));
+
+        state.apply(&AppEvent::UpdateProgress {
+            percent: Some(42),
+            message: "Downloading update…".into(),
+        });
+        assert!(matches!(
+            state.pending_update.as_ref().map(|prompt| &prompt.stage),
+            Some(UpdateStage::Downloading {
+                percent: Some(42),
+                ..
+            })
+        ));
+
+        // While downloading, no key does anything but the popup keeps consuming input.
+        assert_eq!(
+            handle_update_event(&mut state, &press(KeyCode::Esc)),
+            UpdateEventOutcome::Handled
+        );
+
+        state.apply(&AppEvent::UpdateReady {
+            message: "Gocode will restart to finish the update.".into(),
+        });
+        assert!(matches!(
+            state.pending_update.as_ref().map(|prompt| &prompt.stage),
+            Some(UpdateStage::Completed { .. })
+        ));
+
+        assert_eq!(
+            handle_update_event(&mut state, &press(KeyCode::Enter)),
+            UpdateEventOutcome::RestartRequested
+        );
+        // The popup stays up until the driver confirms the exit; Close doesn't dismiss it.
+        assert!(state.pending_update.is_some());
+    }
+
+    #[test]
+    fn a_failed_update_shows_the_failure_and_close_dismisses_it() {
+        let mut state = update_prompt_state();
+        handle_update_event(&mut state, &press(KeyCode::Char('y')));
+
+        state.apply(&AppEvent::UpdateFailed(
+            "The download could not be verified.".into(),
+        ));
+        assert!(matches!(
+            state.pending_update.as_ref().map(|prompt| &prompt.stage),
+            Some(UpdateStage::Failed(message)) if message == "The download could not be verified."
+        ));
+
+        assert_eq!(
+            handle_update_event(&mut state, &press(KeyCode::Enter)),
+            UpdateEventOutcome::Handled
+        );
+        assert!(state.pending_update.is_none());
+    }
+
+    #[test]
+    fn every_update_stage_renders_without_panicking() {
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("terminal should initialize");
+
+        let mut prompt_state = update_prompt_state();
+        terminal
+            .draw(|frame| render(frame, &prompt_state))
+            .expect("prompt stage should render");
+        assert!(buffer_text(&terminal).contains("New update"));
+
+        handle_update_event(&mut prompt_state, &press(KeyCode::Char('y')));
+        terminal
+            .draw(|frame| render(frame, &prompt_state))
+            .expect("downloading stage should render");
+
+        prompt_state.apply(&AppEvent::UpdateProgress {
+            percent: Some(55),
+            message: "Downloading update…".into(),
+        });
+        terminal
+            .draw(|frame| render(frame, &prompt_state))
+            .expect("downloading stage with a percent should render");
+        assert!(buffer_text(&terminal).contains("55%"));
+
+        prompt_state.apply(&AppEvent::UpdateReady {
+            message: "Gocode will restart to finish the update.".into(),
+        });
+        terminal
+            .draw(|frame| render(frame, &prompt_state))
+            .expect("completed stage should render");
+        assert!(buffer_text(&terminal).contains("Completed"));
+
+        let mut failed_state = update_prompt_state();
+        handle_update_event(&mut failed_state, &press(KeyCode::Char('y')));
+        failed_state.apply(&AppEvent::UpdateFailed("Network unreachable.".into()));
+        terminal
+            .draw(|frame| render(frame, &failed_state))
+            .expect("failed stage should render");
+        assert!(buffer_text(&terminal).contains("Network unreachable."));
     }
 
     #[test]

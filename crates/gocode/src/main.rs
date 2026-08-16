@@ -1,6 +1,10 @@
 //! Gocode application bootstrap.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use gocode_agent::{Agent, AgentEvent, AgentRequest};
 use gocode_core::{
@@ -328,6 +332,7 @@ async fn run_application() -> Result<(), AppError> {
             bootstrap.resolved_config.reasoning_effort.clone();
         let mut permission_mode = gocode_core::PermissionMode::default();
         let mut auto_compact_enabled = true;
+        let mut staged_update: Option<StagedUpdate> = None;
         let sessions_dir = gocode_core::sessions_dir(&paths.state_dir);
         let current_session: Arc<Mutex<gocode_core::SessionRecord>> =
             Arc::new(Mutex::new(gocode_core::SessionRecord::new()));
@@ -867,11 +872,16 @@ async fn run_application() -> Result<(), AppError> {
                     }
                 }
                 AppCommand::AcceptUpdate => {
-                    match prepare_windows_update(&paths.cache_dir, driver.event_tx.clone()).await {
-                        Ok(()) => {
+                    match prepare_update(&paths.cache_dir, driver.event_tx.clone()).await {
+                        Ok(staged) => {
+                            staged_update = Some(staged);
                             let _ = driver
                                 .event_tx
-                                .send(gocode_core::AppEvent::ExitForUpdate)
+                                .send(gocode_core::AppEvent::UpdateReady {
+                                    message: "The update is ready. Gocode will restart to \
+                                              finish installing it."
+                                        .into(),
+                                })
                                 .await;
                         }
                         Err(error) => {
@@ -881,6 +891,28 @@ async fn run_application() -> Result<(), AppError> {
                                 .await;
                         }
                     }
+                }
+                AppCommand::RestartForUpdate => {
+                    let Some(staged) = staged_update.take() else {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::UpdateFailed(
+                                "No update is staged to install.".into(),
+                            ))
+                            .await;
+                        continue;
+                    };
+                    if let Err(error) = install_and_restart(&staged) {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::UpdateFailed(error))
+                            .await;
+                        continue;
+                    }
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::ExitForUpdate)
+                        .await;
                 }
             }
         }
@@ -897,8 +929,21 @@ async fn run_application() -> Result<(), AppError> {
     Ok(())
 }
 
+/// A downloaded, verified, and extracted update sitting in the cache directory, ready to be
+/// installed over `installed` once the user confirms on the "Completed" screen.
+struct StagedUpdate {
+    staged_binary: PathBuf,
+    installed: PathBuf,
+}
+
+/// Whether this build checks for and can install updates: Windows and Linux release builds
+/// only (macOS isn't packaged, and debug builds would otherwise nag during development).
+fn updates_supported() -> bool {
+    (cfg!(windows) || cfg!(target_os = "linux")) && !cfg!(debug_assertions)
+}
+
 fn start_update_check(event_tx: mpsc::Sender<gocode_core::AppEvent>) {
-    if !cfg!(windows) || cfg!(debug_assertions) {
+    if !updates_supported() {
         return;
     }
     tokio::spawn(async move {
@@ -907,54 +952,83 @@ fn start_update_check(event_tx: mpsc::Sender<gocode_core::AppEvent>) {
             let releases = source.stable_releases().await?;
             let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
                 .map_err(|error| gocode_updater::UpdateError::InvalidRelease(error.to_string()))?;
-            Ok::<_, gocode_updater::UpdateError>(gocode_updater::available_update(
-                &current, releases,
+            let suffix = gocode_updater::current_platform_archive_suffix()?;
+            Ok::<_, gocode_updater::UpdateError>((
+                current.clone(),
+                gocode_updater::available_update(&current, releases, suffix),
             ))
         }
         .await;
         match result {
-            Ok(Some(update)) => {
+            Ok((current, Some(update))) => {
                 let _ = event_tx
                     .send(gocode_core::AppEvent::UpdateAvailable {
+                        current_version: current.to_string(),
                         version: update.version.to_string(),
                         notes: update.notes,
                     })
                     .await;
             }
-            Ok(None) => {}
+            Ok((_, None)) => {}
             Err(error) => tracing::info!("update check skipped: {error}"),
         }
     });
 }
 
-async fn prepare_windows_update(
+/// Downloads, verifies, and extracts the newest available update for this platform into the
+/// cache directory, without touching the installed executable. Reports download progress via
+/// `event_tx` as it goes.
+async fn prepare_update(
     cache_dir: &Path,
     event_tx: mpsc::Sender<gocode_core::AppEvent>,
-) -> Result<(), String> {
-    if !cfg!(windows) {
-        return Err("Automatic updates are available on Windows only. Download the latest Linux archive and replace the installation manually.".into());
-    }
+) -> Result<StagedUpdate, String> {
+    let archive_suffix =
+        gocode_updater::current_platform_archive_suffix().map_err(|e| e.to_string())?;
     let source = gocode_updater::GitHubReleaseSource::new().map_err(|e| e.to_string())?;
     let releases = source.stable_releases().await.map_err(|e| e.to_string())?;
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
-    let update = gocode_updater::available_update(&current, releases)
-        .ok_or_else(|| "No newer Windows update is available.".to_string())?;
+    let update = gocode_updater::available_update(&current, releases, archive_suffix)
+        .ok_or_else(|| "No newer update is available for this platform.".to_string())?;
     let staging = cache_dir.join("update");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-    let _ = event_tx
-        .send(gocode_core::AppEvent::UpdateProgress(
-            "Downloading update…".into(),
-        ))
-        .await;
+
     let client = reqwest::Client::builder()
         .user_agent("gocode-updater")
         .build()
         .map_err(|e| e.to_string())?;
-    let archive =
-        gocode_updater::download_to_staging(&client, &update.archive.download_url, &staging)
-            .await
-            .map_err(|e| e.to_string())?;
+
+    let progress_tx = event_tx.clone();
+    let mut last_percent = None;
+    let archive = gocode_updater::download_to_staging(
+        &client,
+        &update.archive.download_url,
+        &staging,
+        move |downloaded, total| {
+            let percent = total.map(|total| {
+                downloaded
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .map_or(100, |value| u8::try_from(value.min(100)).unwrap_or(100))
+            });
+            if percent != last_percent {
+                last_percent = percent;
+                let _ = progress_tx.try_send(gocode_core::AppEvent::UpdateProgress {
+                    percent,
+                    message: "Downloading update…".into(),
+                });
+            }
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let _ = event_tx
+        .send(gocode_core::AppEvent::UpdateProgress {
+            percent: Some(100),
+            message: "Verifying update…".into(),
+        })
+        .await;
     let sums_url = gocode_updater::official_download_url(&update.checksums.download_url)
         .map_err(|e| e.to_string())?;
     let sums = client
@@ -969,37 +1043,67 @@ async fn prepare_windows_update(
         .map_err(|e| e.to_string())?;
     let expected =
         gocode_updater::checksum_for(&sums, &update.archive.name).map_err(|e| e.to_string())?;
-    let _ = event_tx
-        .send(gocode_core::AppEvent::UpdateProgress(
-            "Verifying update…".into(),
-        ))
-        .await;
     gocode_updater::verify_sha256(&archive, &expected).map_err(|e| e.to_string())?;
-    let (staged_app, _) =
-        gocode_updater::extract_windows_archive(&archive, &staging.join("unpacked"))
-            .map_err(|e| e.to_string())?;
-    let installed = std::env::current_exe().map_err(|e| e.to_string())?;
-    let updater = installed
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("gocode-updater.exe");
-    if !updater.is_file() {
-        return Err(
-            "The installed gocode-updater.exe is missing; reinstall Gocode and try again.".into(),
-        );
-    }
+
     let _ = event_tx
-        .send(gocode_core::AppEvent::UpdateProgress(
-            "Restarting to install update…".into(),
-        ))
+        .send(gocode_core::AppEvent::UpdateProgress {
+            percent: Some(100),
+            message: "Extracting update…".into(),
+        })
         .await;
-    std::process::Command::new(updater)
-        .arg(std::process::id().to_string())
-        .arg(staged_app)
-        .arg(installed)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    let unpacked = staging.join("unpacked");
+    let staged_binary = if cfg!(windows) {
+        let (staged_app, _staged_updater) =
+            gocode_updater::extract_windows_archive(&archive, &unpacked)
+                .map_err(|e| e.to_string())?;
+        staged_app
+    } else {
+        gocode_updater::extract_linux_archive(&archive, &unpacked).map_err(|e| e.to_string())?
+    };
+    let installed = std::env::current_exe().map_err(|e| e.to_string())?;
+    Ok(StagedUpdate {
+        staged_binary,
+        installed,
+    })
+}
+
+/// Installs a staged update over the running installation and starts the replacement process.
+///
+/// On Windows the running executable is locked, so this hands off to the separately installed
+/// `gocode-updater.exe` helper, which waits for this process to exit before swapping files and
+/// restarting. On Linux the executable can be replaced in place (an atomic rename doesn't
+/// require the file to be closed), so this does it directly and restarts immediately.
+fn install_and_restart(staged: &StagedUpdate) -> Result<(), String> {
+    if cfg!(windows) {
+        let updater = staged
+            .installed
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("gocode-updater.exe");
+        if !updater.is_file() {
+            return Err(
+                "The installed gocode-updater.exe is missing; reinstall Gocode and try again."
+                    .into(),
+            );
+        }
+        std::process::Command::new(updater)
+            .arg(std::process::id().to_string())
+            .arg(&staged.staged_binary)
+            .arg(&staged.installed)
+            .spawn()
+            .map_err(|error| {
+                format!("Gocode could not restart automatically ({error}). Please reopen Gocode manually.")
+            })?;
+        return Ok(());
+    }
+    gocode_updater::replace_with_rollback(&staged.staged_binary, &staged.installed)
+        .map_err(|error| error.to_string())?;
+    gocode_updater::restart(&staged.installed, &[]).map_err(|error| {
+        format!(
+            "Gocode was updated but could not restart automatically ({error}). Please reopen \
+             Gocode manually."
+        )
+    })
 }
 
 fn init_logging(

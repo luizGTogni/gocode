@@ -1,9 +1,9 @@
 # Gocode — Updater Specification
 
-**Status:** Implemented for v0.0.6; Windows packaged-flow validation remains required
-**Product:** Gocode  
-**Target version:** v0.1.0  
-**Scope:** Update discovery, download, verification, Windows self-update, rollback
+**Status:** Implemented for Windows and Linux (v0.2.0+); packaged-flow validation should be repeated per release
+**Product:** Gocode
+**Target version:** v0.1.0 (Windows), extended to Linux in a later release
+**Scope:** Update discovery, download, verification, self-update (Windows helper process, Linux in-place replace), rollback
 
 ---
 
@@ -13,7 +13,7 @@ This document defines the Gocode update system.
 
 The updater must allow a globally installed Gocode binary to discover and install newer stable releases with minimal user effort.
 
-Required v0.1.0 behavior:
+Required behavior:
 
 ```text
 installed version = 0.1.0
@@ -21,7 +21,7 @@ latest stable release = 0.2.0
 ↓
 Gocode asks user
 ↓
-Update now / Not now
+Yes / No
 ```
 
 If the user declines, the same version should be offered again on the next startup.
@@ -91,7 +91,7 @@ beta
 nightly
 ```
 
-but not in v0.1.0.
+but are not implemented yet.
 
 ---
 
@@ -102,7 +102,7 @@ The update checker should query the repository's latest stable GitHub Release.
 It should retrieve enough metadata to identify:
 
 - release version;
-- Windows asset;
+- this platform's asset (Windows `.zip` or Linux `.tar.gz`);
 - checksum asset/metadata;
 - optional release notes.
 
@@ -119,25 +119,29 @@ UpdateChecker
 UpdateInstaller
 ```
 
-And on Windows, two processes:
+On Windows, installation involves two processes:
 
 ```text
 gocode.exe
 gocode-updater.exe
 ```
 
+On Linux, installation happens inside the single running process — no helper binary is shipped or needed, because the installed executable can be replaced by an atomic rename while it is still running.
+
 ---
 
-# 7. Why a Separate Updater
+# 7. Why Windows Uses a Separate Updater
 
-A running Windows executable should not rely on replacing itself in place.
+A running Windows executable cannot replace itself in place; the file is locked while it is executing.
 
-Preferred flow:
+Flow:
 
 ```text
 gocode.exe
 ↓
-download new version
+download + verify + stage new version
+↓
+user confirms install ("Completed" screen → Close)
 ↓
 launch gocode-updater.exe
 ↓
@@ -150,30 +154,46 @@ updater relaunches gocode.exe
 
 ---
 
-# 8. Crate Layout
+# 8. Why Linux Updates In Place
+
+On Linux (and Unix generally), `rename()` only changes a directory entry — it doesn't require the target file to be closed. A running process keeps executing the old inode even after its path has been repointed at a new file.
+
+This means Gocode can replace its own installed binary while it is still the process running that binary, with no separate helper process:
+
+```text
+gocode running
+↓
+download + verify + stage new version
+↓
+user confirms install ("Completed" screen → Close)
+↓
+rename the staged binary over the installed one (atomic; current process is unaffected)
+↓
+spawn the new binary as a child process
+↓
+send ExitForUpdate and exit
+```
+
+If the child spawn fails after the rename already succeeded, the binary on disk is updated even though the current process is still running the old code in memory — the user is told to reopen Gocode manually.
+
+---
+
+# 9. Crate Layout
 
 Recommended:
 
 ```text
 gocode-updater/
 └── src/
-    ├── checker.rs
-    ├── github.rs
-    ├── release.rs
-    ├── version.rs
-    ├── download.rs
-    ├── checksum.rs
-    ├── installer.rs
-    ├── windows.rs
-    ├── errors.rs
-    └── lib.rs
+    ├── lib.rs      (release discovery, download, checksum, archive extraction, replace/restart)
+    └── main.rs     (the Windows-only gocode-updater helper binary)
 ```
 
-A separate binary target may live in the same crate.
+The library is platform-agnostic where possible; only archive extraction (`extract_windows_archive` / `extract_linux_archive`) and the Windows helper binary are platform-specific.
 
 ---
 
-# 9. Current Version
+# 10. Current Version
 
 The running binary should expose its version at build time.
 
@@ -191,7 +211,7 @@ semver
 
 ---
 
-# 10. Update Check Timing
+# 11. Update Check Timing
 
 Recommended startup sequence:
 
@@ -213,9 +233,11 @@ wait
 then open TUI
 ```
 
+Update checks are skipped entirely in debug builds and on platforms other than Windows and Linux, so local development never nags about updates.
+
 ---
 
-# 11. Non-Blocking Failure
+# 12. Non-Blocking Failure
 
 If GitHub is:
 
@@ -236,9 +258,9 @@ Update check failure is not a blocking application error.
 
 ---
 
-# 12. Update Check Frequency
+# 13. Update Check Frequency
 
-v0.1.0 behavior:
+Current behavior:
 
 ```text
 check on every startup
@@ -257,7 +279,7 @@ A small internal cache is optional.
 
 ---
 
-# 13. Update Configuration
+# 14. Update Configuration
 
 Global config:
 
@@ -270,7 +292,7 @@ No `ignored_version` field in the MVP.
 
 ---
 
-# 14. Version Comparison
+# 15. Version Comparison
 
 Use SemVer rules.
 
@@ -298,7 +320,7 @@ Never auto-downgrade.
 
 ---
 
-# 15. Tag Normalization
+# 16. Tag Normalization
 
 Accept release tags such as:
 
@@ -318,7 +340,7 @@ Invalid release versions should be ignored with debug logging.
 
 ---
 
-# 16. Release Metadata
+# 17. Release Metadata
 
 Conceptual:
 
@@ -333,51 +355,51 @@ pub struct ReleaseInfo {
 
 ---
 
-# 17. Windows Asset Selection
+# 18. Platform Asset Selection
 
-Release pipeline should publish a deterministic Windows artifact name.
-
-Example:
+The release pipeline publishes one deterministic archive name per supported platform:
 
 ```text
-gocode-x86_64-pc-windows-msvc.zip
+gocode-{version}-windows-x86_64.zip
+gocode-{version}-linux-x86_64.tar.gz
 ```
 
-or:
-
-```text
-gocode-windows-x86_64.zip
-```
-
-The exact name must be standardized before updater implementation.
+The client picks the suffix for the platform it's running on (`current_platform_archive_suffix`) and looks for `gocode-{version}-{suffix}` among the release assets. Any other platform is unsupported and the update checker simply doesn't run.
 
 ---
 
-# 18. Package Contents
+# 19. Package Contents
 
-Recommended Windows release archive:
+Windows release archive:
 
 ```text
 gocode.exe
 gocode-updater.exe
+LICENSE
+INSTALL.md
+install-windows.ps1
 ```
 
-Optionally:
+Linux release archive (inside one top-level `gocode-{version}-linux-x86_64/` directory):
 
 ```text
+gocode
 LICENSE
+INSTALL.md
+install-linux.sh
 ```
 
-The updater should know exactly which executable must replace the installed binary.
+Linux ships no separate updater helper — only the `gocode` executable is extracted from the archive; the other files are ignored by the updater (they matter only for a fresh manual install).
 
 ---
 
-# 19. Architecture Detection
+# 20. Architecture Detection
 
-v0.1.0 may initially support:
+Currently supported:
 
 ```text
 x86_64 Windows
+x86_64 Linux
 ```
 
 If ARM64 is supported, asset selection must use runtime architecture.
@@ -386,19 +408,23 @@ Do not download an incompatible binary.
 
 ---
 
-# 20. Update Available Event
+# 21. Update Available Event
 
-The checker emits normalized application event:
+The checker emits a normalized application event:
 
 ```rust
-AppEvent::UpdateAvailable(UpdateInfo)
+AppEvent::UpdateAvailable {
+    current_version: String,
+    version: String,
+    notes: String,
+}
 ```
 
-The TUI decides when to show the modal.
+`current_version` is included so the popup can show the "old → new" comparison. The TUI decides when to show the modal.
 
 ---
 
-# 21. Active Agent Run
+# 22. Active Agent Run
 
 If an update is detected while an AgentRun is active:
 
@@ -412,35 +438,31 @@ Do not interrupt coding work.
 
 ---
 
-# 22. Update Prompt
+# 23. Update Prompt
 
-Example:
+The popup shows:
 
 ```text
-Gocode 0.2.0 is available
+New update
 
-You're using 0.1.0
+0.1.0  ->  0.2.0      (current version in red, new version in green)
 
-[ Update now ] [ Not now ]
+<first line of release notes>
+
+ Yes   No
 ```
 
-Keep the interaction simple.
+`Yes`/`No` are highlighted buttons; Left/Right/Tab toggle which one is selected, Enter confirms the highlighted one, and `y`/`n`/`Esc` work as direct shortcuts regardless of the current selection.
 
 ---
 
-# 23. Declining an Update
+# 24. Declining an Update
 
-If user selects:
+If the user selects `No` (or presses `Esc`):
 
-```text
-Not now
-```
-
-Gocode should:
-
-- close the modal;
+- close the popup;
 - continue normally;
-- not persist an ignored version.
+- do not persist an ignored version.
 
 Next startup:
 
@@ -452,27 +474,29 @@ ask again
 
 ---
 
-# 24. Accepting an Update
+# 25. Accepting an Update
 
-Flow:
+Choosing `Yes` only downloads, verifies, and stages the update — it does **not** touch the installed binary yet:
 
 ```text
-user selects Update now
+user selects Yes
 ↓
-download asset
+popup switches to a download-progress screen (percentage + message)
 ↓
-verify integrity
+download asset (streamed, with byte-level progress)
 ↓
-prepare updater
+verify checksum
 ↓
-launch updater
+extract the platform archive into a staging directory
 ↓
-exit current process
+popup switches to "Completed" with a Close button
 ```
+
+The actual install + restart only happens once the user presses **Close** on the Completed screen (see §7 and §8 for the platform-specific replacement step that follows).
 
 ---
 
-# 25. Download Location
+# 26. Download Location
 
 Use a temporary/update staging directory.
 
@@ -484,23 +508,23 @@ Example:
 
 or OS temp directory.
 
-Recommended staged names:
+Staged download name:
 
 ```text
-gocode-0.2.0.zip.part
-gocode-0.2.0.zip
+download.partial   (while in flight)
+release.download   (once complete)
 ```
 
 ---
 
-# 26. Partial Downloads
+# 27. Partial Downloads
 
 Never treat a partial download as valid.
 
 Pattern:
 
 ```text
-download to .part
+download to .partial
 ↓
 flush/close
 ↓
@@ -509,7 +533,7 @@ rename to final staged file
 
 ---
 
-# 27. HTTPS
+# 28. HTTPS
 
 All release and asset downloads must use HTTPS.
 
@@ -517,39 +541,38 @@ Do not support insecure HTTP for official updates.
 
 ---
 
-# 28. Integrity Verification
+# 29. Integrity Verification
 
 The updater must verify downloaded artifacts before installation.
 
-Minimum MVP requirement:
+Minimum requirement:
 
 ```text
 SHA-256 checksum
 ```
 
-The release pipeline should publish checksums.
+The release pipeline publishes checksums for every platform archive.
 
 ---
 
-# 29. Checksum Distribution
+# 30. Checksum Distribution
 
-Recommended GitHub Release asset:
+GitHub Release asset:
 
 ```text
 SHA256SUMS
 ```
 
-or per-file:
+containing one line per archive, e.g.:
 
 ```text
-gocode-windows-x86_64.zip.sha256
+<sha256>  gocode-0.2.0-windows-x86_64.zip
+<sha256>  gocode-0.2.0-linux-x86_64.tar.gz
 ```
-
-The format must be standardized.
 
 ---
 
-# 30. Verification Flow
+# 31. Verification Flow
 
 ```text
 download binary/archive
@@ -566,7 +589,7 @@ mismatch → abort
 
 ---
 
-# 31. Checksum Failure
+# 32. Checksum Failure
 
 If checksum mismatches:
 
@@ -574,9 +597,9 @@ If checksum mismatches:
 abort update
 ```
 
-Do not replace the installed executable.
+Do not touch the installed executable — at this point nothing has been staged for install yet.
 
-User-facing message:
+User-facing message (on the popup's "Failed" screen):
 
 ```text
 Gocode could not verify the update.
@@ -586,7 +609,7 @@ Your current installation was not changed.
 
 ---
 
-# 32. Signature Verification
+# 33. Signature Verification
 
 Cryptographic release signing is desirable future hardening.
 
@@ -596,11 +619,11 @@ Possible future technologies:
 - minisign;
 - platform code signing.
 
-Not required to block v0.1.0 if SHA-256 is implemented correctly, but Windows code signing should be considered before wider distribution.
+Not required while SHA-256 is implemented correctly, but Windows code signing should be considered before wider distribution. Linux has no equivalent trust-prompt friction to solve, so it isn't a near-term priority there.
 
 ---
 
-# 33. Windows Code Signing
+# 34. Windows Code Signing
 
 A production release should eventually sign:
 
@@ -615,25 +638,24 @@ It is a release engineering concern separate from checksum verification.
 
 ---
 
-# 34. Update Installer Input
+# 35. Update Installer Input
 
-The updater process should receive explicit paths and expected version.
+The Windows helper process receives explicit paths and expected version:
 
 Conceptual CLI:
 
 ```text
 gocode-updater.exe
-  --current <path>
-  --new <path>
-  --version 0.2.0
-  --restart
+  <pid>
+  <staged-executable-path>
+  <installed-executable-path>
 ```
 
-Exact syntax is internal.
+Exact syntax is internal. Linux has no equivalent helper input — the running process performs the replace and restart itself (see §8).
 
 ---
 
-# 35. Updater Trust Boundary
+# 36. Updater Trust Boundary
 
 The updater must not accept arbitrary unsafe replacement targets from untrusted model/tool input.
 
@@ -641,7 +663,7 @@ Only the Gocode application invokes it with validated paths.
 
 ---
 
-# 36. Process Ownership
+# 37. Process Ownership
 
 The updater should verify the target path corresponds to the installed Gocode binary it expects to replace.
 
@@ -649,12 +671,14 @@ Avoid generic "replace any executable" behavior.
 
 ---
 
-# 37. Main Windows Flow
+# 38. Windows Replacement Flow
 
 ```text
 gocode.exe running
 ↓
-new binary staged
+new binary downloaded, verified, and staged (§25) — installed binary untouched so far
+↓
+"Completed" screen shown; user presses Close
 ↓
 gocode-updater.exe launched
 ↓
@@ -677,9 +701,33 @@ updater exits
 
 ---
 
-# 38. Waiting for Main Process Exit
+# 39. Linux Replacement Flow
 
-The updater may need to wait until the old process fully exits.
+```text
+gocode running
+↓
+new binary downloaded, verified, and staged (§25) — installed binary untouched so far
+↓
+"Completed" screen shown; user presses Close
+↓
+backup old binary (rename installed → installed.previous)
+↓
+rename staged binary → installed path (atomic; current process keeps running the old inode)
+↓
+remove backup
+↓
+spawn the newly installed binary as a child process
+↓
+send ExitForUpdate and exit
+```
+
+If the child spawn fails, the backup has already been removed (replacement succeeded) but no new process was started — the popup shows a "Failed" screen telling the user to reopen Gocode manually rather than attempting a rollback of a successful file replacement.
+
+---
+
+# 40. Waiting for Main Process Exit
+
+The Windows updater helper may need to wait until the old process fully exits before the file lock is released.
 
 Use:
 
@@ -687,49 +735,43 @@ Use:
 - bounded retry/wait;
 - clear failure behavior.
 
-Never loop forever.
+Never loop forever. (Not applicable on Linux — there is no lock to wait out.)
 
 ---
 
-# 39. Backup Strategy
+# 41. Backup Strategy
 
-Before replacement:
+Before replacement, on either platform:
 
 ```text
-gocode.exe
+<installed>
 ↓
-gocode.exe.old
+<installed>.previous
 ```
 
-Then place new executable:
+Then place the new executable at the installed path. After a successful replacement:
 
 ```text
-new → gocode.exe
-```
-
-After successful restart/verification:
-
-```text
-remove .old
+remove <installed>.previous
 ```
 
 ---
 
-# 40. Rollback
+# 42. Rollback
 
 If replacement fails after backup:
 
 ```text
-restore gocode.exe.old
+restore <installed>.previous → <installed>
 ```
 
 The user's existing installation should remain usable.
 
 ---
 
-# 41. Rollback Scope
+# 43. Rollback Scope
 
-MVP rollback should cover:
+Rollback should cover:
 
 - file replacement failure;
 - missing new binary;
@@ -739,13 +781,9 @@ Full transactional update systems are unnecessary.
 
 ---
 
-# 42. Restart
+# 44. Restart
 
-After successful replacement:
-
-```text
-start gocode.exe
-```
+After successful replacement, start the newly installed executable as a child process (same binary path on both platforms, no arguments preserved yet).
 
 Prefer preserving:
 
@@ -753,84 +791,71 @@ Prefer preserving:
 
 Future enhancement may preserve project/session continuation.
 
-v0.1.0 can simply reopen Gocode in the same working directory if practical.
+---
+
+# 45. Restart Arguments
+
+If Gocode was started with useful CLI arguments, the restart may preserve them when safe.
+
+Not required for the current implementation.
 
 ---
 
-# 43. Restart Arguments
+# 46. Update UX Progress
 
-If Gocode was started with useful CLI arguments, updater may preserve them when safe.
-
-Not required for first implementation.
-
----
-
-# 44. Update UX Progress
-
-During download/preparation, TUI may show:
+While downloading and preparing an update, the popup shows a progress bar with a percentage (when the server reports `Content-Length`) and a short message:
 
 ```text
-Updating Gocode...
-
-Downloading 0.2.0
-Verifying update
-Preparing restart
+Downloading update…   [███████░░░]  68%
+Verifying update…     [██████████] 100%
+Extracting update…    [██████████] 100%
 ```
 
 Avoid exposing low-level file operations.
 
 ---
 
-# 45. Terminal Shutdown Before Updater
+# 47. Terminal Shutdown Before Restart
 
-Before exiting to updater:
+Before exiting to install the update:
 
 1. flush session state;
 2. flush logs;
 3. restore terminal;
-4. launch updater;
+4. (Windows) launch the updater helper, or (Linux) rename the binary and spawn the new process directly;
 5. exit.
 
 Do not leave terminal raw mode enabled.
 
 ---
 
-# 46. Updater UI
+# 48. Updater UI
 
-The updater does not need a TUI.
+The Windows helper does not need a TUI; it may run silently or print minimal console output.
 
-It may run silently or print minimal console output.
-
-Example:
-
-```text
-Updating Gocode...
-Updated to 0.2.0.
-```
-
-If immediately restarting, even this may be unnecessary.
+Linux has no separate updater process at all — the replacement happens inside the main Gocode process between the Close click and process exit.
 
 ---
 
-# 47. Update Failure UX
+# 49. Update Failure UX
 
-If update preparation fails while Gocode is still running:
+If update preparation or installation fails, the popup switches to a "Failed" screen:
 
 ```text
-Gocode could not update.
+Failed
 
-Your current installation was not changed.
+<error message>
 
-[ Continue ]
+ Close
 ```
 
-The user should remain in the current session.
+Close dismisses the popup; the current session and installation are unaffected unless the failure happened after a successful file replacement (see §39), in which case the message tells the user to reopen Gocode manually.
 
 ---
 
-# 48. Updater Failure After Main Exit
+# 50. Updater Failure After Main Exit
 
-If updater fails after Gocode exits:
+If the Windows updater helper fails after Gocode exits:
 
 - restore old binary when possible;
 - print a concise console error;
@@ -845,7 +870,7 @@ The previous version was restored.
 
 ---
 
-# 49. Update Logs
+# 51. Update Logs
 
 Write updater diagnostics to:
 
@@ -868,7 +893,7 @@ rollback result
 
 ---
 
-# 50. GitHub Errors
+# 52. GitHub Errors
 
 Map:
 
@@ -888,30 +913,30 @@ Install errors are user-visible.
 
 ---
 
-# 51. Update Error Types
+# 53. Update Error Types
 
-Conceptual:
+Conceptual (matches `gocode_updater::UpdateError`):
 
 ```rust
 pub enum UpdateError {
     Network(String),
-    Timeout,
     InvalidRelease(String),
-    InvalidVersion(String),
     AssetNotFound,
     ChecksumMissing,
     ChecksumMismatch,
-    Download(String),
+    UnsafeArchive(String),
     Io(String),
     Replace(String),
     Rollback(String),
-    Restart(String),
+    UnsupportedPlatform,
 }
 ```
 
+`UnsupportedPlatform` covers any OS other than Windows or Linux.
+
 ---
 
-# 52. Update Checker Type
+# 54. Update Checker Type
 
 Conceptual:
 
@@ -924,7 +949,7 @@ pub struct UpdateChecker {
 
 ---
 
-# 53. Update Source
+# 55. Update Source
 
 A small abstraction is justified.
 
@@ -947,7 +972,7 @@ This enables deterministic tests.
 
 ---
 
-# 54. Update Installer Type
+# 56. Update Installer Type
 
 Conceptual:
 
@@ -963,32 +988,26 @@ Do not over-abstract internal helpers.
 
 ---
 
-# 55. Download Progress
+# 57. Download Progress
 
-Downloader may emit:
+The downloader reports `(downloaded_bytes, total_bytes)` to a progress callback as each streamed chunk arrives; `total_bytes` is `None` when the server omits `Content-Length`. This is turned into the application event:
 
 ```rust
-pub enum UpdateProgress {
-    Starting,
-    Downloading {
-        downloaded: u64,
-        total: Option<u64>,
-    },
-    Verifying,
-    PreparingInstall,
-    Restarting,
+AppEvent::UpdateProgress {
+    percent: Option<u8>,
+    message: String,
 }
 ```
 
-TUI can simplify the display.
+The TUI shows `message` next to a progress bar driven by `percent` (an indeterminate bar when `percent` is `None`).
 
 ---
 
-# 56. Cancellation
+# 58. Cancellation
 
-Before the updater process starts, user cancellation may be allowed.
+Before the user confirms install (i.e. while still on the download-progress screen), there is currently no cancel action — the download either completes or fails.
 
-Once binary replacement begins:
+Once file replacement begins (§38/§39):
 
 ```text
 do not expose arbitrary cancellation
@@ -998,7 +1017,7 @@ A half-applied update is worse than finishing a short atomic operation.
 
 ---
 
-# 57. Update During Permission Modal
+# 59. Update During Permission Modal
 
 Do not show an update modal over an active permission modal.
 
@@ -1006,7 +1025,7 @@ Queue the update notification.
 
 ---
 
-# 58. Update During Onboarding
+# 60. Update During Onboarding
 
 Recommended:
 
@@ -1020,7 +1039,7 @@ Do not distract the user before they can enter the product.
 
 ---
 
-# 59. Update Check Privacy
+# 61. Update Check Privacy
 
 The GitHub update request may reveal normal network metadata such as:
 
@@ -1036,7 +1055,7 @@ Do not send:
 
 ---
 
-# 60. GitHub Authentication
+# 62. GitHub Authentication
 
 Public release checks should not require a GitHub token.
 
@@ -1046,120 +1065,113 @@ Do not ask users for a GitHub token just to update Gocode.
 
 ---
 
-# 61. Release Asset Naming
+# 63. Release Asset Naming
 
-Standardize naming early.
-
-Recommended example:
+Standardized names (see `.github/workflows/release.yml`):
 
 ```text
-gocode-v0.2.0-x86_64-pc-windows-msvc.zip
-gocode-v0.2.0-x86_64-pc-windows-msvc.zip.sha256
+gocode-{version}-windows-x86_64.zip
+gocode-{version}-linux-x86_64.tar.gz
+SHA256SUMS
 ```
 
 Consistency simplifies updater logic.
 
 ---
 
-# 62. Archive Extraction
+# 64. Archive Extraction
 
-If distributing ZIP:
+Windows (`.zip`):
 
 ```text
 download zip
 ↓
 verify zip checksum
 ↓
-extract into staging directory
+extract gocode.exe and gocode-updater.exe into a staging directory
 ↓
-validate expected files
+validate both files were present
 ↓
 install
 ```
 
-Never extract directly over the live installation.
-
----
-
-# 63. Archive Safety
-
-ZIP extraction must prevent path traversal.
-
-Reject entries such as:
+Linux (`.tar.gz`):
 
 ```text
-../../evil.exe
+download tar.gz
+↓
+verify checksum
+↓
+extract only the `gocode` file, found one level under a single top-level directory
+↓
+validate it was present, then set its executable bit
+↓
+install
 ```
 
-Only accept expected file names/paths.
+Never extract directly over the live installation on either platform.
 
 ---
 
-# 64. Expected Files
+# 65. Archive Safety
 
-For Windows release:
+Extraction must prevent path traversal on both formats.
+
+Windows ZIP entries are rejected unless they are a root-level `gocode.exe` or `gocode-updater.exe` (no `/`, no `\`, no enclosed-path mismatch).
+
+Linux tar entries are rejected unless they resolve to exactly `<one-directory>/<file>` — anything with `..`, more path segments, or no wrapping directory is treated as unsafe. Non-`gocode` files inside that one directory (`LICENSE`, install scripts, …) are simply skipped, not rejected.
+
+---
+
+# 66. Expected Files
+
+Windows release:
 
 ```text
 gocode.exe
 gocode-updater.exe
 ```
 
-Validate they exist before starting replacement.
+Both must exist before starting replacement.
+
+Linux release: only `gocode` is required; other archive members are optional and ignored by the updater.
 
 ---
 
-# 65. Updating the Updater
+# 67. Updating the Updater
 
-The release may also contain a new:
+The Windows release may also contain a new `gocode-updater.exe`, but the current implementation does not use the freshly downloaded one — it reuses whatever `gocode-updater.exe` is already installed next to `gocode.exe`. If that file is missing, the update fails with a message asking the user to reinstall Gocode.
 
-```text
-gocode-updater.exe
-```
-
-The update strategy must account for replacing the updater itself safely.
-
-One simple approach:
-
-1. current updater performs main binary replacement;
-2. updater replacement is staged for next launch or copied under a temporary name;
-3. cleanup occurs after process exit.
-
-The exact implementation should be designed carefully for Windows file-lock behavior.
+Linux has no separate updater binary to update — nothing to do here.
 
 ---
 
-# 66. Simplified MVP Updater Strategy
+# 68. Simplified Updater Strategy
 
-For first implementation, acceptable approach:
+Windows:
 
 - keep a small stable updater binary;
 - update `gocode.exe` first;
-- defer updater self-replacement if necessary.
+- defer updater self-replacement.
 
-Do not let updater self-update complexity block the MVP.
-
----
-
-# 67. Installation Path
-
-Expected default:
-
-```text
-%USERPROFILE%\.gocode\bin\
-```
-
-Containing:
-
-```text
-gocode.exe
-gocode-updater.exe
-```
-
-Updater must resolve the actual running binary path rather than blindly assuming the default.
+Linux doesn't need this strategy at all — there is no second binary in the loop.
 
 ---
 
-# 68. Portable/Alternate Installs
+# 69. Installation Path
+
+Typical per-user install locations:
+
+```text
+Windows: %USERPROFILE%\.gocode\bin\gocode.exe (+ gocode-updater.exe)
+Linux:   ~/.local/bin/gocode
+```
+
+The updater must resolve the actual running binary path (`current_exe()`) rather than assuming a fixed default, since users may install elsewhere.
+
+---
+
+# 70. Portable/Alternate Installs
 
 Future users may place Gocode elsewhere.
 
@@ -1175,9 +1187,9 @@ Only update installations the process can write to.
 
 ---
 
-# 69. Permission Failure
+# 71. Permission Failure
 
-If installation directory is not writable:
+If the installation directory is not writable:
 
 ```text
 abort safely
@@ -1193,36 +1205,33 @@ Future installer methods may handle elevated/system installs separately.
 
 ---
 
-# 70. Global User Install
+# 72. Global User Install
 
-The MVP should prefer per-user installation so updates do not require administrator privileges.
-
-This aligns with:
+Prefer per-user installation so updates do not require administrator/root privileges:
 
 ```text
-%USERPROFILE%\.gocode\bin
+Windows: %USERPROFILE%\.gocode\bin
+Linux:   ~/.local/bin
 ```
 
 ---
 
-# 71. Release Pipeline Contract
+# 73. Release Pipeline Contract
 
-The updater depends on release engineering.
-
-GitHub Actions should produce:
+The updater depends on release engineering. GitHub Actions produces, per tag:
 
 ```text
-Windows binary/archive
-checksum
-GitHub Release
-stable version tag
+gocode-{version}-windows-x86_64.zip
+gocode-{version}-linux-x86_64.tar.gz
+SHA256SUMS
+GitHub Release (stable version tag)
 ```
 
 Updater design and release pipeline must share the same asset naming contract.
 
 ---
 
-# 72. Release Pipeline Concept
+# 74. Release Pipeline Concept
 
 ```text
 git tag v0.2.0
@@ -1233,18 +1242,18 @@ cargo test
 ↓
 cargo build --release
 ↓
-package Windows assets
+package Windows and Linux assets
 ↓
-SHA-256
+SHA-256 (SHA256SUMS)
 ↓
 publish GitHub Release
 ```
 
 ---
 
-# 73. Release Notes
+# 75. Release Notes
 
-The update modal does not need to display full release notes.
+The update popup shows only the first line of the release notes.
 
 Future option:
 
@@ -1252,41 +1261,41 @@ Future option:
 View what's new
 ```
 
-Not required for v0.1.0.
+Not required currently.
 
 ---
 
-# 74. Forced Updates
+# 76. Forced Updates
 
-Do not implement forced updates in v0.1.0.
+Do not implement forced updates.
 
-The user must be able to select:
+The user must always be able to select:
 
 ```text
-Not now
+No
 ```
 
 ---
 
-# 75. Automatic Silent Installation
+# 77. Automatic Silent Installation
 
-Do not silently install updates without user approval in v0.1.0.
+Do not silently install updates without user approval.
 
-Check automatically, install explicitly.
-
----
-
-# 76. Downgrade
-
-Updater does not support downgrade through normal flow.
-
-Manual downgrade remains outside MVP.
+Check automatically, install explicitly (and only after the user confirms the "Completed" screen — see §25).
 
 ---
 
-# 77. Prerelease Builds
+# 78. Downgrade
 
-A developer build with version such as:
+Updater does not support downgrade through the normal flow.
+
+Manual downgrade remains outside scope.
+
+---
+
+# 79. Prerelease Builds
+
+A developer build with a version such as:
 
 ```text
 0.2.0-alpha.1
@@ -1298,20 +1307,13 @@ For stable public builds, use stable latest release only.
 
 ---
 
-# 78. Development Builds
+# 80. Development Builds
 
-Local development binaries may disable update checks by:
-
-- build flag;
-- config;
-- repository detection;
-- version convention.
-
-The exact policy should prevent developers from accidentally overwriting debug builds.
+Update checks are disabled in debug builds (`cfg!(debug_assertions)`), so local development never nags about updates.
 
 ---
 
-# 79. Debug Update Source
+# 81. Debug Update Source
 
 Tests may use a fake source.
 
@@ -1319,7 +1321,7 @@ Do not require GitHub network access for updater unit tests.
 
 ---
 
-# 80. Fake Update Source
+# 82. Fake Update Source
 
 Example:
 
@@ -1339,7 +1341,7 @@ fake latest 0.2.0
 
 ---
 
-# 81. Fake Installer
+# 83. Fake Installer
 
 Installer behavior should be testable with temporary directories.
 
@@ -1347,7 +1349,7 @@ Avoid replacing the test runner executable.
 
 ---
 
-# 82. Version Tests
+# 84. Version Tests
 
 Minimum:
 
@@ -1361,11 +1363,12 @@ v-prefix
 invalid tag
 prerelease
 draft ignored
+release missing this platform's asset
 ```
 
 ---
 
-# 83. Download Tests
+# 85. Download Tests
 
 Test:
 
@@ -1376,11 +1379,12 @@ partial failure
 resume not required
 wrong content length
 temp file cleanup
+progress callback receives increasing percentages
 ```
 
 ---
 
-# 84. Checksum Tests
+# 86. Checksum Tests
 
 Test:
 
@@ -1393,23 +1397,36 @@ invalid checksum format
 
 ---
 
-# 85. Windows Installer Tests
+# 87. Platform Installer Tests
 
-Test in isolated temp directory:
+Test in isolated temp directories, for both platforms:
 
 ```text
 replace binary
 backup old
 failure during replace
 rollback
-locked file
-missing staged file
 restart path construction
+```
+
+Windows-specific:
+
+```text
+locked file
+missing staged updater helper
+```
+
+Linux-specific:
+
+```text
+extensionless binary name (no ".exe")
+replace succeeds while a process still has the old file open
+archive path-traversal / missing-wrapping-directory rejection
 ```
 
 ---
 
-# 86. Integration Test
+# 88. Integration Test
 
 A safe integration scenario can simulate:
 
@@ -1427,58 +1444,61 @@ Do not replace the running test process.
 
 ---
 
-# 87. Real Windows Manual Test
+# 89. Manual Release Verification
 
-Before v0.1.0:
+Before shipping a release, on **both** Windows and Linux:
 
-1. install `0.0.x`;
-2. publish test release;
+1. install the previous version;
+2. publish the new release;
 3. launch Gocode;
 4. receive prompt;
 5. decline;
-6. relaunch and confirm prompt appears again;
-7. accept;
-8. verify checksum;
-9. verify process restart;
-10. verify new version;
-11. verify old binary cleanup.
+6. relaunch and confirm the prompt appears again;
+7. accept — confirm the progress screen shows an increasing percentage;
+8. confirm the "Completed" screen appears with a Close button;
+9. press Close — confirm the process restarts automatically into the new version;
+10. verify old binary/backup cleanup.
 
 ---
 
-# 88. Recovery Manual Test
+# 90. Recovery Manual Test
 
 Simulate:
 
 - no network;
 - bad checksum;
-- locked install directory;
-- missing updater;
-- failed replacement.
+- locked install directory (Windows) / read-only install directory (Linux);
+- missing `gocode-updater.exe` (Windows);
+- failed replacement;
+- restart spawn failure right after a successful in-place replace (Linux) — confirm the "reopen manually" message appears and the binary on disk is the new version.
 
 Current version must remain usable whenever possible.
 
 ---
 
-# 89. App Event Integration
+# 91. App Event Integration
 
-Events:
+Events (`gocode_core::AppEvent`):
 
 ```rust
-AppEvent::UpdateAvailable(UpdateInfo)
-AppEvent::UpdateProgress(UpdateProgress)
-AppEvent::UpdateFailed(UpdateError)
+UpdateAvailable { current_version: String, version: String, notes: String }
+UpdateProgress { percent: Option<u8>, message: String }
+UpdateReady { message: String }
+UpdateFailed(String)
+ExitForUpdate
 ```
 
-Commands:
+Commands (`gocode_core::AppCommand`):
 
 ```rust
-AppCommand::AcceptUpdate
-AppCommand::RejectUpdate
+AcceptUpdate       // Yes: download, verify, and stage the update
+RejectUpdate       // No: dismiss for this startup
+RestartForUpdate   // Close on the Completed screen: install and restart
 ```
 
 ---
 
-# 90. Session Interaction
+# 92. Session Interaction
 
 Before installation/restart:
 
@@ -1490,7 +1510,7 @@ Do not begin update replacement while an AgentRun is active.
 
 ---
 
-# 91. Config Interaction
+# 93. Config Interaction
 
 If:
 
@@ -1510,7 +1530,7 @@ Not required in the initial slash command set.
 
 ---
 
-# 92. Updater Security Summary
+# 94. Updater Security Summary
 
 The updater must enforce:
 
@@ -1520,37 +1540,38 @@ The updater must enforce:
 4. SemVer comparison;
 5. deterministic platform asset selection;
 6. SHA-256 verification;
-7. staging before install;
+7. staging before install — nothing is installed until the user confirms the Completed screen;
 8. path validation;
 9. backup before replacement;
 10. rollback on failure;
 11. no forced update;
-12. no downgrade.
+12. no downgrade;
+13. platform-appropriate replacement strategy (Windows: separate helper process; Linux: atomic in-place rename).
 
 ---
 
-# 93. Definition of Done
+# 95. Definition of Done
 
-The updater is ready for v0.1.0 when:
+The updater is ready when, on both Windows and Linux:
 
-- update check runs after TUI startup;
+- update check runs after TUI startup, and is skipped in debug builds;
 - GitHub failures do not block Gocode;
 - latest stable release is parsed;
 - SemVer comparison is correct;
-- update modal appears only when newer version exists;
+- the popup appears only when a newer version exists for this platform;
 - declining causes the prompt to reappear next startup;
-- accepting downloads the correct Windows artifact;
-- checksum is verified;
+- accepting downloads and verifies the correct platform artifact, showing live download progress;
+- checksum is verified before anything is staged;
 - partial downloads are not installed;
-- Gocode exits cleanly;
-- updater replaces the binary;
+- the "Completed" screen appears only once the update is fully staged, with a Close button;
+- pressing Close installs the update and restarts Gocode automatically;
+- if automatic restart isn't possible, the user is told to reopen Gocode manually;
 - rollback works on replacement failure;
-- new Gocode restarts successfully;
-- current installation remains unchanged after verification/download failure.
+- current installation remains unchanged after a verification/download failure.
 
 ---
 
-# 94. Reference Successful Flow
+# 96. Reference Successful Flow
 
 ```text
 gocode 0.1.0 starts
@@ -1561,39 +1582,30 @@ background GitHub check
 ↓
 0.2.0 found
 ↓
-Update modal
+"New update" popup: Yes
 ↓
-Update now
-↓
-download
+download (with progress %)
 ↓
 SHA-256 verify
 ↓
-stage
+extract to staging
 ↓
-launch updater
+"Completed" screen: Close
 ↓
-restore terminal
-↓
-gocode exits
-↓
-backup 0.1.0 binary
-↓
-install 0.2.0
-↓
-restart
+Windows: launch gocode-updater.exe, exit, helper replaces + restarts
+Linux:   rename staged binary over installed, spawn new process, exit
 ↓
 Gocode 0.2.0 starts
 ```
 
 ---
 
-# 95. Reference Decline Flow
+# 97. Reference Decline Flow
 
 ```text
 0.2.0 available
 ↓
-Not now
+No
 ↓
 continue using 0.1.0
 ↓
@@ -1608,29 +1620,27 @@ ask again
 
 ---
 
-# 96. Reference Failure Flow
+# 98. Reference Failure Flow
 
 ```text
 0.2.0 available
 ↓
-Update now
+Yes
 ↓
 download
 ↓
 checksum mismatch
 ↓
-abort
+"Failed" screen: Close
 ↓
 0.1.0 remains installed
-↓
-show non-destructive error
 ↓
 continue using Gocode
 ```
 
 ---
 
-# 97. Final Rule
+# 99. Final Rule
 
 The updater should make staying current easy without making the installation fragile.
 

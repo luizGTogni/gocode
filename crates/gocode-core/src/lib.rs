@@ -31,10 +31,12 @@ pub enum AppCommand {
     CancelProviderRequest,
     /// Answer the single active permission prompt: `true` approves, `false` denies.
     PermissionResponse(bool),
-    /// Start the user-approved update installation.
+    /// Start the user-approved update download and staging.
     AcceptUpdate,
     /// Dismiss this startup's update prompt without changing the installation.
     RejectUpdate,
+    /// Install the staged update and restart, once the user confirms on the "Completed" screen.
+    RestartForUpdate,
     /// Set the reasoning-effort level sent with future chat requests, or clear it.
     SetReasoningEffort(Option<String>),
     /// Set the permission mode applied to future agent runs.
@@ -126,12 +128,25 @@ pub enum AppEvent {
     /// An error severe enough to require a blocking acknowledgement before work continues.
     BlockingError(String),
     /// A newer verified release is available for user approval.
-    UpdateAvailable { version: String, notes: String },
-    /// A non-destructive preparation status for an accepted update.
-    UpdateProgress(String),
-    /// Update preparation failed; the running installation remains available.
+    UpdateAvailable {
+        /// The version currently running, shown alongside `version` for comparison.
+        current_version: String,
+        /// The newer version on offer.
+        version: String,
+        notes: String,
+    },
+    /// Download/verification progress for an accepted update. `percent` is `None` while the
+    /// total size isn't yet known (e.g. a server that omits `Content-Length`).
+    UpdateProgress {
+        percent: Option<u8>,
+        message: String,
+    },
+    /// The update was downloaded, verified, and staged; ready to install on user confirmation.
+    UpdateReady { message: String },
+    /// Update preparation or installation failed; the running installation remains available.
     UpdateFailed(String),
-    /// The external updater is launched; the interface must restore the terminal and exit.
+    /// The update is installed (or an external updater has taken over); the interface must
+    /// restore the terminal and exit.
     ExitForUpdate,
     /// The agent run's lifecycle state changed.
     AgentStateChanged(AgentActivityState),
