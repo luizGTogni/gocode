@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "gocode"
-version = "0.0.10"
+version = "0.1.0"
 dependencies = [
  "gocode-agent",
  "gocode-core",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "gocode-agent"
-version = "0.0.10"
+version = "0.1.0"
 dependencies = [
  "gocode-core",
  "gocode-tools",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "gocode-core"
-version = "0.0.10"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -830,14 +830,14 @@ dependencies = [
 
 [[package]]
 name = "gocode-credentials"
-version = "0.0.10"
+version = "0.1.0"
 dependencies = [
  "keyring",
 ]
 
 [[package]]
 name = "gocode-provider-nvidia"
-version = "0.0.10"
+version = "0.1.0"
 dependencies = [
  "futures-util",
  "gocode-core",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "gocode-tools"
-version = "0.0.10"
+version = "0.1.0"
 dependencies = [
  "ignore",
  "serde",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "gocode-tui"
-version = "0.0.10"
+version = "0.1.0"
 dependencies = [
  "arboard",
  "crossterm",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "gocode-updater"
-version = "0.0.10"
+version = "0.1.0"
 dependencies = [
  "hex",
  "reqwest",
