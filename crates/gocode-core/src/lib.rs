@@ -1195,17 +1195,20 @@ pub fn save_global_config(
     model: Option<&str>,
     reasoning_effort: Option<&str>,
 ) -> Result<(), AppError> {
+    use std::fmt::Write as _;
+
     let mut contents = String::from("schema_version = 1\n");
     if let Some(provider) = provider {
-        contents.push_str(&format!("default_provider = \"{provider}\"\n"));
+        let _ = writeln!(contents, "default_provider = \"{provider}\"");
     }
     if let Some(model) = model {
-        contents.push_str(&format!("default_model = \"{model}\"\n"));
+        let _ = writeln!(contents, "default_model = \"{model}\"");
     }
     if let Some(reasoning_effort) = reasoning_effort {
-        contents.push_str(&format!(
-            "default_reasoning_effort = \"{reasoning_effort}\"\n"
-        ));
+        let _ = writeln!(
+            contents,
+            "default_reasoning_effort = \"{reasoning_effort}\""
+        );
     }
     atomic_write(path, &contents)
 }

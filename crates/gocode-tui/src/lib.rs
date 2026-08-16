@@ -3102,7 +3102,7 @@ mod tests {
         let (start, end, truncated) = super::visible_suggestion_window(total, total - 1);
         assert!(truncated);
         assert_eq!(end, total);
-        assert!(end - start <= MAX_VISIBLE_SUGGESTIONS - 1);
+        assert!(end - start < MAX_VISIBLE_SUGGESTIONS);
     }
 
     #[test]
