@@ -281,6 +281,10 @@ impl McpRuntime {
                     tool_count: tools.map_or(0, Vec::len),
                     tool_names,
                     error: self.errors.get(&server.name).cloned(),
+                    needs_authorization: matches!(
+                        server.auth,
+                        gocode_core::McpAuthConfig::OAuth { .. }
+                    ),
                 }
             })
             .collect()
@@ -1085,6 +1089,97 @@ async fn run_application() -> Result<(), AppError> {
                             )))
                             .await;
                     }
+                    tool_registry = Arc::new(mcp_runtime.build_registry());
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::McpServersAvailable(
+                            mcp_runtime.statuses(),
+                        ))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not report MCP server status: {error}"
+                            ))
+                        })?;
+                }
+                AppCommand::McpAuthorize(name) => {
+                    let Some(server) = mcp_runtime
+                        .servers
+                        .iter()
+                        .find(|server| server.name == name)
+                        .cloned()
+                    else {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentWarning(format!(
+                                "no MCP server named '{name}' is configured"
+                            )))
+                            .await;
+                        continue;
+                    };
+
+                    match gocode_mcp::oauth::prepare_authorization(&server) {
+                        Ok(pending) => {
+                            let auth_url = pending.auth_url.clone();
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::McpAuthorizationUrlReady {
+                                    server: name.clone(),
+                                    url: auth_url.clone(),
+                                })
+                                .await;
+                            let _ = webbrowser::open(&auth_url);
+
+                            match gocode_mcp::oauth::complete_authorization(
+                                pending,
+                                std::time::Duration::from_secs(180),
+                            )
+                            .await
+                            {
+                                Ok(tokens) => {
+                                    let account = gocode_mcp::api_key_account(&name);
+                                    if let Ok(json) = serde_json::to_string(&tokens)
+                                        && let Err(error) = NativeCredentialStore::new()
+                                            .save_secret(&account, &SecretString::new(json))
+                                    {
+                                        let _ = driver
+                                            .event_tx
+                                            .send(gocode_core::AppEvent::AgentWarning(format!(
+                                                "could not store the OAuth token for '{name}': \
+                                                 {error:?}"
+                                            )))
+                                            .await;
+                                    }
+                                    if let Err(error) = mcp_runtime.connect(&name).await {
+                                        let _ = driver
+                                            .event_tx
+                                            .send(gocode_core::AppEvent::AgentWarning(format!(
+                                                "MCP server '{name}' failed to connect after \
+                                                 authorizing: {error}"
+                                            )))
+                                            .await;
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = driver
+                                        .event_tx
+                                        .send(gocode_core::AppEvent::AgentWarning(format!(
+                                            "authorization for '{name}' failed: {error}"
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::AgentWarning(format!(
+                                    "could not start authorization for '{name}': {error}"
+                                )))
+                                .await;
+                        }
+                    }
+
                     tool_registry = Arc::new(mcp_runtime.build_registry());
                     driver
                         .event_tx

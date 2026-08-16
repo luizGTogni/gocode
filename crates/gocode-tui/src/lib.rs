@@ -519,6 +519,12 @@ impl AppState {
             }
             AppEvent::SkillsAvailable(skills) => self.skills.clone_from(skills),
             AppEvent::McpServersAvailable(servers) => self.mcp_servers.clone_from(servers),
+            AppEvent::McpAuthorizationUrlReady { server, url } => {
+                self.entries.push(ChatEntry::Info(format!(
+                    "Opening your browser to authorize MCP server '{server}'. If it didn't \
+                     open, visit: {url}"
+                )));
+            }
             AppEvent::TerminalResized { .. } => {}
             AppEvent::CredentialRequired => self.screen = Screen::Onboarding,
             AppEvent::CredentialValidationStarted => {
@@ -1743,7 +1749,15 @@ fn mcp_server_row(server: &gocode_core::McpServerStatus, selected: bool) -> Stri
     } else {
         "Disconnected".into()
     };
-    format!("{cursor} {} ({}) — {status}", server.name, server.transport)
+    let auth_hint = if server.needs_authorization && !server.connected {
+        " [press o to authorize]"
+    } else {
+        ""
+    };
+    format!(
+        "{cursor} {} ({}) — {status}{auth_hint}",
+        server.name, server.transport
+    )
 }
 
 fn render_mcp_server_list(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -1793,8 +1807,10 @@ fn render_mcp_server_list(frame: &mut Frame, state: &AppState, area: Rect) {
     }
 
     frame.render_widget(
-        Paragraph::new("Enter to connect/disconnect · → to inspect tools · Esc to go back")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(
+            "Enter to connect/disconnect · o to authorize · → to inspect tools · Esc to go back",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
 }
@@ -2603,6 +2619,10 @@ fn run_terminal(
             }
             McpEventOutcome::AddServer { entry, api_key } => {
                 send_command(&command_tx, AppCommand::McpAddServer { entry, api_key })?;
+                continue;
+            }
+            McpEventOutcome::Authorize(name) => {
+                send_command(&command_tx, AppCommand::McpAuthorize(name))?;
                 continue;
             }
         }
@@ -3523,6 +3543,8 @@ pub enum McpEventOutcome {
         entry: gocode_core::McpServerEntry,
         api_key: Option<String>,
     },
+    /// Start the OAuth authorization flow for the named server.
+    Authorize(String),
 }
 
 /// Resets every `/mcp` "Add server" wizard draft field back to its default.
@@ -3641,6 +3663,16 @@ pub fn handle_mcp_event(state: &mut AppState, event: &Event) -> McpEventOutcome 
                     McpEventOutcome::Disconnect(server.name.clone())
                 } else {
                     McpEventOutcome::Connect(server.name.clone())
+                }
+            }
+            KeyCode::Char('o') => {
+                let Some(server) = state.mcp_servers.get(state.mcp_selected) else {
+                    return McpEventOutcome::Handled;
+                };
+                if server.needs_authorization {
+                    McpEventOutcome::Authorize(server.name.clone())
+                } else {
+                    McpEventOutcome::Handled
                 }
             }
             KeyCode::Esc => {
@@ -5623,6 +5655,7 @@ mod tests {
                     "mcp__filesystem__write".into(),
                 ],
                 error: None,
+                needs_authorization: false,
             },
             McpServerStatus {
                 name: "broken".into(),
@@ -5631,6 +5664,7 @@ mod tests {
                 tool_count: 0,
                 tool_names: Vec::new(),
                 error: Some("connection refused".into()),
+                needs_authorization: false,
             },
         ]
     }
@@ -5872,5 +5906,42 @@ mod tests {
             McpEventOutcome::Handled
         ));
         assert_eq!(state.mcp_view, McpView::Menu);
+    }
+
+    #[test]
+    fn pressing_o_authorizes_a_server_that_needs_it_and_is_a_no_op_otherwise() {
+        let mut servers = sample_mcp_servers();
+        servers[1].needs_authorization = true; // "broken", currently disconnected
+        let mut state = AppState {
+            mcp_visible: true,
+            mcp_view: McpView::ServerList,
+            mcp_servers: servers,
+            mcp_selected: 0,
+            ..AppState::default()
+        };
+
+        // "filesystem" (index 0) doesn't need authorization.
+        assert!(matches!(
+            handle_mcp_event(&mut state, &press(KeyCode::Char('o'))),
+            McpEventOutcome::Handled
+        ));
+
+        state.mcp_selected = 1;
+        match handle_mcp_event(&mut state, &press(KeyCode::Char('o'))) {
+            McpEventOutcome::Authorize(name) => assert_eq!(name, "broken"),
+            other => panic!("expected an authorize outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authorization_url_ready_event_shows_the_url_in_the_transcript() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::McpAuthorizationUrlReady {
+            server: "remote".into(),
+            url: "https://example.com/authorize?state=abc".into(),
+        });
+        assert!(
+            matches!(state.entries.last(), Some(ChatEntry::Info(text)) if text.contains("https://example.com/authorize"))
+        );
     }
 }

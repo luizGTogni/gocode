@@ -105,6 +105,9 @@ pub struct McpServerStatus {
     pub tool_names: Vec<String>,
     /// The most recent connection error, if any. Cleared on a successful connect.
     pub error: Option<String>,
+    /// Whether this server is configured for OAuth, so the `/mcp` server list can offer an
+    /// explicit "authorize" action for it.
+    pub needs_authorization: bool,
 }
 
 /// MCP server configuration for one precedence layer (global or project).

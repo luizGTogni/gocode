@@ -1,12 +1,14 @@
 //! MCP (Model Context Protocol) client support: JSON-RPC framing, transports (stdio and
 //! streamable HTTP), and the `initialize`/`tools/list`/`tools/call` client.
 
+pub mod auth;
 pub mod client;
 pub mod jsonrpc;
 pub mod manager;
 pub mod tool_bridge;
 pub mod transport;
 
+pub use auth::oauth::{self, OAuthTokenSet};
 pub use client::{McpClient, McpToolInfo, ToolCallOutcome};
 pub use manager::{
     McpConnectOutcome, McpServerConnection, api_key_account, connect_configured_servers,

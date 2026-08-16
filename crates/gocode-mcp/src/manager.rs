@@ -72,7 +72,7 @@ pub async fn connect_server(server: &McpServerEntry) -> Result<McpServerConnecti
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
-            if let Some(bearer) = resolve_bearer_token(server)? {
+            if let Some(bearer) = resolve_bearer_token(server).await? {
                 header_pairs.push(("Authorization".to_string(), format!("Bearer {bearer}")));
             }
             let transport = HttpTransport::new(url, &header_pairs)?;
@@ -82,30 +82,73 @@ pub async fn connect_server(server: &McpServerEntry) -> Result<McpServerConnecti
 }
 
 /// Resolves the `Authorization: Bearer` value for a server's configured auth, if any.
-fn resolve_bearer_token(server: &McpServerEntry) -> Result<Option<String>, McpError> {
+///
+/// For OAuth, an expired access token is refreshed (and the refreshed tokens re-persisted)
+/// automatically when a refresh token is available; otherwise the caller is told to
+/// re-authorize.
+async fn resolve_bearer_token(server: &McpServerEntry) -> Result<Option<String>, McpError> {
     match &server.auth {
         McpAuthConfig::None => Ok(None),
         McpAuthConfig::ApiKey => {
-            let account = api_key_account(&server.name);
-            let store = NativeCredentialStore::new();
-            let secret = store.get_secret(&account).map_err(|error| {
+            let secret = read_stored_secret(server)?.ok_or_else(|| {
                 McpError::Transport(format!(
-                    "could not read the stored API key for '{}': {error:?}",
+                    "no API key is stored for MCP server '{}' — add one via /mcp",
                     server.name
                 ))
             })?;
-            let Some(secret) = secret else {
-                return Err(McpError::Transport(format!(
-                    "no API key is stored for MCP server '{}' — add one via /mcp",
-                    server.name
-                )));
-            };
-            Ok(Some(secret.expose().to_string()))
+            Ok(Some(secret))
         }
-        McpAuthConfig::OAuth { .. } => Err(McpError::Transport(
-            "OAuth authentication for MCP servers is not implemented yet".into(),
-        )),
+        McpAuthConfig::OAuth {
+            token_url,
+            client_id,
+            ..
+        } => {
+            let account = api_key_account(&server.name);
+            let stored = read_stored_secret(server)?.ok_or_else(|| {
+                McpError::Transport(format!(
+                    "MCP server '{}' is not authorized yet — run /mcp authorize",
+                    server.name
+                ))
+            })?;
+            let mut tokens: crate::OAuthTokenSet =
+                serde_json::from_str(&stored).map_err(|error| {
+                    McpError::Protocol(format!(
+                        "stored OAuth tokens for '{}' are corrupt: {error}",
+                        server.name
+                    ))
+                })?;
+
+            if tokens.is_expired() {
+                let Some(refresh_token) = tokens.refresh_token.clone() else {
+                    return Err(McpError::Transport(format!(
+                        "MCP server '{}' authorization expired — run /mcp authorize again",
+                        server.name
+                    )));
+                };
+                tokens = crate::oauth::refresh_tokens(token_url, client_id, &refresh_token).await?;
+                if let Ok(json) = serde_json::to_string(&tokens) {
+                    let _ = NativeCredentialStore::new()
+                        .save_secret(&account, &gocode_credentials::SecretString::new(json));
+                }
+            }
+
+            Ok(Some(tokens.access_token))
+        }
     }
+}
+
+/// Reads the raw secret stored under a server's keyring account, if present.
+fn read_stored_secret(server: &McpServerEntry) -> Result<Option<String>, McpError> {
+    let account = api_key_account(&server.name);
+    NativeCredentialStore::new()
+        .get_secret(&account)
+        .map_err(|error| {
+            McpError::Transport(format!(
+                "could not read the stored credential for '{}': {error:?}",
+                server.name
+            ))
+        })
+        .map(|secret| secret.map(|secret| secret.expose().to_string()))
 }
 
 async fn connect_and_discover<T: crate::McpTransport + 'static>(
@@ -223,7 +266,7 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":
     }
 
     #[tokio::test]
-    async fn records_a_failure_for_an_oauth_server_since_oauth_is_not_implemented_yet() {
+    async fn records_a_failure_for_an_oauth_server_that_has_not_been_authorized_yet() {
         let mut server = fake_server_entry("remote", FAKE_SERVER);
         server.transport = McpTransportConfig::Http {
             url: "http://127.0.0.1:1/mcp".into(),
@@ -235,6 +278,7 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":
             client_id: "gocode".into(),
             scopes: vec![],
         };
+        server.name = format!("gocode-mcp-test-no-such-server-{}", uuid_like_suffix());
 
         let outcome = connect_configured_servers(&[server]).await;
         assert!(outcome.connections.is_empty());

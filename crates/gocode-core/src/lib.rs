@@ -71,6 +71,8 @@ pub enum AppCommand {
         entry: McpServerEntry,
         api_key: Option<String>,
     },
+    /// Start (or restart) the OAuth authorization flow for a configured server by name.
+    McpAuthorize(String),
 }
 
 /// How permissively an agent run is allowed to act without asking the user first.
@@ -251,6 +253,9 @@ pub enum AppEvent {
     /// Configured MCP servers and their live connection status; sent once after bootstrap and
     /// resent in full after every connect/disconnect.
     McpServersAvailable(Vec<McpServerStatus>),
+    /// An OAuth authorization URL was opened in the system browser; shown as a fallback in case
+    /// opening it failed. `McpServersAvailable` reflects the eventual outcome.
+    McpAuthorizationUrlReady { server: String, url: String },
 }
 
 /// Coarse lifecycle phase of an active agent run, for a concise status indicator.
