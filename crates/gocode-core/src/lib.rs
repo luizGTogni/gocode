@@ -90,6 +90,18 @@ pub enum AppCommand {
     /// Remove an existing worktree (already confirmed by the interface), resolved by name or
     /// path. Never removes the repository's main worktree.
     WorktreeRemove(String),
+    /// Undo the last `n` agent-edit transactions in the current worktree, stopping at the first
+    /// one whose files no longer match what the agent left them in.
+    Undo(usize),
+    /// Same as [`AppCommand::Undo`], but overwrites conflicting files anyway (already confirmed
+    /// by the interface).
+    UndoForce(usize),
+    /// Redo the last `n` undone transactions in the current worktree, stopping at the first one
+    /// whose files no longer match.
+    Redo(usize),
+    /// Same as [`AppCommand::Redo`], but overwrites conflicting files anyway (already confirmed
+    /// by the interface).
+    RedoForce(usize),
 }
 
 /// Where a new worktree's branch comes from, mirroring [`gocode_tools`]'s `BranchSource` at the
@@ -311,6 +323,51 @@ pub enum AppEvent {
     /// A worktree list/create/switch/remove operation failed with a safe, user-actionable
     /// message.
     WorktreeOperationFailed(String),
+    /// One or more undo transactions applied. `direction` is `"undo"` or `"redo"`.
+    UndoApplied {
+        direction: String,
+        transactions: Vec<UndoTransactionResult>,
+    },
+    /// An undo/redo request stopped because a transaction's files no longer match what the agent
+    /// left them in. `applied` lists any transactions that already succeeded before the
+    /// conflicting one was reached.
+    UndoConflict {
+        direction: String,
+        /// The transaction count originally requested, so a forced retry can resend it.
+        requested: usize,
+        applied: Vec<UndoTransactionResult>,
+        conflicting_files: Vec<UndoConflictFile>,
+    },
+    /// An undo/redo request had nothing to do.
+    UndoUnavailable { direction: String },
+    /// The undo/redo stack sizes for the current worktree changed.
+    UndoStackChanged {
+        undo_count: usize,
+        redo_count: usize,
+    },
+    /// An undo/redo request failed for a reason other than a stack being empty or a conflict
+    /// (e.g. a filesystem error while restoring an already-verified transaction).
+    UndoOperationFailed { direction: String, message: String },
+}
+
+/// One transaction's file outcomes, for `AppEvent::UndoApplied`/`UndoConflict`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoTransactionResult {
+    /// Short description of the transaction (its originating prompt).
+    pub description: String,
+    /// Files touched and the action taken on each: `"restored"`, `"removed"`, or `"recreated"`.
+    pub files: Vec<(String, String)>,
+}
+
+/// One file that blocked an undo/redo transaction, with enough content to render a diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoConflictFile {
+    /// Workspace-relative path.
+    pub path: String,
+    /// Content the transaction expected to find, `None` meaning it expected the file absent.
+    pub expected: Option<String>,
+    /// Content actually found on disk, `None` meaning the file is currently absent.
+    pub actual: Option<String>,
 }
 
 /// Coarse lifecycle phase of an active agent run, for a concise status indicator.

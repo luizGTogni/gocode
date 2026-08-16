@@ -728,6 +728,126 @@ async fn file_changes_from_a_successful_write_are_reported() {
 }
 
 #[tokio::test]
+async fn file_snapshots_capture_before_and_after_content_for_write_and_patch() {
+    let root = fixture("file-snapshots");
+    let provider = FakeProvider::script(vec![
+        tool_call_turn(
+            "call-1",
+            "write_file",
+            &serde_json::json!({"path": "a.rs", "content": "one\ntwo\n"}),
+        ),
+        tool_call_turn(
+            "call-2",
+            "apply_patch",
+            &serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: a.rs\n one\n-two\n+TWO\n*** End Patch"
+            }),
+        ),
+        text_turn("Created and then patched a.rs."),
+    ]);
+    let (tx, rx) = mpsc::channel(32);
+
+    agent(
+        provider,
+        gocode_tools::builtin_registry(),
+        editing_permissions(),
+    )
+    .run(
+        request(&root, "create and patch a.rs"),
+        tx,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("a write followed by a patch should complete the run");
+
+    let events = drain(rx).await;
+    let snapshots: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::FileSnapshot(snapshot) => Some(snapshot),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].path, Path::new("a.rs"));
+    assert_eq!(snapshots[0].before, None);
+    assert_eq!(snapshots[0].after.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(snapshots[1].path, Path::new("a.rs"));
+    assert_eq!(snapshots[1].before.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(snapshots[1].after.as_deref(), Some("one\nTWO\n"));
+
+    fs::remove_dir_all(root).ok();
+}
+
+/// A tool that cancels the run's token as a side effect of executing, used to deterministically
+/// interrupt a run between two tool calls in the same turn.
+struct CancelAfterRunning {
+    cancellation: CancellationToken,
+}
+
+impl Tool for CancelAfterRunning {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: ToolName::new("cancel_after_running"),
+            description: "Cancels the run's token, used only in Agent tests.".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn execute(&self, ctx: ToolContext, _input: serde_json::Value) -> ToolFuture<'_> {
+        self.cancellation.cancel();
+        Box::pin(async move { Ok(ToolResult::success(ctx.call_id, ToolOutput::new("ok"))) })
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_run_still_reports_snapshots_for_tools_that_already_completed() {
+    let root = fixture("cancel-preserves-snapshots");
+    let cancellation = CancellationToken::new();
+    let mut tools = gocode_tools::builtin_registry();
+    tools.register(Arc::new(CancelAfterRunning {
+        cancellation: cancellation.clone(),
+    }));
+
+    // Both calls are requested in the same model turn, so the agent's tool loop processes the
+    // successful write before its next cancellation check sees the token the second tool just
+    // cancelled.
+    let provider = FakeProvider::script(vec![vec![
+        Ok(ChatStreamEvent::ToolCallDelta(ToolCallDelta {
+            index: 0,
+            id: Some("call-1".into()),
+            name_delta: Some("write_file".into()),
+            arguments_delta: Some(
+                serde_json::json!({"path": "a.rs", "content": "hi\n"}).to_string(),
+            ),
+        })),
+        Ok(ChatStreamEvent::ToolCallDelta(ToolCallDelta {
+            index: 1,
+            id: Some("call-2".into()),
+            name_delta: Some("cancel_after_running".into()),
+            arguments_delta: Some("{}".into()),
+        })),
+        Ok(ChatStreamEvent::Finished(FinishReason::ToolCalls)),
+    ]]);
+    let (tx, rx) = mpsc::channel(32);
+
+    let outcome = agent(provider, tools, editing_permissions())
+        .run(request(&root, "write then cancel"), tx, cancellation)
+        .await;
+
+    assert!(matches!(outcome, Err(AgentError::Cancelled)));
+
+    let events = drain(rx).await;
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::FileSnapshot(snapshot) if snapshot.path == Path::new("a.rs"))
+    ));
+    assert!(matches!(events.last(), Some(AgentEvent::Cancelled)));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn reference_flow_completes_a_search_read_patch_and_command_task() {
     let root = fixture("reference-flow");
     fs::write(

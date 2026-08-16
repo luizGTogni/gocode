@@ -5,11 +5,12 @@
 //! [`permissions`] before it can touch the filesystem or spawn a process. See `docs/TOOLS.md`.
 
 pub mod contract;
-mod patch;
+pub mod patch;
 pub mod permissions;
 pub mod process;
 pub mod registry;
 pub mod tools;
+pub mod undo;
 pub mod workspace;
 pub mod worktree;
 
@@ -19,3 +20,7 @@ pub use contract::{
     ToolResult, ToolStatus,
 };
 pub use registry::{ToolRegistry, builtin_registry};
+pub use undo::{
+    AppliedFile, AppliedTransaction, FileAction, FileSnapshot, UndoConflict, UndoConflictFile,
+    UndoOutcome, UndoStore, UndoTransaction, load_undo_store, save_undo_store, undo_dir,
+};

@@ -58,16 +58,30 @@ impl PermissionResolver for TuiPermissionResolver {
 
 /// Forwards one agent run's events to the interface, translating them to the provider-neutral
 /// [`gocode_core::AppEvent`] contract.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat one-variant-per-line translation match is clearer here than splitting it"
+)]
 async fn bridge_agent_events(
     mut agent_events: mpsc::Receiver<AgentEvent>,
     event_tx: mpsc::Sender<gocode_core::AppEvent>,
+    project_root: PathBuf,
+    prompt: String,
+    undo: UndoRegistry,
+    undo_dir: PathBuf,
 ) {
     let mut streamed_any_text = false;
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut tools_with_output: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut file_snapshots: Vec<gocode_tools::FileSnapshot> = Vec::new();
 
     while let Some(event) = agent_events.recv().await {
+        let is_run_end = matches!(event, AgentEvent::Completed(_) | AgentEvent::Cancelled);
         let mapped = match event {
+            AgentEvent::FileSnapshot(snapshot) => {
+                file_snapshots.push(snapshot);
+                None
+            }
             AgentEvent::Started | AgentEvent::ToolStarted(_) => None,
             AgentEvent::StateChanged(state) => match state {
                 gocode_agent::AgentState::Inference => {
@@ -159,7 +173,185 @@ async fn bridge_agent_events(
         {
             return;
         }
+
+        if is_run_end && !file_snapshots.is_empty() {
+            commit_undo_transaction(
+                &event_tx,
+                &undo,
+                &undo_dir,
+                &project_root,
+                &prompt,
+                std::mem::take(&mut file_snapshots),
+            )
+            .await;
+        }
     }
+}
+
+/// Records one agent run's file edits as a single undo transaction and reports the new stack
+/// sizes, once the run has completed or been cancelled.
+async fn commit_undo_transaction(
+    event_tx: &mpsc::Sender<gocode_core::AppEvent>,
+    undo: &UndoRegistry,
+    undo_dir: &Path,
+    project_root: &Path,
+    prompt: &str,
+    files: Vec<gocode_tools::FileSnapshot>,
+) {
+    let transaction = gocode_tools::UndoTransaction {
+        id: uuid::Uuid::new_v4().to_string(),
+        created_at_unix: unix_now(),
+        description: first_line(prompt, 60),
+        files,
+    };
+    let counts = {
+        let mut store = undo.lock().await;
+        let entry = store.entry(project_root.to_path_buf()).or_insert_with(|| {
+            gocode_tools::load_undo_store(
+                undo_dir,
+                project_root,
+                gocode_tools::undo::DEFAULT_MAX_ENTRIES,
+            )
+        });
+        entry.commit(transaction);
+        let _ = gocode_tools::save_undo_store(undo_dir, project_root, entry);
+        (entry.undo_count(), entry.redo_count())
+    };
+    let _ = event_tx
+        .send(gocode_core::AppEvent::UndoStackChanged {
+            undo_count: counts.0,
+            redo_count: counts.1,
+        })
+        .await;
+}
+
+/// Shared undo/redo history, one [`gocode_tools::UndoStore`] per worktree (keyed by its
+/// `project_root`), mirrored to disk under `undo_dir` so it survives a restart.
+type UndoRegistry = Arc<Mutex<HashMap<PathBuf, gocode_tools::UndoStore>>>;
+
+/// Converts one applied transaction's file outcomes into the plain-string form
+/// [`gocode_core::AppEvent`] carries, so `gocode-core` need not depend on `gocode-tools`.
+fn describe_applied_transaction(
+    transaction: &gocode_tools::AppliedTransaction,
+) -> gocode_core::UndoTransactionResult {
+    gocode_core::UndoTransactionResult {
+        description: transaction.description.clone(),
+        files: transaction
+            .files
+            .iter()
+            .map(|file| {
+                let action = match file.action {
+                    gocode_tools::FileAction::Restored => "restored",
+                    gocode_tools::FileAction::Removed => "removed",
+                    gocode_tools::FileAction::Recreated => "recreated",
+                };
+                (file.path.display().to_string(), action.to_string())
+            })
+            .collect(),
+    }
+}
+
+/// Runs `/undo` or `/redo` against the current worktree's history and reports the outcome.
+async fn apply_undo_redo(
+    event_tx: &mpsc::Sender<gocode_core::AppEvent>,
+    undo: &UndoRegistry,
+    undo_dir: &Path,
+    project_root: &Path,
+    n: usize,
+    force: bool,
+    redo: bool,
+) {
+    let direction = if redo { "redo" } else { "undo" };
+    let (result, undo_count, redo_count) = {
+        let mut store = undo.lock().await;
+        let entry = store.entry(project_root.to_path_buf()).or_insert_with(|| {
+            gocode_tools::load_undo_store(
+                undo_dir,
+                project_root,
+                gocode_tools::undo::DEFAULT_MAX_ENTRIES,
+            )
+        });
+        let result = if redo {
+            entry.redo(n, project_root, force)
+        } else {
+            entry.undo(n, project_root, force)
+        };
+        if result
+            .as_ref()
+            .is_ok_and(|outcome| !outcome.applied.is_empty())
+        {
+            let _ = gocode_tools::save_undo_store(undo_dir, project_root, entry);
+        }
+        (result, entry.undo_count(), entry.redo_count())
+    };
+
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = event_tx
+                .send(gocode_core::AppEvent::UndoOperationFailed {
+                    direction: direction.to_string(),
+                    message: error.to_string(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    if let Some(conflict) = outcome.conflict {
+        let _ = event_tx
+            .send(gocode_core::AppEvent::UndoConflict {
+                direction: direction.to_string(),
+                requested: n,
+                applied: outcome
+                    .applied
+                    .iter()
+                    .map(describe_applied_transaction)
+                    .collect(),
+                conflicting_files: conflict
+                    .files
+                    .into_iter()
+                    .map(|file| gocode_core::UndoConflictFile {
+                        path: file.path.display().to_string(),
+                        expected: file.expected,
+                        actual: file.actual,
+                    })
+                    .collect(),
+            })
+            .await;
+    } else if outcome.applied.is_empty() {
+        let _ = event_tx
+            .send(gocode_core::AppEvent::UndoUnavailable {
+                direction: direction.to_string(),
+            })
+            .await;
+    } else {
+        let _ = event_tx
+            .send(gocode_core::AppEvent::UndoApplied {
+                direction: direction.to_string(),
+                transactions: outcome
+                    .applied
+                    .iter()
+                    .map(describe_applied_transaction)
+                    .collect(),
+            })
+            .await;
+    }
+
+    let _ = event_tx
+        .send(gocode_core::AppEvent::UndoStackChanged {
+            undo_count,
+            redo_count,
+        })
+        .await;
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 fn describe_warning(warning: &gocode_agent::AgentWarning) -> String {
@@ -470,6 +662,8 @@ async fn run_application() -> Result<(), AppError> {
         // to a Git worktree on `/worktree` create/switch, without ever touching the original
         // project root's files or checked-out branch.
         let mut project_root = bootstrap.project.root.clone();
+        let undo: UndoRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let undo_dir = gocode_tools::undo_dir(&paths.state_dir);
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
         let mut mcp_runtime = McpRuntime::bootstrap(&paths, &bootstrap.project).await;
@@ -780,7 +974,14 @@ async fn run_application() -> Result<(), AppError> {
                     };
                     let event_tx = driver.event_tx.clone();
                     let (agent_events_tx, agent_events_rx) = mpsc::channel(64);
-                    tokio::spawn(bridge_agent_events(agent_events_rx, event_tx.clone()));
+                    tokio::spawn(bridge_agent_events(
+                        agent_events_rx,
+                        event_tx.clone(),
+                        project_root.clone(),
+                        prompt.clone(),
+                        undo.clone(),
+                        undo_dir.clone(),
+                    ));
                     let session_for_run = current_session.clone();
                     let sessions_dir_for_run = sessions_dir.clone();
                     let provider_for_run = provider.clone();
@@ -1420,6 +1621,54 @@ async fn run_application() -> Result<(), AppError> {
                                 .await;
                         }
                     }
+                }
+                AppCommand::Undo(n) => {
+                    apply_undo_redo(
+                        &driver.event_tx,
+                        &undo,
+                        &undo_dir,
+                        &project_root,
+                        n,
+                        false,
+                        false,
+                    )
+                    .await;
+                }
+                AppCommand::UndoForce(n) => {
+                    apply_undo_redo(
+                        &driver.event_tx,
+                        &undo,
+                        &undo_dir,
+                        &project_root,
+                        n,
+                        true,
+                        false,
+                    )
+                    .await;
+                }
+                AppCommand::Redo(n) => {
+                    apply_undo_redo(
+                        &driver.event_tx,
+                        &undo,
+                        &undo_dir,
+                        &project_root,
+                        n,
+                        false,
+                        true,
+                    )
+                    .await;
+                }
+                AppCommand::RedoForce(n) => {
+                    apply_undo_redo(
+                        &driver.event_tx,
+                        &undo,
+                        &undo_dir,
+                        &project_root,
+                        n,
+                        true,
+                        true,
+                    )
+                    .await;
                 }
                 AppCommand::AcceptUpdate => {
                     match prepare_update(&paths.cache_dir, driver.event_tx.clone()).await {

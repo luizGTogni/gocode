@@ -120,6 +120,22 @@ pub struct PermissionPrompt {
     pub working_directory: String,
 }
 
+/// An `/undo` or `/redo` that stopped because a transaction's files no longer match, awaiting
+/// the user's choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUndoConflict {
+    /// `"undo"` or `"redo"`, echoed back on a forced retry.
+    direction: String,
+    /// The transaction count originally requested, echoed back on a forced retry.
+    count: usize,
+    /// Transactions that already applied before the conflicting one was reached.
+    applied: Vec<gocode_core::UndoTransactionResult>,
+    /// Every file that blocked the conflicting transaction.
+    conflicting_files: Vec<gocode_core::UndoConflictFile>,
+    /// Whether the diff for `conflicting_files` is currently expanded.
+    show_diff: bool,
+}
+
 /// Which screen the update popup is currently showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateStage {
@@ -186,6 +202,12 @@ pub enum SlashCommand {
     /// typed after `/worktree` (e.g. `list`, `switch my-task`, `remove my-task`, `my-task`, or
     /// `my-task existing-branch`); empty suggests a name for the user to edit and confirm.
     Worktree(String),
+    /// Undo the last `n` agent-edit transactions in the current worktree. The `String` is the
+    /// raw text typed after `/undo` (a positive integer, or empty for `1`).
+    Undo(String),
+    /// Redo the last `n` transactions undone with `/undo`. The `String` is the raw text typed
+    /// after `/redo` (a positive integer, or empty for `1`).
+    Redo(String),
     /// Exit Gocode.
     Exit,
 }
@@ -345,6 +367,16 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "Create, list, switch to, or remove an isolated Git worktree",
         SlashCommand::Worktree(String::new()),
     ),
+    (
+        "/undo",
+        "Undo the agent's last edit (or `/undo n` for the last n)",
+        SlashCommand::Undo(String::new()),
+    ),
+    (
+        "/redo",
+        "Redo the last undone edit (or `/redo n` for the last n)",
+        SlashCommand::Redo(String::new()),
+    ),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
     ("/quit", "Exit Gocode", SlashCommand::Exit),
 ];
@@ -438,6 +470,13 @@ pub struct AppState {
     pending_permission: Option<PermissionPrompt>,
     /// A `/worktree remove <target>` awaiting explicit Y/N confirmation before it is sent.
     pending_worktree_removal: Option<String>,
+    /// An `/undo` or `/redo` that stopped on a conflicting file, awaiting the user's choice to
+    /// cancel, view a diff, or force it through.
+    pending_undo_conflict: Option<PendingUndoConflict>,
+    /// Number of transactions currently available to `/undo`, shown by `/status`.
+    undo_count: usize,
+    /// Number of transactions currently available to `/redo`, shown by `/status`.
+    redo_count: usize,
     pending_update: Option<UpdatePrompt>,
     /// Which button is highlighted on the update popup's Yes/No prompt screen: `false` selects
     /// Yes (the default), `true` selects No.
@@ -589,6 +628,7 @@ impl AppState {
                     && self.activity.is_none()
                     && self.pending_permission.is_none()
                     && self.pending_worktree_removal.is_none()
+                    && self.pending_undo_conflict.is_none()
                 {
                     self.pending_update = Some(prompt);
                     self.update_selected_no = false;
@@ -771,6 +811,73 @@ impl AppState {
                 self.entries
                     .push(ChatEntry::Error(format!("Worktree: {message}")));
             }
+            AppEvent::UndoApplied {
+                direction,
+                transactions,
+            } => {
+                let verb = if direction == "redo" {
+                    "Redid"
+                } else {
+                    "Undid"
+                };
+                self.entries
+                    .push(ChatEntry::Info(format_undo_summary(verb, transactions)));
+            }
+            AppEvent::UndoConflict {
+                direction,
+                requested,
+                applied,
+                conflicting_files,
+            } => {
+                if !applied.is_empty() {
+                    let done_verb = if direction == "redo" {
+                        "Redid"
+                    } else {
+                        "Undid"
+                    };
+                    self.entries
+                        .push(ChatEntry::Info(format_undo_summary(done_verb, applied)));
+                }
+                let action = if direction == "redo" { "Redo" } else { "Undo" };
+                let files: Vec<String> = conflicting_files
+                    .iter()
+                    .map(|file| format!("`{}`", file.path))
+                    .collect();
+                self.entries.push(ChatEntry::Error(format!(
+                    "{action} stopped: {} changed since the agent's edit and would be \
+                     overwritten. Press F to force it anyway, D to view the diff, or C/Esc to \
+                     cancel.",
+                    files.join(", ")
+                )));
+                self.pending_undo_conflict = Some(PendingUndoConflict {
+                    direction: direction.clone(),
+                    count: *requested,
+                    applied: applied.clone(),
+                    conflicting_files: conflicting_files.clone(),
+                    show_diff: false,
+                });
+            }
+            AppEvent::UndoUnavailable { direction } => {
+                let message = if direction == "redo" {
+                    "Nothing to redo."
+                } else {
+                    "Nothing to undo."
+                };
+                self.entries.push(ChatEntry::Info(message.into()));
+            }
+            AppEvent::UndoStackChanged {
+                undo_count,
+                redo_count,
+            } => {
+                self.undo_count = *undo_count;
+                self.redo_count = *redo_count;
+            }
+            AppEvent::UndoOperationFailed { direction, message } => {
+                self.entries.push(ChatEntry::Error(format!(
+                    "{}: {message}",
+                    if direction == "redo" { "Redo" } else { "Undo" }
+                )));
+            }
         }
         None
     }
@@ -790,6 +897,7 @@ impl AppState {
         if self.screen == Screen::Chat
             && self.pending_permission.is_none()
             && self.pending_worktree_removal.is_none()
+            && self.pending_undo_conflict.is_none()
             && self.pending_update.is_none()
             && self.queued_update.is_some()
         {
@@ -1332,6 +1440,49 @@ fn format_worktree_list(worktrees: &[gocode_core::WorktreeSummary]) -> String {
     lines.join("\n")
 }
 
+/// Parses the raw text typed after `/undo` or `/redo`: empty means `1`; otherwise a positive
+/// integer.
+fn parse_undo_redo_count(raw: &str) -> Result<usize, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(1);
+    }
+    match trimmed.parse::<usize>() {
+        Ok(0) | Err(_) => Err(format!("Usage: /undo [n] or /redo [n] (got `{trimmed}`)")),
+        Ok(n) => Ok(n),
+    }
+}
+
+/// Renders one transaction's file outcomes as a comma-separated `action path` list.
+fn format_action_list(files: &[(String, String)]) -> String {
+    files
+        .iter()
+        .map(|(path, action)| format!("{action} `{path}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Renders one or more applied undo/redo transactions as a single chat entry.
+fn format_undo_summary(verb: &str, transactions: &[gocode_core::UndoTransactionResult]) -> String {
+    if let [transaction] = transactions {
+        format!(
+            "{verb} '{}' — {}.",
+            transaction.description,
+            format_action_list(&transaction.files)
+        )
+    } else {
+        let mut lines = vec![format!("{verb} {} transaction(s):", transactions.len())];
+        for transaction in transactions {
+            lines.push(format!(
+                "- '{}' — {}",
+                transaction.description,
+                format_action_list(&transaction.files)
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
 /// What a `/worktree` invocation, once parsed, should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorktreeInvocation {
@@ -1567,6 +1718,8 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
         render_permission_modal(frame, prompt, area);
     } else if let Some(target) = &state.pending_worktree_removal {
         render_worktree_removal_modal(frame, target, area);
+    } else if let Some(prompt) = &state.pending_undo_conflict {
+        render_undo_conflict_modal(frame, prompt, area);
     } else if let Some(prompt) = &state.pending_update {
         render_update_modal(frame, state, prompt, area);
     } else if let Some(message) = &state.blocking_error {
@@ -2492,6 +2645,7 @@ fn render_composer(
 
     let editing = state.pending_permission.is_none()
         && state.pending_worktree_removal.is_none()
+        && state.pending_undo_conflict.is_none()
         && state.pending_update.is_none()
         && state.blocking_error.is_none();
     if editing {
@@ -2550,6 +2704,47 @@ fn render_worktree_removal_modal(frame: &mut Frame, target: &str, area: Rect) {
         Paragraph::new(content)
             .wrap(Wrap { trim: false })
             .block(Block::default().title("Confirm").borders(Borders::ALL)),
+        modal,
+    );
+}
+
+fn render_undo_conflict_modal(frame: &mut Frame, prompt: &PendingUndoConflict, area: Rect) {
+    let verb = if prompt.direction == "redo" {
+        "Redo"
+    } else {
+        "Undo"
+    };
+    let files: Vec<String> = prompt
+        .conflicting_files
+        .iter()
+        .map(|file| format!("`{}`", file.path))
+        .collect();
+    let mut content = format!(
+        "{verb} stopped: the following file(s) changed since the agent's edit and would be \
+         overwritten:\n{}\n\n[f] Force anyway   [d] {} diff   [c] Cancel",
+        files.join(", "),
+        if prompt.show_diff { "Hide" } else { "View" }
+    );
+    if prompt.show_diff {
+        content.push_str("\n\n");
+        for file in &prompt.conflicting_files {
+            let _ = write!(
+                content,
+                "--- {} (expected)\n{}\n+++ {} (on disk)\n{}\n\n",
+                file.path,
+                file.expected.as_deref().unwrap_or("(absent)"),
+                file.path,
+                file.actual.as_deref().unwrap_or("(absent)"),
+            );
+        }
+    }
+    let height: u16 = 9 + if prompt.show_diff { 12 } else { 0 };
+    let modal = centered(area, 76, height);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title("Conflict").borders(Borders::ALL)),
         modal,
     );
 }
@@ -2725,6 +2920,23 @@ fn run_terminal(
                 )));
             }
             continue;
+        }
+
+        match handle_undo_conflict_event(&mut state, &terminal_event) {
+            Some(UndoConflictOutcome::Forced { direction, count }) => {
+                if direction == "redo" {
+                    send_command(&command_tx, AppCommand::RedoForce(count))?;
+                } else {
+                    send_command(&command_tx, AppCommand::UndoForce(count))?;
+                }
+                continue;
+            }
+            Some(UndoConflictOutcome::Cancelled) => {
+                state.entries.push(ChatEntry::Info("Cancelled.".into()));
+                continue;
+            }
+            Some(UndoConflictOutcome::DiffToggled) => continue,
+            None => {}
         }
 
         match handle_update_event(&mut state, &terminal_event) {
@@ -2916,7 +3128,9 @@ fn run_terminal(
                         "Provider: NVIDIA NIM · Model: {model} · Reasoning effort: {effort}\n\
                          Directory: {directory}\n\
                          Session: {session}\n\
-                         Context: {context}"
+                         Context: {context}\n\
+                         Undo: {} available · Redo: {} available",
+                        state.undo_count, state.redo_count
                     )));
                 }
                 ChatSubmission::Command(SlashCommand::Help) => {
@@ -2988,6 +3202,18 @@ fn run_terminal(
                         }
                     }
                 }
+                ChatSubmission::Command(SlashCommand::Undo(raw)) => {
+                    match parse_undo_redo_count(&raw) {
+                        Ok(n) => send_command(&command_tx, AppCommand::Undo(n))?,
+                        Err(message) => state.entries.push(ChatEntry::Error(message)),
+                    }
+                }
+                ChatSubmission::Command(SlashCommand::Redo(raw)) => {
+                    match parse_undo_redo_count(&raw) {
+                        Ok(n) => send_command(&command_tx, AppCommand::Redo(n))?,
+                        Err(message) => state.entries.push(ChatEntry::Error(message)),
+                    }
+                }
                 ChatSubmission::Command(SlashCommand::Init) => {
                     let prompt = "Explore this repository (its structure, languages, build \
                                    system, tests, and conventions) and write a complete \
@@ -3008,6 +3234,7 @@ fn run_terminal(
             && state.blocking_error.is_none()
             && state.pending_permission.is_none()
             && state.pending_worktree_removal.is_none()
+            && state.pending_undo_conflict.is_none()
             && matches!(
                 terminal_event,
                 Event::Key(KeyEvent {
@@ -3294,6 +3521,7 @@ pub fn handle_permission_mode_event(state: &mut AppState, event: &Event) -> Opti
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
         || state.pending_worktree_removal.is_some()
+        || state.pending_undo_conflict.is_some()
         || state.pending_update.is_some()
     {
         return None;
@@ -3551,6 +3779,59 @@ pub fn handle_worktree_removal_event(
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             state.pending_worktree_removal = None;
             Some((target, false))
+        }
+        _ => None,
+    }
+}
+
+/// Outcome of dispatching a terminal event to a pending `/undo`/`/redo` conflict prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoConflictOutcome {
+    /// The user cancelled; nothing further was applied.
+    Cancelled,
+    /// The user toggled the inline diff; the prompt stays open.
+    DiffToggled,
+    /// The user forced the transaction through despite the conflict.
+    Forced {
+        /// `"undo"` or `"redo"`.
+        direction: String,
+        /// The transaction count to resend, force flag on.
+        count: usize,
+    },
+}
+
+/// Applies force/diff/cancel keys to a pending `/undo`/`/redo` conflict prompt.
+#[must_use]
+pub fn handle_undo_conflict_event(
+    state: &mut AppState,
+    event: &Event,
+) -> Option<UndoConflictOutcome> {
+    state.pending_undo_conflict.as_ref()?;
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+
+    match code {
+        KeyCode::Char('f' | 'F') => {
+            let prompt = state.pending_undo_conflict.take()?;
+            Some(UndoConflictOutcome::Forced {
+                direction: prompt.direction,
+                count: prompt.count,
+            })
+        }
+        KeyCode::Char('d' | 'D') => {
+            let prompt = state.pending_undo_conflict.as_mut()?;
+            prompt.show_diff = !prompt.show_diff;
+            Some(UndoConflictOutcome::DiffToggled)
+        }
+        KeyCode::Char('c' | 'C') | KeyCode::Esc => {
+            state.pending_undo_conflict = None;
+            Some(UndoConflictOutcome::Cancelled)
         }
         _ => None,
     }
@@ -4098,6 +4379,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
         || state.pending_worktree_removal.is_some()
+        || state.pending_undo_conflict.is_some()
         || state.pending_update.is_some()
     {
         return None;
@@ -4199,6 +4481,16 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
                     let target = arguments.trim().to_string();
                     state.clear_chat_input();
                     return Some(ChatSubmission::Command(SlashCommand::Worktree(target)));
+                }
+                if name == "/undo" {
+                    let count = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Undo(count)));
+                }
+                if name == "/redo" {
+                    let count = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Redo(count)));
                 }
                 if let Some(command) = resolve_custom_command(&state.custom_commands, name) {
                     let body = expand_custom_command(&command.body, arguments.trim());

@@ -65,7 +65,7 @@ impl Tool for ApplyPatchTool {
                 call_id: ctx.call_id.clone(),
                 status: ToolStatus::Success,
                 metadata: ToolMetadata {
-                    affected_files: changes.iter().map(|change| change.path.clone()).collect(),
+                    affected_files: changes.clone(),
                     ..ToolMetadata::default()
                 },
                 output: ToolOutput::new(content),

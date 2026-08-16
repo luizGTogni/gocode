@@ -110,6 +110,25 @@ fn parse_patch(patch: &str) -> Result<Vec<FileOperation>, ToolError> {
     Ok(operations)
 }
 
+/// Scans a `*** Begin Patch` document for the workspace-relative paths its `Update File`, `Add
+/// File`, and `Delete File` sections name, without parsing or validating their hunk bodies.
+///
+/// Used to snapshot a file's pre-edit content before the patch is applied; returns an empty list
+/// for a patch that fails [`parse_patch`] later, since callers treat a missing snapshot as "no
+/// prior content to restore" rather than an error.
+#[must_use]
+pub fn touched_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix(UPDATE_PREFIX)
+                .or_else(|| line.strip_prefix(ADD_PREFIX))
+                .or_else(|| line.strip_prefix(DELETE_PREFIX))
+                .map(|path| path.trim().to_string())
+        })
+        .collect()
+}
+
 fn is_section_marker(line: &str) -> bool {
     line.starts_with(UPDATE_PREFIX)
         || line.starts_with(ADD_PREFIX)

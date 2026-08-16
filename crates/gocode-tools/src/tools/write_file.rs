@@ -2,8 +2,8 @@ use serde::Deserialize;
 
 use crate::{
     contract::{
-        Tool, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolMetadata, ToolName,
-        ToolOutput, ToolResult, ToolStatus,
+        ChangeKind, FileChange, Tool, ToolContext, ToolDefinition, ToolError, ToolFuture,
+        ToolMetadata, ToolName, ToolOutput, ToolResult, ToolStatus,
     },
     permissions::PermissionAction,
     tools::parse_args,
@@ -68,11 +68,19 @@ impl Tool for WriteFileTool {
                 format!("Created `{}` ({line_count} lines).", args.path)
             };
 
+            let kind = if existed {
+                ChangeKind::Modified
+            } else {
+                ChangeKind::Created
+            };
             Ok(ToolResult {
                 call_id: ctx.call_id.clone(),
                 status: ToolStatus::Success,
                 metadata: ToolMetadata {
-                    affected_files: vec![std::path::PathBuf::from(&args.path)],
+                    affected_files: vec![FileChange {
+                        path: std::path::PathBuf::from(&args.path),
+                        kind,
+                    }],
                     ..ToolMetadata::default()
                 },
                 output: ToolOutput::new(content),

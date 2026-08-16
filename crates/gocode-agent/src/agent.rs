@@ -1,14 +1,18 @@
 //! The Agent runtime: a cancellable, multi-turn inference-then-tool loop.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use gocode_core::{
     CancellationToken, ChatMessage, ChatStreamEvent, FinishReason, ModelId, Provider,
     ProviderToolCall,
 };
 use gocode_tools::{
-    ChangeKind, FileChange, ToolCall, ToolContext, ToolError, ToolEvent, ToolEventSink,
-    ToolRegistry, ToolResult, ToolStatus, permissions::PermissionContext,
+    FileSnapshot, ToolCall, ToolContext, ToolError, ToolEvent, ToolEventSink, ToolRegistry,
+    ToolResult, ToolStatus, permissions::PermissionContext,
 };
 use tokio::sync::mpsc;
 
@@ -184,6 +188,8 @@ impl Agent {
                 stats.tool_calls += 1;
                 let _ = events.send(AgentEvent::ToolRequested(call.clone())).await;
 
+                let before_snapshots = capture_before_snapshots(&request.project_root, &call);
+
                 let tool_result = self
                     .execute_tool(&request, &call, &tool_cancellation, events)
                     .await?;
@@ -204,11 +210,16 @@ impl Agent {
                     }
                 }
 
-                for path in &tool_result.metadata.affected_files {
+                for change in &tool_result.metadata.affected_files {
+                    let _ = events.send(AgentEvent::FileChanged(change.clone())).await;
+
+                    let after = read_workspace_file(&request.project_root, &change.path);
+                    let before = before_snapshots.get(&change.path).cloned().flatten();
                     let _ = events
-                        .send(AgentEvent::FileChanged(FileChange {
-                            path: path.clone(),
-                            kind: ChangeKind::Modified,
+                        .send(AgentEvent::FileSnapshot(FileSnapshot {
+                            path: change.path.clone(),
+                            before,
+                            after,
                         }))
                         .await;
                 }
@@ -383,6 +394,48 @@ impl ToolEventSink for AgentToolEventSink {
                 .try_send(AgentEvent::ToolOutputChunk { id, chunk });
         }
     }
+}
+
+/// For a `write_file` or `apply_patch` call, reads every file it is about to touch so the run
+/// can later report an undo snapshot; any other tool contributes nothing. Resolution or read
+/// failures are treated the same as "file does not exist yet" — the write tool will surface its
+/// own error if the path is genuinely invalid.
+fn capture_before_snapshots(
+    project_root: &Path,
+    call: &ToolCall,
+) -> HashMap<PathBuf, Option<String>> {
+    let candidate_paths: Vec<String> = match call.name.as_str() {
+        "write_file" => call
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default(),
+        "apply_patch" => call
+            .arguments
+            .get("patch")
+            .and_then(serde_json::Value::as_str)
+            .map(gocode_tools::patch::touched_paths)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    candidate_paths
+        .into_iter()
+        .map(|path| {
+            let before = read_workspace_file(project_root, Path::new(&path));
+            (PathBuf::from(path), before)
+        })
+        .collect()
+}
+
+/// Reads a workspace-relative path's current content, or `None` if it does not exist or is not
+/// readable as UTF-8 text.
+fn read_workspace_file(project_root: &Path, relative: &Path) -> Option<String> {
+    let resolved =
+        gocode_tools::workspace::resolve_workspace_path(project_root, &relative.to_string_lossy())
+            .ok()?;
+    std::fs::read_to_string(resolved).ok()
 }
 
 fn map_tool_definitions(tools: &ToolRegistry) -> Vec<gocode_core::ToolDefinition> {

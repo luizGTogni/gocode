@@ -1,7 +1,7 @@
 //! Events emitted by an [`crate::Agent`] while it drives a run.
 
 use gocode_core::ChatMessage;
-use gocode_tools::{FileChange, ToolCall, ToolCallId, ToolResult};
+use gocode_tools::{FileChange, FileSnapshot, ToolCall, ToolCallId, ToolResult};
 
 use crate::{ids::AgentRunId, state::AgentState};
 
@@ -33,11 +33,12 @@ pub enum AgentEvent {
     /// Execution finished for one tool call.
     ToolFinished(ToolResult),
     /// A tool call affected a workspace file.
-    ///
-    /// The current tool layer reports only which files were affected, not how, so every change
-    /// is currently reported as [`gocode_tools::ChangeKind::Modified`]; finer-grained kinds can
-    /// be added once tools report them.
     FileChanged(FileChange),
+    /// A `write_file` or `apply_patch` call's before/after content for one file, used to build
+    /// undo history. Emitted alongside [`AgentEvent::FileChanged`] for the same file, before any
+    /// subsequent tool call — including one that then fails or cancels the run — so undo history
+    /// is never lost to an early return.
+    FileSnapshot(FileSnapshot),
     /// A non-fatal condition worth surfacing to the user.
     Warning(AgentWarning),
     /// The run finished normally.

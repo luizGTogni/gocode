@@ -114,7 +114,7 @@ pub struct ToolMetadata {
     /// Wall-clock execution duration.
     pub duration_ms: Option<u64>,
     /// Files created, modified, or deleted by this call.
-    pub affected_files: Vec<PathBuf>,
+    pub affected_files: Vec<FileChange>,
     /// Process exit code, when the tool ran an external process.
     pub exit_code: Option<i32>,
     /// Whether the output was truncated (mirrors [`ToolOutput::truncated`] for convenience).
