@@ -179,6 +179,118 @@ fn first_line(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Conservative trigger for automatic compaction: the provider's reported input-token count for
+/// the run's last turn. NVIDIA NIM's model listing does not expose each model's real context
+/// window, so this errs toward compacting earlier rather than risking an oversized request
+/// against a smaller-context model.
+const AUTO_COMPACT_TOKEN_THRESHOLD: u64 = 24_000;
+
+/// Everything a compaction (automatic or `/compact`) needs to read and update the active session.
+struct CompactionContext<'a> {
+    provider: &'a NvidiaProvider,
+    model: &'a str,
+    session: &'a Arc<Mutex<gocode_core::SessionRecord>>,
+    sessions_dir: &'a Path,
+}
+
+/// Persists a completed run's history onto its session, then triggers automatic compaction when
+/// the reported input-token usage crosses [`AUTO_COMPACT_TOKEN_THRESHOLD`].
+async fn handle_completed_run(
+    ctx: &CompactionContext<'_>,
+    prompt: &str,
+    completion: gocode_agent::AgentCompletion,
+    auto_compact_enabled: bool,
+    event_tx: &mpsc::Sender<gocode_core::AppEvent>,
+) {
+    let last_input_tokens = completion.stats.last_input_tokens;
+    {
+        let mut session = ctx.session.lock().await;
+        session.history = completion.history;
+        session.record_turn(prompt, &completion.final_text);
+        let _ = gocode_core::save_session(ctx.sessions_dir, &session);
+    }
+
+    if auto_compact_enabled
+        && last_input_tokens.is_some_and(|tokens| tokens >= AUTO_COMPACT_TOKEN_THRESHOLD)
+    {
+        let history_snapshot = ctx.session.lock().await.history.clone();
+        compact_and_report(ctx, history_snapshot, true, event_tx).await;
+    }
+}
+
+/// Summarizes `history` down to one condensed message and stores it on the session, reporting
+/// the outcome either way.
+async fn compact_and_report(
+    ctx: &CompactionContext<'_>,
+    history: Vec<gocode_core::ChatMessage>,
+    automatic: bool,
+    event_tx: &mpsc::Sender<gocode_core::AppEvent>,
+) {
+    match compact_conversation(ctx.provider, ctx.model, history).await {
+        Ok(compacted) => {
+            {
+                let mut session = ctx.session.lock().await;
+                session.history = compacted;
+                let _ = gocode_core::save_session(ctx.sessions_dir, &session);
+            }
+            let _ = event_tx
+                .send(gocode_core::AppEvent::ContextCompacted { automatic })
+                .await;
+        }
+        Err(error) => {
+            let _ = event_tx
+                .send(gocode_core::AppEvent::ContextCompactionFailed(
+                    error.to_string(),
+                ))
+                .await;
+        }
+    }
+}
+
+/// Asks the model to summarize `history`, replacing it with a single condensed message.
+///
+/// # Errors
+///
+/// Returns the provider error when the summarization request fails.
+async fn compact_conversation(
+    provider: &NvidiaProvider,
+    model: &str,
+    history: Vec<gocode_core::ChatMessage>,
+) -> Result<Vec<gocode_core::ChatMessage>, gocode_core::ProviderError> {
+    let mut messages = history;
+    messages.push(gocode_core::ChatMessage::User(
+        "Summarize this conversation so far in a concise paragraph, preserving important facts, \
+         decisions, and any unfinished tasks. Respond with only the summary, no preamble."
+            .into(),
+    ));
+    let request = gocode_core::ChatRequest {
+        model: gocode_core::ModelId::new(model),
+        messages,
+        tools: Vec::new(),
+        reasoning_effort: None,
+    };
+    let cancellation = gocode_core::CancellationToken::new();
+    let mut stream = provider.stream_chat(request, cancellation).await?;
+
+    let mut summary = String::new();
+    while let Some(event) = stream.recv().await {
+        if let gocode_core::ChatStreamEvent::TextDelta(delta) = event? {
+            summary.push_str(&delta);
+        }
+    }
+    let summary = summary.trim();
+    let summary = if summary.is_empty() {
+        "(no summary was produced)"
+    } else {
+        summary
+    };
+
+    Ok(vec![gocode_core::ChatMessage::User(format!(
+        "(Earlier conversation was compacted to save context. Summary of what happened so far:)\n\
+         {summary}"
+    ))])
+}
+
 #[tokio::main]
 async fn main() {
     gocode_tui::install_panic_hook();
@@ -220,6 +332,10 @@ async fn run_application() -> Result<(), AppError> {
         let mut reasoning_effort: Option<String> =
             bootstrap.resolved_config.reasoning_effort.clone();
         let mut permission_mode = gocode_core::PermissionMode::default();
+        let mut auto_compact_enabled = true;
+        let sessions_dir = gocode_core::sessions_dir(&paths.state_dir);
+        let current_session: Arc<Mutex<gocode_core::SessionRecord>> =
+            Arc::new(Mutex::new(gocode_core::SessionRecord::new()));
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
         let tool_registry: Arc<ToolRegistry> = Arc::new(builtin_registry());
@@ -429,6 +545,8 @@ async fn run_application() -> Result<(), AppError> {
                         permissions,
                         gocode_agent::AgentLimits::default(),
                     );
+                    let history_snapshot = current_session.lock().await.history.clone();
+                    let prompt = message.clone();
                     let request = AgentRequest {
                         prompt: message,
                         model: gocode_core::ModelId::new(model.clone()),
@@ -436,14 +554,34 @@ async fn run_application() -> Result<(), AppError> {
                         instructions: instructions.clone(),
                         tools_enabled,
                         reasoning_effort: reasoning_effort.clone(),
+                        history: history_snapshot,
                     };
                     let event_tx = driver.event_tx.clone();
                     let (agent_events_tx, agent_events_rx) = mpsc::channel(64);
                     tokio::spawn(bridge_agent_events(agent_events_rx, event_tx.clone()));
+                    let session_for_run = current_session.clone();
+                    let sessions_dir_for_run = sessions_dir.clone();
+                    let provider_for_run = provider.clone();
+                    let model_for_run = model.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = agent.run(request, agent_events_tx, cancellation).await
-                        {
-                            match error {
+                        match agent.run(request, agent_events_tx, cancellation).await {
+                            Ok(completion) => {
+                                let ctx = CompactionContext {
+                                    provider: &provider_for_run,
+                                    model: &model_for_run,
+                                    session: &session_for_run,
+                                    sessions_dir: &sessions_dir_for_run,
+                                };
+                                handle_completed_run(
+                                    &ctx,
+                                    &prompt,
+                                    completion,
+                                    auto_compact_enabled,
+                                    &event_tx,
+                                )
+                                .await;
+                            }
+                            Err(error) => match error {
                                 gocode_agent::AgentError::Cancelled => {}
                                 gocode_agent::AgentError::Provider(provider_error) => {
                                     let event = match provider_error.severity() {
@@ -467,7 +605,7 @@ async fn run_application() -> Result<(), AppError> {
                                         ))
                                         .await;
                                 }
-                            }
+                            },
                         }
                     });
                 }
@@ -510,6 +648,134 @@ async fn run_application() -> Result<(), AppError> {
                 }
                 AppCommand::SetPermissionMode(mode) => {
                     permission_mode = mode;
+                }
+                AppCommand::SetAutoCompact(enabled) => {
+                    auto_compact_enabled = enabled;
+                }
+                AppCommand::CompactContext => {
+                    let history_snapshot = current_session.lock().await.history.clone();
+                    if history_snapshot.is_empty() {
+                        driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentWarning(
+                                "Nothing to compact yet.".into(),
+                            ))
+                            .await
+                            .map_err(|error| {
+                                AppError::Initialization(format!(
+                                    "could not report an empty compaction request: {error}"
+                                ))
+                            })?;
+                    } else if let (Some(provider), Some(model)) = (&provider, &selected_model) {
+                        let provider = provider.clone();
+                        let model = model.clone();
+                        let session_for_compact = current_session.clone();
+                        let sessions_dir_for_compact = sessions_dir.clone();
+                        let event_tx = driver.event_tx.clone();
+                        tokio::spawn(async move {
+                            let ctx = CompactionContext {
+                                provider: &provider,
+                                model: &model,
+                                session: &session_for_compact,
+                                sessions_dir: &sessions_dir_for_compact,
+                            };
+                            compact_and_report(&ctx, history_snapshot, false, &event_tx).await;
+                        });
+                    } else {
+                        driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::ContextCompactionFailed(
+                                "select a model before compacting".into(),
+                            ))
+                            .await
+                            .map_err(|error| {
+                                AppError::Initialization(format!(
+                                    "could not report a failed compaction: {error}"
+                                ))
+                            })?;
+                    }
+                }
+                AppCommand::ClearConversation => {
+                    let stale_id = {
+                        let mut session = current_session.lock().await;
+                        let stale_id = session.id.clone();
+                        *session = gocode_core::SessionRecord::new();
+                        stale_id
+                    };
+                    let _ = std::fs::remove_file(sessions_dir.join(format!("{stale_id}.json")));
+                }
+                AppCommand::NewSession => {
+                    *current_session.lock().await = gocode_core::SessionRecord::new();
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::SessionSwitched {
+                            name: "New session".into(),
+                            is_new: true,
+                            history: Vec::new(),
+                        })
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not confirm the new session: {error}"
+                            ))
+                        })?;
+                }
+                AppCommand::RequestSessionList => {
+                    let summaries = gocode_core::list_sessions(&sessions_dir)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(gocode_core::SessionSummary::from)
+                        .collect();
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::SessionListAvailable(summaries))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not send the session list: {error}"
+                            ))
+                        })?;
+                }
+                AppCommand::ResumeSession(id) => {
+                    match gocode_core::load_session(&sessions_dir, &id) {
+                        Ok(mut session) => {
+                            session.last_used_at_unix = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |duration| {
+                                    i64::try_from(duration.as_secs()).unwrap_or(0)
+                                });
+                            let _ = gocode_core::save_session(&sessions_dir, &session);
+                            let name = session.name.clone();
+                            let history = session.history.clone();
+                            *current_session.lock().await = session;
+                            driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::SessionSwitched {
+                                    name,
+                                    is_new: false,
+                                    history,
+                                })
+                                .await
+                                .map_err(|error| {
+                                    AppError::Initialization(format!(
+                                        "could not confirm the resumed session: {error}"
+                                    ))
+                                })?;
+                        }
+                        Err(error) => {
+                            driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::SessionResumeFailed(
+                                    error.to_string(),
+                                ))
+                                .await
+                                .map_err(|send_error| {
+                                    AppError::Initialization(format!(
+                                        "could not report a failed session resume: {send_error}"
+                                    ))
+                                })?;
+                        }
+                    }
                 }
                 AppCommand::AcceptUpdate => {
                     match prepare_windows_update(&paths.cache_dir, driver.event_tx.clone()).await {

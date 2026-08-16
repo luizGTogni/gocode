@@ -5,7 +5,10 @@ use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use gocode_core::{AgentActivityState, AppCommand, AppEvent, PermissionMode, ToolActivityStatus};
+use gocode_core::{
+    AgentActivityState, AppCommand, AppEvent, ChatMessage, PermissionMode, SessionSummary,
+    ToolActivityStatus,
+};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
@@ -38,6 +41,8 @@ pub enum Screen {
     Settings,
     /// Reasoning-effort level selection.
     EffortPicker,
+    /// Saved-session picker, opened by `/resume`.
+    SessionPicker,
     /// Main conversational interface.
     Chat,
 }
@@ -132,8 +137,16 @@ pub enum SlashCommand {
     Provider,
     /// Show the resolved model, provider, and reasoning effort.
     Status,
-    /// Clear the conversation view.
+    /// Clear the conversation view and forget the current session's history.
     Clear,
+    /// Summarize and shrink the remembered conversation history right now.
+    Compact,
+    /// Toggle automatic compaction when the conversation grows large (on by default).
+    AutoCompact,
+    /// Start a brand-new session without discarding the current one.
+    NewSession,
+    /// Open the saved-session picker.
+    ResumeSession,
     /// List available commands.
     Help,
     /// Exit Gocode.
@@ -158,7 +171,31 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "Show the resolved model, provider, and reasoning effort",
         SlashCommand::Status,
     ),
-    ("/clear", "Clear the conversation view", SlashCommand::Clear),
+    (
+        "/clear",
+        "Clear the conversation and forget this session's history",
+        SlashCommand::Clear,
+    ),
+    (
+        "/compact",
+        "Summarize and shrink the conversation history now",
+        SlashCommand::Compact,
+    ),
+    (
+        "/autocompact",
+        "Toggle automatic compaction when context gets large (on by default)",
+        SlashCommand::AutoCompact,
+    ),
+    (
+        "/new",
+        "Start a new session without discarding the current one",
+        SlashCommand::NewSession,
+    ),
+    (
+        "/resume",
+        "Pick a previous session to continue",
+        SlashCommand::ResumeSession,
+    ),
     ("/help", "List available commands", SlashCommand::Help),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
     ("/quit", "Exit Gocode", SlashCommand::Exit),
@@ -210,6 +247,11 @@ pub struct AppState {
     cursor: usize,
     suggestion_selected: usize,
     permission_mode: PermissionMode,
+    /// Inverted so the derived `Default` (false) means automatic compaction is on, matching the
+    /// documented default.
+    auto_compact_disabled: bool,
+    sessions: Vec<SessionSummary>,
+    selected_session: usize,
     selection: Option<Selection>,
     copy_notification: Option<String>,
     entries: Vec<ChatEntry>,
@@ -354,6 +396,58 @@ impl AppState {
                         .push(ChatEntry::Info(format!("Reasoning effort set to: {label}")));
                     self.status = Some(format!("Reasoning effort: {label}"));
                 }
+            }
+            AppEvent::ContextCompacted { automatic } => {
+                let message = if *automatic {
+                    "Context compacted automatically to stay within the model's context window."
+                } else {
+                    "Context compacted."
+                };
+                self.entries.push(ChatEntry::Info(message.into()));
+            }
+            AppEvent::ContextCompactionFailed(message) => {
+                self.entries.push(ChatEntry::Warning(format!(
+                    "Could not compact context: {message}"
+                )));
+            }
+            AppEvent::SessionSwitched {
+                name,
+                is_new,
+                history,
+            } => {
+                self.entries.clear();
+                self.scroll = 0;
+                self.streaming_assistant = false;
+                self.file_change_buffer.clear();
+                for message in history {
+                    match message {
+                        ChatMessage::User(text) => {
+                            self.entries.push(ChatEntry::User(text.clone()));
+                        }
+                        ChatMessage::Assistant {
+                            text: Some(text), ..
+                        } if !text.is_empty() => {
+                            self.entries.push(ChatEntry::Assistant(text.clone()));
+                        }
+                        ChatMessage::Assistant { .. }
+                        | ChatMessage::Tool { .. }
+                        | ChatMessage::System(_) => {}
+                    }
+                }
+                let verb = if *is_new { "Started" } else { "Resumed" };
+                self.entries
+                    .push(ChatEntry::Info(format!("{verb} session: {name}")));
+                self.screen = Screen::Chat;
+            }
+            AppEvent::SessionListAvailable(summaries) => {
+                self.sessions.clone_from(summaries);
+                self.selected_session = 0;
+            }
+            AppEvent::SessionResumeFailed(message) => {
+                self.entries.push(ChatEntry::Error(format!(
+                    "Could not resume session: {message}"
+                )));
+                self.screen = Screen::Chat;
             }
         }
         None
@@ -799,6 +893,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         Screen::ModelPicker => render_model_picker(frame, state, area),
         Screen::Settings => render_settings(frame, state, area),
         Screen::EffortPicker => render_effort_picker(frame, state, area),
+        Screen::SessionPicker => render_session_picker(frame, state, area),
         Screen::Chat => render_chat(frame, state, area),
     }
 }
@@ -914,6 +1009,84 @@ fn render_effort_picker(frame: &mut Frame, state: &AppState, area: Rect) {
         ),
         area,
     );
+}
+
+fn render_session_picker(frame: &mut Frame, state: &AppState, area: Rect) {
+    if state.sessions.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No saved sessions yet. Send a message, then /new starts another.")
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title("Gocode · Resume a session")
+                        .borders(Borders::ALL),
+                ),
+            area,
+        );
+        return;
+    }
+
+    let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
+    let first_visible = state
+        .selected_session
+        .saturating_sub(visible_rows.saturating_sub(1));
+    let content = state.sessions[first_visible..]
+        .iter()
+        .enumerate()
+        .take(visible_rows)
+        .map(|(offset, session)| {
+            let index = first_visible + offset;
+            let cursor = if index == state.selected_session {
+                ">"
+            } else {
+                " "
+            };
+            let when = format_relative_time(session.last_used_at_unix);
+            format!(
+                "{cursor} {} — {when}\n    {}",
+                session.name, session.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.render_widget(
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Gocode · Resume a session")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+/// Formats a Unix timestamp as "N minute(s)/hour(s) ago" within a day, or an American-format
+/// date and time (`MM/DD/YYYY, h:mm AM/PM`) beyond that.
+fn format_relative_time(unix_seconds: i64) -> String {
+    let then = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(unix_seconds.max(0)).unwrap_or(0));
+    let now = std::time::SystemTime::now();
+    let elapsed = now.duration_since(then).unwrap_or_default();
+    let minutes = elapsed.as_secs() / 60;
+
+    if minutes < 1 {
+        "just now".to_string()
+    } else if minutes < 60 {
+        if minutes == 1 {
+            "1 minute ago".into()
+        } else {
+            format!("{minutes} minutes ago")
+        }
+    } else if minutes < 24 * 60 {
+        let hours = minutes / 60;
+        if hours == 1 {
+            "1 hour ago".into()
+        } else {
+            format!("{hours} hours ago")
+        }
+    } else {
+        let local: chrono::DateTime<chrono::Local> = then.into();
+        local.format("%m/%d/%Y, %-I:%M %p").to_string()
+    }
 }
 
 /// Splits the chat screen into its history and composer areas. Shared by rendering and mouse
@@ -1476,6 +1649,11 @@ fn run_terminal(
             continue;
         }
 
+        if let Some(session_id) = handle_session_picker_event(&mut state, &terminal_event) {
+            send_command(&command_tx, AppCommand::ResumeSession(session_id))?;
+            continue;
+        }
+
         if let Some(mode) = handle_permission_mode_event(&mut state, &terminal_event) {
             send_command(&command_tx, AppCommand::SetPermissionMode(mode))?;
             continue;
@@ -1494,6 +1672,39 @@ fn run_terminal(
                 ChatSubmission::Command(SlashCommand::Clear) => {
                     state.entries.clear();
                     state.scroll = 0;
+                    send_command(&command_tx, AppCommand::ClearConversation)?;
+                }
+                ChatSubmission::Command(SlashCommand::Compact) => {
+                    if state.activity.is_some() {
+                        state.entries.push(ChatEntry::Warning(
+                            "Wait for the current run to finish before compacting.".into(),
+                        ));
+                    } else {
+                        send_command(&command_tx, AppCommand::CompactContext)?;
+                    }
+                }
+                ChatSubmission::Command(SlashCommand::AutoCompact) => {
+                    state.auto_compact_disabled = !state.auto_compact_disabled;
+                    let status = if state.auto_compact_disabled {
+                        "off"
+                    } else {
+                        "on"
+                    };
+                    state
+                        .entries
+                        .push(ChatEntry::Info(format!("Autocompact is now {status}.")));
+                    send_command(
+                        &command_tx,
+                        AppCommand::SetAutoCompact(!state.auto_compact_disabled),
+                    )?;
+                }
+                ChatSubmission::Command(SlashCommand::NewSession) => {
+                    send_command(&command_tx, AppCommand::NewSession)?;
+                }
+                ChatSubmission::Command(SlashCommand::ResumeSession) => {
+                    state.screen = Screen::SessionPicker;
+                    state.selected_session = 0;
+                    send_command(&command_tx, AppCommand::RequestSessionList)?;
                 }
                 ChatSubmission::Command(SlashCommand::Model) => {
                     state.screen = Screen::ModelPicker;
@@ -1520,7 +1731,8 @@ fn run_terminal(
                 }
                 ChatSubmission::Command(SlashCommand::Help) => {
                     state.entries.push(ChatEntry::Info(
-                        "Commands: /model /settings /provider /status /clear /help /exit /quit"
+                        "Commands: /model /settings /provider /status /clear /compact \
+                         /autocompact /new /resume /help /exit /quit"
                             .into(),
                     ));
                 }
@@ -1751,6 +1963,40 @@ pub fn handle_effort_picker_event(state: &mut AppState, event: &Event) -> Option
             return Some(value.map(str::to_string));
         }
         KeyCode::Esc => state.screen = Screen::Chat,
+        _ => {}
+    }
+    None
+}
+
+/// Applies navigation and confirmation keys to the saved-session picker.
+///
+/// Returns the chosen session's id on confirmation.
+#[must_use]
+pub fn handle_session_picker_event(state: &mut AppState, event: &Event) -> Option<String> {
+    if state.screen != Screen::SessionPicker {
+        return None;
+    }
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+
+    match code {
+        KeyCode::Up => state.selected_session = state.selected_session.saturating_sub(1),
+        KeyCode::Down if !state.sessions.is_empty() => {
+            state.selected_session = (state.selected_session + 1).min(state.sessions.len() - 1);
+        }
+        KeyCode::Enter => {
+            return state
+                .sessions
+                .get(state.selected_session)
+                .map(|session| session.id.clone());
+        }
+        KeyCode::Esc if state.current_model.is_some() => state.screen = Screen::Chat,
         _ => {}
     }
     None
@@ -2136,14 +2382,17 @@ mod tests {
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
-    use gocode_core::{AgentActivityState, AppEvent, ErrorSeverity, ToolActivityStatus};
+    use gocode_core::{
+        AgentActivityState, AppEvent, ChatMessage, ErrorSeverity, SessionSummary,
+        ToolActivityStatus,
+    };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
         AppState, ChatEntry, ChatSubmission, InputAction, MAX_VISIBLE_SUGGESTIONS, Screen,
         SlashCommand, classify_event, handle_chat_event, handle_onboarding_event,
-        handle_permission_event, handle_update_event, render, run_with_event_source,
-        slash_suggestions,
+        handle_permission_event, handle_session_picker_event, handle_update_event, render,
+        run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -2677,6 +2926,143 @@ mod tests {
             Some(ChatSubmission::Command(SlashCommand::Clear))
         );
         assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn resuming_a_session_replays_its_history_and_starting_new_clears_the_transcript() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("leftover prompt".into());
+
+        state.apply(&AppEvent::SessionSwitched {
+            name: "fix the login bug".into(),
+            is_new: false,
+            history: vec![
+                ChatMessage::User("what broke login?".into()),
+                ChatMessage::assistant_text("A race condition in the token refresh."),
+            ],
+        });
+
+        assert_eq!(state.screen, Screen::Chat);
+        assert_eq!(state.entries.len(), 3);
+        assert_eq!(
+            state.entries[0],
+            ChatEntry::User("what broke login?".into())
+        );
+        assert_eq!(
+            state.entries[1],
+            ChatEntry::Assistant("A race condition in the token refresh.".into())
+        );
+
+        state.apply(&AppEvent::SessionSwitched {
+            name: "New session".into(),
+            is_new: true,
+            history: Vec::new(),
+        });
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(
+            state.entries[0],
+            ChatEntry::Info("Started session: New session".into())
+        );
+    }
+
+    #[test]
+    fn the_session_list_populates_the_picker_and_enter_returns_the_selected_id() {
+        let mut state = AppState {
+            screen: Screen::SessionPicker,
+            current_model: Some("nvidia/model".into()),
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::SessionListAvailable(vec![
+            SessionSummary {
+                id: "one".into(),
+                name: "first".into(),
+                summary: "did stuff".into(),
+                last_used_at_unix: 100,
+            },
+            SessionSummary {
+                id: "two".into(),
+                name: "second".into(),
+                summary: "did other stuff".into(),
+                last_used_at_unix: 200,
+            },
+        ]));
+        assert_eq!(state.sessions.len(), 2);
+
+        let _ = handle_session_picker_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(
+            handle_session_picker_event(&mut state, &press(KeyCode::Enter)),
+            Some("two".into())
+        );
+
+        assert_eq!(
+            handle_session_picker_event(&mut state, &press(KeyCode::Esc)),
+            None
+        );
+        assert_eq!(state.screen, Screen::Chat);
+    }
+
+    #[test]
+    fn autocompact_toggles_and_reports_the_command_it_sent() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/autocompact".into(),
+            ..AppState::default()
+        };
+        assert!(!state.auto_compact_disabled);
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::AutoCompact))
+        );
+    }
+
+    #[test]
+    fn compact_is_blocked_while_the_agent_is_busy_but_allowed_when_idle() {
+        let mut idle = AppState {
+            screen: Screen::Chat,
+            chat_input: "/compact".into(),
+            ..AppState::default()
+        };
+        assert_eq!(
+            handle_chat_event(&mut idle, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Compact))
+        );
+    }
+
+    #[test]
+    fn context_compacted_and_failed_events_surface_as_transcript_entries() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::ContextCompacted { automatic: true });
+        assert!(matches!(state.entries.last(), Some(ChatEntry::Info(_))));
+
+        state.apply(&AppEvent::ContextCompactionFailed("network error".into()));
+        assert!(matches!(state.entries.last(), Some(ChatEntry::Warning(_))));
+    }
+
+    #[test]
+    fn relative_time_reports_minutes_and_hours_within_a_day() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_secs();
+
+        assert_eq!(
+            super::format_relative_time(i64::try_from(now).unwrap() - 60),
+            "1 minute ago"
+        );
+        assert_eq!(
+            super::format_relative_time(i64::try_from(now).unwrap() - 2 * 3600),
+            "2 hours ago"
+        );
+        // Beyond 24h it falls back to an absolute date, not a relative phrase.
+        let over_a_day_ago = i64::try_from(now).unwrap() - 25 * 3600;
+        assert!(!super::format_relative_time(over_a_day_ago).contains("ago"));
     }
 
     #[test]

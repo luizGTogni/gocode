@@ -10,8 +10,8 @@ use std::{
 };
 
 use gocode_core::{
-    CancellationToken, ChatStreamEvent, FinishReason, ModelId, ProviderError, ToolCallDelta,
-    testing::FakeProvider,
+    CancellationToken, ChatMessage, ChatStreamEvent, FinishReason, ModelId, ProviderError,
+    ToolCallDelta, Usage, testing::FakeProvider,
 };
 use gocode_tools::{
     Tool, ToolCallId, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolName, ToolOutput,
@@ -71,6 +71,7 @@ fn request(project_root: &Path, prompt: &str) -> AgentRequest {
         instructions: None,
         tools_enabled: true,
         reasoning_effort: None,
+        history: Vec::new(),
     }
 }
 
@@ -135,6 +136,44 @@ async fn completes_without_any_tool_call() {
     let events = drain(rx).await;
     assert!(matches!(events.first(), Some(AgentEvent::Started)));
     assert!(matches!(events.last(), Some(AgentEvent::Completed(_))));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn seeded_history_is_preserved_and_extended_with_this_run_and_reported_usage() {
+    let root = fixture("seeded-history");
+    let mut script = text_turn("Sure, continuing from before.");
+    script.push(Ok(ChatStreamEvent::Usage(Usage {
+        input_tokens: Some(4_200),
+        output_tokens: Some(10),
+        reasoning_tokens: None,
+    })));
+    let provider = FakeProvider::script(vec![script]);
+    let (tx, _rx) = mpsc::channel(32);
+
+    let mut request = request(&root, "and then?");
+    request.history = vec![
+        ChatMessage::User("earlier question".into()),
+        ChatMessage::assistant_text("earlier answer"),
+    ];
+
+    let outcome = agent(
+        provider,
+        ToolRegistry::new(),
+        PermissionContext::read_only_default(),
+    )
+    .run(request, tx, CancellationToken::new())
+    .await
+    .expect("a text-only turn should complete the run");
+
+    assert_eq!(outcome.history.len(), 4);
+    assert_eq!(
+        outcome.history[0],
+        ChatMessage::User("earlier question".into())
+    );
+    assert_eq!(outcome.history[2], ChatMessage::User("and then?".into()));
+    assert_eq!(outcome.stats.last_input_tokens, Some(4_200));
 
     fs::remove_dir_all(root).ok();
 }

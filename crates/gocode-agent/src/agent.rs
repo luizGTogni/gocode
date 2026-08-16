@@ -39,6 +39,9 @@ pub struct AgentRequest {
     pub tools_enabled: bool,
     /// User-selected reasoning-effort level, forwarded to the provider request as-is.
     pub reasoning_effort: Option<String>,
+    /// Prior conversation turns to seed this run's history with, oldest first. Empty for a fresh
+    /// conversation.
+    pub history: Vec<ChatMessage>,
 }
 
 /// Long-lived collaborators an [`Agent`] uses to drive every run.
@@ -102,6 +105,10 @@ impl Agent {
         outcome
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the inference-then-tool driving loop is intentionally kept in one place"
+    )]
     async fn drive(
         &self,
         run_id: AgentRunId,
@@ -113,7 +120,8 @@ impl Agent {
         let _bridge_guard = bridge_cancellation(cancellation.clone(), tool_cancellation.clone());
 
         let mut stats = AgentRunStats::default();
-        let mut history = vec![ChatMessage::User(request.prompt.clone())];
+        let mut history = request.history.clone();
+        history.push(ChatMessage::User(request.prompt.clone()));
         let tool_defs = if request.tools_enabled {
             map_tool_definitions(&self.tools)
         } else {
@@ -136,9 +144,12 @@ impl Agent {
                 .send(AgentEvent::StateChanged(AgentState::Inference))
                 .await;
 
-            let (text, tool_calls) = self
+            let (text, tool_calls, input_tokens) = self
                 .run_turn(&request, &history, &tool_defs, events, &cancellation)
                 .await?;
+            if input_tokens.is_some() {
+                stats.last_input_tokens = input_tokens;
+            }
 
             history.push(ChatMessage::Assistant {
                 text: text.clone(),
@@ -217,6 +228,7 @@ impl Agent {
             run_id,
             final_text,
             stats,
+            history,
         })
     }
 
@@ -227,7 +239,7 @@ impl Agent {
         tool_defs: &[gocode_core::ToolDefinition],
         events: &mpsc::Sender<AgentEvent>,
         cancellation: &CancellationToken,
-    ) -> Result<(Option<String>, Vec<ToolCall>), AgentError> {
+    ) -> Result<(Option<String>, Vec<ToolCall>, Option<u64>), AgentError> {
         let chat_request = build_request(
             request.model.clone(),
             request.instructions.as_deref(),
@@ -244,6 +256,7 @@ impl Agent {
 
         let mut text = String::new();
         let mut assembler = ToolCallAssembler::default();
+        let mut input_tokens = None;
 
         loop {
             tokio::select! {
@@ -266,10 +279,12 @@ impl Agent {
                     Some(Ok(ChatStreamEvent::Finished(FinishReason::Cancelled))) => {
                         return Err(AgentError::Cancelled);
                     }
+                    Some(Ok(ChatStreamEvent::Usage(usage))) => {
+                        input_tokens = usage.input_tokens;
+                    }
                     Some(Ok(
                         ChatStreamEvent::Finished(_)
-                        | ChatStreamEvent::RequestId(_)
-                        | ChatStreamEvent::Usage(_),
+                        | ChatStreamEvent::RequestId(_),
                     )) => {}
                     Some(Err(error)) => return Err(AgentError::Provider(error)),
                     None => break,
@@ -278,7 +293,7 @@ impl Agent {
         }
 
         let text = (!text.is_empty()).then_some(text);
-        Ok((text, assembler.finish()))
+        Ok((text, assembler.finish(), input_tokens))
     }
 
     async fn execute_tool(

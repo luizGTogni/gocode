@@ -1,3 +1,8 @@
+mod session;
+pub use session::{
+    SessionRecord, SessionSummary, list_sessions, load_session, save_session, sessions_dir,
+};
+
 /// Intent emitted by an interface and handled by the application runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
@@ -23,6 +28,18 @@ pub enum AppCommand {
     SetReasoningEffort(Option<String>),
     /// Set the permission mode applied to future agent runs.
     SetPermissionMode(PermissionMode),
+    /// Summarize and replace the remembered conversation history right now.
+    CompactContext,
+    /// Enable or disable automatic compaction when the conversation grows large.
+    SetAutoCompact(bool),
+    /// Forget the current session's remembered conversation history and start it over.
+    ClearConversation,
+    /// Start a brand-new, empty session without discarding the current one.
+    NewSession,
+    /// Read the list of previously saved sessions from disk.
+    RequestSessionList,
+    /// Switch to a previously saved session, replacing the current one.
+    ResumeSession(String),
 }
 
 /// How permissively an agent run is allowed to act without asking the user first.
@@ -61,7 +78,7 @@ impl PermissionMode {
 }
 
 /// Fact emitted by the application runtime and rendered by an interface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
     /// Application bootstrap has begun.
     BootStarted,
@@ -150,6 +167,27 @@ pub enum AppEvent {
         /// performed at startup from a previously saved value.
         announce: bool,
     },
+    /// The remembered conversation history was summarized and replaced.
+    ContextCompacted {
+        /// Whether this happened automatically (context grew large) or via `/compact`.
+        automatic: bool,
+    },
+    /// Compaction could not be completed; the previous history is unchanged.
+    ContextCompactionFailed(String),
+    /// The active session changed: a fresh one was started, or a saved one was resumed.
+    SessionSwitched {
+        /// The new current session's display name.
+        name: String,
+        /// `true` for a brand-new empty session, `false` when resuming a saved one.
+        is_new: bool,
+        /// The resumed session's messages, empty for a new session. The interface replays these
+        /// into the transcript so a resumed conversation looks the way you left it.
+        history: Vec<ChatMessage>,
+    },
+    /// The saved-session list finished loading, newest-used first.
+    SessionListAvailable(Vec<SessionSummary>),
+    /// A session could not be resumed; the current session is unchanged.
+    SessionResumeFailed(String),
 }
 
 /// Coarse lifecycle phase of an active agent run, for a concise status indicator.
@@ -244,7 +282,7 @@ impl RuntimeChannels {
 }
 
 /// Dependencies prepared during application bootstrap.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BootstrapResult {
     /// First lifecycle event for the interface.
     pub event: AppEvent,
@@ -855,7 +893,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Operating systems with distinct Gocode directory conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1478,7 +1516,7 @@ pub struct Model {
 /// `Assistant` and `Tool` carry the fields needed to keep a multi-turn tool-calling
 /// conversation coherent: an assistant turn may request tool calls alongside (or instead of)
 /// visible text, and a tool turn must be correlated back to the call it answers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChatMessage {
     /// A system instruction.
     System(String),
@@ -1512,7 +1550,7 @@ impl ChatMessage {
 }
 
 /// A normalized tool call requested by the model during a chat turn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderToolCall {
     /// Correlation identifier assigned by the provider.
     pub id: String,

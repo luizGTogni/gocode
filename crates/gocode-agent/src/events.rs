@@ -1,5 +1,6 @@
 //! Events emitted by an [`crate::Agent`] while it drives a run.
 
+use gocode_core::ChatMessage;
 use gocode_tools::{FileChange, ToolCall, ToolCallId, ToolResult};
 
 use crate::{ids::AgentRunId, state::AgentState};
@@ -63,10 +64,13 @@ pub struct AgentRunStats {
     pub tool_calls: usize,
     /// Number of tool calls that did not succeed.
     pub failed_tool_calls: usize,
+    /// Input tokens reported for the run's last turn, when the provider reports them. Used as an
+    /// approximate signal for automatic context compaction.
+    pub last_input_tokens: Option<u64>,
 }
 
 /// The successful outcome of one agent run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentCompletion {
     /// Identifier of the run that completed.
     pub run_id: AgentRunId,
@@ -74,4 +78,6 @@ pub struct AgentCompletion {
     pub final_text: String,
     /// Counters for the completed run.
     pub stats: AgentRunStats,
+    /// The full conversation transcript after this run, ready to seed the next turn's request.
+    pub history: Vec<ChatMessage>,
 }
