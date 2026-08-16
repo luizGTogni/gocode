@@ -199,6 +199,8 @@ pub struct AppState {
     selected_effort: usize,
     current_effort: Option<String>,
     chat_input: String,
+    /// Char index (not byte index) of the composer's insertion point.
+    cursor: usize,
     suggestion_selected: usize,
     permission_mode: PermissionMode,
     selection: Option<Selection>,
@@ -471,8 +473,64 @@ impl AppState {
             return;
         }
         let index = self.suggestion_selected.min(suggestions.len() - 1);
-        self.chat_input = suggestions[index].0.to_string();
+        self.set_chat_input(suggestions[index].0.to_string());
+    }
+
+    /// Replaces the composer's text wholesale, moving the cursor to its end.
+    fn set_chat_input(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.chat_input = text;
         self.suggestion_selected = 0;
+    }
+
+    /// Empties the composer and resets the cursor to the start.
+    fn clear_chat_input(&mut self) {
+        self.chat_input.clear();
+        self.cursor = 0;
+        self.suggestion_selected = 0;
+    }
+
+    /// Inserts `text` at the cursor and advances the cursor past it.
+    fn insert_at_cursor(&mut self, text: &str) {
+        let byte_index = char_to_byte_index(&self.chat_input, self.cursor);
+        self.chat_input.insert_str(byte_index, text);
+        self.cursor += text.chars().count();
+        self.suggestion_selected = 0;
+    }
+
+    /// Removes the character immediately before the cursor, if any.
+    fn backspace_at_cursor(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end_byte = char_to_byte_index(&self.chat_input, self.cursor);
+        let start_byte = char_to_byte_index(&self.chat_input, self.cursor - 1);
+        self.chat_input.replace_range(start_byte..end_byte, "");
+        self.cursor -= 1;
+        self.suggestion_selected = 0;
+    }
+
+    /// Moves the cursor one character left, clamped to the start.
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Moves the cursor one character right, clamped to the end.
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.chat_input.chars().count());
+    }
+
+    /// Moves the cursor to the same column on the line above (`delta < 0`) or below
+    /// (`delta > 0`), clamped to the shorter line's length. A no-op past the first/last line.
+    fn move_cursor_vertical(&mut self, delta: isize) {
+        let lines: Vec<&str> = self.chat_input.split('\n').collect();
+        let (line, col) = cursor_line_col(&lines, self.cursor);
+        let Some(target_line) = line.checked_add_signed(delta).filter(|line| *line < lines.len())
+        else {
+            return;
+        };
+        let target_col = col.min(lines[target_line].chars().count());
+        self.cursor = char_index_from_line_col(&lines, target_line, target_col);
     }
 
     /// Appends one masked-on-screen credential character during onboarding.
@@ -603,6 +661,37 @@ fn push_wrapped(lines: &mut Vec<String>, prefix: &str, text: &str) {
             lines.push(format!("{indent}{line}"));
         }
     }
+}
+
+/// Converts a char index into a byte index into `text`, so `char_index` characters in never
+/// lands on a multi-byte UTF-8 boundary. Char indices past the end resolve to `text.len()`.
+fn char_to_byte_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte_index, _)| byte_index)
+}
+
+/// Resolves a char-index cursor to its zero-based `(line, column)` within `\n`-split `lines`.
+fn cursor_line_col(lines: &[&str], cursor: usize) -> (usize, usize) {
+    let mut remaining = cursor;
+    for (line_index, line) in lines.iter().enumerate() {
+        let line_len = line.chars().count();
+        if remaining <= line_len {
+            return (line_index, remaining);
+        }
+        remaining -= line_len + 1; // the '\n' that joined this line to the next
+    }
+    let last = lines.len().saturating_sub(1);
+    (last, lines.get(last).map_or(0, |line| line.chars().count()))
+}
+
+/// The inverse of [`cursor_line_col`]: the char-index cursor position at `(line, col)`.
+fn char_index_from_line_col(lines: &[&str], line: usize, col: usize) -> usize {
+    let mut index = 0;
+    for line_text in lines.iter().take(line) {
+        index += line_text.chars().count() + 1;
+    }
+    index + col.min(lines.get(line).map_or(0, |line| line.chars().count()))
 }
 
 /// Outcome of classifying one terminal event.
@@ -975,7 +1064,16 @@ fn selected_char_range(selection: &Selection, line_index: usize, line_len: usize
 }
 
 fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions: &[(&str, &str)]) {
-    let mut lines = vec![Line::from(format!("> {}", state.chat_input))];
+    let input_display_lines: Vec<&str> = state.chat_input.split('\n').collect();
+    let input_line_count = input_display_lines.len();
+    let mut lines: Vec<Line> = input_display_lines
+        .iter()
+        .enumerate()
+        .map(|(index, line_text)| {
+            let prefix = if index == 0 { "> " } else { "  " };
+            Line::from(format!("{prefix}{line_text}"))
+        })
+        .collect();
 
     let selected = state
         .suggestion_selected
@@ -1029,6 +1127,19 @@ fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions:
             .block(Block::default().borders(Borders::ALL)),
         area,
     );
+
+    let editing = state.pending_permission.is_none()
+        && state.pending_update.is_none()
+        && state.blocking_error.is_none();
+    if editing {
+        let (cursor_line, cursor_col) = cursor_line_col(&input_display_lines, state.cursor);
+        if cursor_line < input_line_count {
+            let prefix_len = 2u16;
+            let cursor_x = area.x + 1 + prefix_len + u16::try_from(cursor_col).unwrap_or(0);
+            let cursor_y = area.y + 1 + u16::try_from(cursor_line).unwrap_or(0);
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
 }
 
 fn permission_mode_color(mode: PermissionMode) -> Color {
@@ -1605,6 +1716,36 @@ fn point_from_terminal_coords(
     })
 }
 
+/// Maps a click inside the composer's input rows to a char-index cursor position, or `None`
+/// when the click landed elsewhere in the composer (suggestions, status, or mode line).
+fn composer_input_click_position(
+    state: &AppState,
+    composer_area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if column <= composer_area.x
+        || column >= composer_area.x + composer_area.width.saturating_sub(1)
+        || row <= composer_area.y
+        || row >= composer_area.y + composer_area.height.saturating_sub(1)
+    {
+        return None;
+    }
+
+    let local_row = usize::from(row - composer_area.y - 1);
+    let input_lines: Vec<&str> = state.chat_input.split('\n').collect();
+    if local_row >= input_lines.len() {
+        return None;
+    }
+
+    let prefix_len = 2usize;
+    let local_col = usize::from(column - composer_area.x - 1);
+    let col_in_line = local_col
+        .saturating_sub(prefix_len)
+        .min(input_lines[local_row].chars().count());
+    Some(char_index_from_line_col(&input_lines, local_row, col_in_line))
+}
+
 /// Applies a mouse event to the transcript's text selection.
 ///
 /// Returns `true` when the event was consumed by selection handling — a left-button press,
@@ -1615,11 +1756,20 @@ pub fn handle_mouse_event(state: &mut AppState, event: &MouseEvent, terminal_are
     }
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            state.selection = point_from_terminal_coords(state, terminal_area, event.column, event.row)
-                .map(|point| Selection {
-                    anchor: point,
-                    cursor: point,
-                });
+            let (_, composer_area) = chat_layout(terminal_area, state);
+            if let Some(cursor) =
+                composer_input_click_position(state, composer_area, event.column, event.row)
+            {
+                state.cursor = cursor;
+                state.selection = None;
+            } else {
+                state.selection =
+                    point_from_terminal_coords(state, terminal_area, event.column, event.row)
+                        .map(|point| Selection {
+                            anchor: point,
+                            cursor: point,
+                        });
+            }
             true
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -1761,8 +1911,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     }
 
     if let Event::Paste(text) = event {
-        state.chat_input.push_str(text);
-        state.suggestion_selected = 0;
+        state.insert_at_cursor(text);
         return None;
     }
 
@@ -1784,8 +1933,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         }
         KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(prompt) = state.last_failed_prompt.take() {
-                state.chat_input = prompt;
-                state.suggestion_selected = 0;
+                state.set_chat_input(prompt);
             }
         }
         KeyCode::Up if suggestion_count > 0 => {
@@ -1795,25 +1943,26 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
             state.suggestion_selected =
                 (state.suggestion_selected + 1).min(suggestion_count - 1);
         }
+        KeyCode::Up => state.move_cursor_vertical(-1),
+        KeyCode::Down => state.move_cursor_vertical(1),
+        KeyCode::Left => state.move_cursor_left(),
+        KeyCode::Right => state.move_cursor_right(),
         KeyCode::PageUp => state.scroll_up(),
         KeyCode::PageDown | KeyCode::End => state.scroll_down(),
         KeyCode::Tab => state.autocomplete(),
         KeyCode::Enter if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
-            state.chat_input.push('\n');
+            state.insert_at_cursor("\n");
         }
         KeyCode::Char('j' | 'J') if modifiers.contains(KeyModifiers::CONTROL) => {
-            state.chat_input.push('\n');
+            state.insert_at_cursor("\n");
         }
         KeyCode::Char(character)
             if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
-            state.chat_input.push(*character);
-            state.suggestion_selected = 0;
+            let mut buffer = [0u8; 4];
+            state.insert_at_cursor(character.encode_utf8(&mut buffer));
         }
-        KeyCode::Backspace => {
-            state.chat_input.pop();
-            state.suggestion_selected = 0;
-        }
+        KeyCode::Backspace => state.backspace_at_cursor(),
         KeyCode::Enter => {
             let trimmed = state.chat_input.trim();
             if trimmed.is_empty() {
@@ -1824,12 +1973,12 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
                 let index = state.suggestion_selected.min(suggestions.len() - 1);
                 let (name, _) = suggestions[index];
                 if let Some(command) = resolve_slash_command(name) {
-                    state.chat_input.clear();
-                    state.suggestion_selected = 0;
+                    state.clear_chat_input();
                     return Some(ChatSubmission::Command(command));
                 }
             }
             let text = std::mem::take(&mut state.chat_input);
+            state.cursor = 0;
             if state.activity.is_some() {
                 state.queued = Some(text);
                 return None;
@@ -2627,6 +2776,110 @@ mod tests {
         ));
         assert_eq!(handle_chat_event(&mut state, &ctrl_j), None);
         assert_eq!(state.chat_input, "\n\n");
+    }
+
+    #[test]
+    fn left_and_right_arrows_move_the_cursor_and_typing_inserts_at_it() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+
+        for character in "helo".chars() {
+            let _ = handle_chat_event(&mut state, &press(KeyCode::Char(character)));
+        }
+        assert_eq!(state.chat_input, "helo");
+        assert_eq!(state.cursor, 4);
+
+        // Move left twice to land between 'l' and 'o', then insert 'l' to fix "helo" -> "hello".
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Left));
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Left));
+        assert_eq!(state.cursor, 2);
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Char('l')));
+        assert_eq!(state.chat_input, "hello");
+        assert_eq!(state.cursor, 3);
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Right));
+        assert_eq!(state.cursor, 4);
+    }
+
+    #[test]
+    fn backspace_removes_the_character_before_the_cursor_not_the_last_one() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "abc".into(),
+            cursor: 3,
+            ..AppState::default()
+        };
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Left));
+        assert_eq!(state.cursor, 2);
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Backspace));
+        assert_eq!(state.chat_input, "ac");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn editing_at_the_cursor_is_utf8_safe_with_accented_characters() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+
+        for character in "café".chars() {
+            let _ = handle_chat_event(&mut state, &press(KeyCode::Char(character)));
+        }
+        assert_eq!(state.chat_input, "café");
+        assert_eq!(state.cursor, 4);
+
+        // Cursor sits between 'f' and 'é'; backspace removes 'f', proving byte offsets never
+        // land inside 'é's multi-byte UTF-8 encoding.
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Left));
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Backspace));
+        assert_eq!(state.chat_input, "caé");
+    }
+
+    #[test]
+    fn up_and_down_arrows_move_the_cursor_between_lines_when_no_suggestions_are_open() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "first\nsecond".into(),
+            cursor: 3,
+            ..AppState::default()
+        };
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(state.cursor, super::char_index_from_line_col(&["first", "second"], 1, 3));
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
+        assert_eq!(state.cursor, 3);
+    }
+
+    #[test]
+    fn clicking_the_composer_input_moves_the_cursor_there() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "hello world".into(),
+            cursor: 0,
+            ..AppState::default()
+        };
+        let terminal_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        let (_, composer_area) = super::chat_layout(terminal_area, &state);
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: composer_area.x + 1 + 2 + 6, // border + "> " prefix + 6 chars into "hello world"
+            row: composer_area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::handle_mouse_event(&mut state, &click, terminal_area));
+        assert_eq!(state.cursor, 6);
+        assert!(state.selection.is_none());
     }
 
     #[test]
