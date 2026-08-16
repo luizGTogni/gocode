@@ -363,10 +363,14 @@ async fn run_application() -> Result<(), AppError> {
         } else {
             bootstrap.project.gocode_dir.join("skills")
         };
-        let skills = gocode_core::load_skills(global_skills_dir.as_deref(), &project_skills_dir);
-        let skills_summary = (!skills.is_empty()).then(|| {
+        let mut skills =
+            gocode_core::load_skills(global_skills_dir.as_deref(), &project_skills_dir);
+        let disabled_skills = gocode_core::load_disabled_skills(&bootstrap.project.gocode_dir);
+        gocode_core::apply_disabled_skills(&mut skills, &disabled_skills);
+        let skills_summary = skills.iter().any(|skill| skill.enabled).then(|| {
             skills
                 .iter()
+                .filter(|skill| skill.enabled)
                 .map(|skill| {
                     format!(
                         "- {}: {} (read {} to use)",
@@ -720,6 +724,15 @@ async fn run_application() -> Result<(), AppError> {
                 }
                 AppCommand::SetAutoCompact(enabled) => {
                     auto_compact_enabled = enabled;
+                }
+                AppCommand::SetSkillEnabled { name, enabled } => {
+                    if let Err(error) = gocode_core::set_skill_enabled(
+                        &bootstrap.project.gocode_dir,
+                        &name,
+                        enabled,
+                    ) {
+                        tracing::warn!("could not persist skill enable state: {error}");
+                    }
                 }
                 AppCommand::CompactContext => {
                     let history_snapshot = current_session.lock().await.history.clone();

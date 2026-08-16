@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
 };
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -158,6 +158,51 @@ pub enum SlashCommand {
     PlanMode,
     /// Exit Gocode.
     Exit,
+}
+
+/// Which screen the `/skills` popup is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SkillsView {
+    /// The "Choose an action" menu: list skills, or enable/disable them.
+    #[default]
+    Menu,
+    /// A read-only, spaced-out listing of every discovered skill.
+    List,
+    /// A checkbox list for toggling skills on or off for this project.
+    EnableDisable,
+}
+
+/// One tab of the `/help` popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HelpTab {
+    #[default]
+    General,
+    Commands,
+    Custom,
+}
+
+impl HelpTab {
+    const ALL: [HelpTab; 3] = [HelpTab::General, HelpTab::Commands, HelpTab::Custom];
+
+    fn title(self) -> &'static str {
+        match self {
+            HelpTab::General => "General",
+            HelpTab::Commands => "Commands",
+            HelpTab::Custom => "Custom commands",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
+
+    fn next(self) -> HelpTab {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    fn previous(self) -> HelpTab {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 /// One recognized slash command: its typed form, description, and variant.
@@ -313,8 +358,18 @@ pub struct AppState {
     pending_update: Option<UpdatePrompt>,
     /// Whether the `/help` popup is currently shown over the chat screen.
     help_visible: bool,
+    /// Which tab of the `/help` popup is currently selected.
+    help_tab: HelpTab,
+    /// Lines scrolled down from the top of the current `/help` tab's content.
+    help_scroll: u16,
     /// Whether the `/skills` popup is currently shown over the chat screen.
     skills_visible: bool,
+    /// Which screen of the `/skills` popup is currently shown.
+    skills_view: SkillsView,
+    /// Selected row within the current `/skills` screen (menu action, or skill index).
+    skills_selected: usize,
+    /// Lines scrolled down from the top of the `/skills` "List skills" screen.
+    skills_list_scroll: u16,
     /// Project-local slash commands discovered under `.gocode/commands/`.
     custom_commands: Vec<gocode_core::CustomCommand>,
     /// Global and project skills discovered at boot.
@@ -1218,43 +1273,183 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
     }
 }
 
-fn render_help_modal(frame: &mut Frame, state: &AppState, area: Rect) {
-    let height = u16::try_from((14 + state.custom_commands.len()).min(24)).unwrap_or(24);
-    let modal = centered(area, 76, height);
-    let mut content = String::from("Commands\n\n");
-    for (name, description, _) in SLASH_COMMANDS {
-        let _ = writeln!(content, "{name:<14} {description}");
-    }
-    if !state.custom_commands.is_empty() {
-        content.push_str("\nProject commands (.gocode/commands/)\n\n");
-        for command in &state.custom_commands {
-            let name = format!("/{}", command.name);
-            let description = if command.description.is_empty() {
-                "(no description)"
+/// Builds the body text shown under the currently selected `/help` tab.
+fn help_tab_content(state: &AppState, tab: HelpTab) -> String {
+    match tab {
+        HelpTab::General => String::from(
+            "Gocode understands your codebase, makes edits with your permission, and \
+             executes commands — right from your terminal.\n\
+             \n\
+             Shortcuts\n\
+             Tab             autocomplete a suggestion\n\
+             Shift+Tab / F2  cycle permission mode\n\
+             Ctrl+J          insert a newline\n\
+             Alt/Shift+Enter insert a newline\n\
+             Up/Down         browse prompt history\n\
+             PageUp/PageDown scroll the conversation\n\
+             Ctrl+O          expand/collapse tool output\n\
+             Ctrl+R          recall the last failed prompt\n\
+             Ctrl+C, Ctrl+C  exit Gocode\n\
+             Drag + Ctrl+C   copy the selection",
+        ),
+        HelpTab::Commands => {
+            let mut content = String::from("Browse default commands\n\n");
+            for (name, description, _) in SLASH_COMMANDS {
+                let _ = writeln!(content, "{name:<14} {description}\n");
+            }
+            content.truncate(content.trim_end().len());
+            content
+        }
+        HelpTab::Custom => {
+            if state.custom_commands.is_empty() {
+                String::from(
+                    "No custom commands found\n\n\
+                     Add Markdown files under .gocode/commands/ to define project-local \
+                     slash commands.",
+                )
             } else {
-                command.description.as_str()
-            };
-            let _ = writeln!(content, "{name:<14} {description}");
+                let mut content = String::from("Project commands (.gocode/commands/)\n\n");
+                for command in &state.custom_commands {
+                    let name = format!("/{}", command.name);
+                    let description = if command.description.is_empty() {
+                        "(no description)"
+                    } else {
+                        command.description.as_str()
+                    };
+                    let _ = writeln!(content, "{name:<14} {description}\n");
+                }
+                content.truncate(content.trim_end().len());
+                content
+            }
         }
     }
-    content.push_str("\nEsc/Enter to close");
+}
+
+fn render_help_modal(frame: &mut Frame, state: &AppState, area: Rect) {
+    let content = help_tab_content(state, state.help_tab);
+    let content_lines = content.lines().count();
+    let height = u16::try_from((content_lines + 5).min(40)).unwrap_or(40);
+    let modal = centered(area, 76, height);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title("Gocode · Help")
+        .borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let titles: Vec<Line> = HelpTab::ALL
+        .iter()
+        .map(|tab| Line::from(tab.title()))
+        .collect();
+    let tabs = Tabs::new(titles)
+        .select(state.help_tab.index())
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(SELECTION_COLOR)
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider(" ");
+    frame.render_widget(tabs, chunks[0]);
+
+    let visible_rows = usize::from(chunks[2].height).max(1);
+    let max_scroll = u16::try_from(content_lines.saturating_sub(visible_rows)).unwrap_or(u16::MAX);
+    let scroll = state.help_scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        chunks[2],
+    );
+
+    let footer = if max_scroll > 0 {
+        "Tab/Shift+Tab to switch tabs · Up/Down to scroll · Esc/Enter to close"
+    } else {
+        "Tab/Shift+Tab to switch tabs · Esc/Enter to close"
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[3],
+    );
+}
+
+/// The `/skills` menu's two actions, in display order.
+const SKILLS_MENU_ITEMS: [(&str, &str); 2] = [
+    ("List skills", "Show every discovered skill."),
+    (
+        "Enable/Disable Skills",
+        "Turn skills on or off for this project.",
+    ),
+];
+
+fn render_skills_modal(frame: &mut Frame, state: &AppState, area: Rect) {
+    match state.skills_view {
+        SkillsView::Menu => render_skills_menu(frame, state, area),
+        SkillsView::List => render_skills_list(frame, state, area),
+        SkillsView::EnableDisable => render_skills_enable_disable(frame, state, area),
+    }
+}
+
+/// A one-line explanation of what skills are, shown at the top of the `/skills` menu.
+const SKILLS_MENU_INTRO: &str =
+    "Skills are extra capabilities the model can read on demand to handle specific tasks.";
+
+fn render_skills_menu(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 76, 11);
+    let mut content = format!("{SKILLS_MENU_INTRO}\n\nChoose an action\n\n");
+    for (index, (label, description)) in SKILLS_MENU_ITEMS.iter().enumerate() {
+        let cursor = if index == state.skills_selected {
+            ">"
+        } else {
+            " "
+        };
+        let _ = writeln!(content, "{cursor} {}. {label} — {description}", index + 1);
+    }
+    content.push_str("\nEnter to select · Esc to close");
     frame.render_widget(Clear, modal);
     frame.render_widget(
         Paragraph::new(content).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title("Gocode · Help")
+                .title("Gocode · Skills")
                 .borders(Borders::ALL),
         ),
         modal,
     );
 }
 
-fn render_skills_modal(frame: &mut Frame, state: &AppState, area: Rect) {
-    let height = u16::try_from((6 + state.skills.len()).min(24)).unwrap_or(24);
-    let modal = centered(area, 76, height);
-    let mut content = String::from("Discovered skills\n\n");
+fn render_skills_list(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 76, 24);
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title("Gocode · Skills")
+        .borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new("Discovered skills\n"), chunks[0]);
+
+    let mut content = String::new();
     if state.skills.is_empty() {
-        content.push_str("None found in ~/.agents/skills or the project's skills directory.\n");
+        content.push_str("None found in ~/.agents/skills or the project's skills directory.");
     } else {
         for skill in &state.skills {
             let source = match skill.source {
@@ -1266,18 +1461,96 @@ fn render_skills_modal(frame: &mut Frame, state: &AppState, area: Rect) {
             } else {
                 skill.description.as_str()
             };
-            let _ = writeln!(content, "{} — {description} ({source})", skill.name);
+            let status = if skill.enabled { "" } else { " (disabled)" };
+            let _ = writeln!(
+                content,
+                "{} — {description} ({source}){status}\n",
+                skill.name
+            );
         }
     }
-    content.push_str("\nEsc/Enter to close");
-    frame.render_widget(Clear, modal);
+    let content_lines = content.lines().count();
+    let visible_rows = usize::from(chunks[1].height).max(1);
+    let max_scroll = u16::try_from(content_lines.saturating_sub(visible_rows)).unwrap_or(u16::MAX);
+    let scroll = state.skills_list_scroll.min(max_scroll);
     frame.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title("Gocode · Skills")
-                .borders(Borders::ALL),
-        ),
-        modal,
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        chunks[1],
+    );
+
+    let footer = if max_scroll > 0 {
+        "Up/Down to scroll · Esc to go back"
+    } else {
+        "Esc to go back"
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn render_skills_enable_disable(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 76, 24);
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title("Gocode · Enable/Disable Skills")
+        .borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new("Turn skills on or off. Your changes are saved automatically.\n"),
+        chunks[0],
+    );
+
+    if state.skills.is_empty() {
+        frame.render_widget(
+            Paragraph::new("None found in ~/.agents/skills or the project's skills directory."),
+            chunks[1],
+        );
+    } else {
+        let visible_rows = usize::from(chunks[1].height).max(1);
+        let first_visible = state
+            .skills_selected
+            .saturating_sub(visible_rows.saturating_sub(1));
+        let content = state.skills[first_visible..]
+            .iter()
+            .enumerate()
+            .take(visible_rows)
+            .map(|(offset, skill)| {
+                let index = first_visible + offset;
+                let cursor = if index == state.skills_selected {
+                    ">"
+                } else {
+                    " "
+                };
+                let checkbox = if skill.enabled { "[x]" } else { "[ ]" };
+                let description = if skill.description.is_empty() {
+                    "(no description)"
+                } else {
+                    skill.description.as_str()
+                };
+                format!("{cursor} {checkbox} {} — {description}", skill.name)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        frame.render_widget(Paragraph::new(content), chunks[1]);
+    }
+
+    frame.render_widget(
+        Paragraph::new("Enter/Space to toggle · Esc to go back")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
     );
 }
 
@@ -1834,8 +2107,13 @@ fn run_terminal(
             continue;
         }
 
-        if handle_skills_event(&mut state, &terminal_event) {
-            continue;
+        match handle_skills_event(&mut state, &terminal_event) {
+            SkillsEventOutcome::NotHandled => {}
+            SkillsEventOutcome::Handled => continue,
+            SkillsEventOutcome::ToggleSkill { name, enabled } => {
+                send_command(&command_tx, AppCommand::SetSkillEnabled { name, enabled })?;
+                continue;
+            }
         }
 
         if let Some(submission) = handle_chat_event(&mut state, &terminal_event) {
@@ -1936,9 +2214,13 @@ fn run_terminal(
                 }
                 ChatSubmission::Command(SlashCommand::Help) => {
                     state.help_visible = true;
+                    state.help_tab = HelpTab::General;
+                    state.help_scroll = 0;
                 }
                 ChatSubmission::Command(SlashCommand::Skills) => {
                     state.skills_visible = true;
+                    state.skills_view = SkillsView::Menu;
+                    state.skills_selected = 0;
                 }
                 ChatSubmission::Command(SlashCommand::PlanMode) => {
                     state.permission_mode = PermissionMode::Plan;
@@ -2506,7 +2788,8 @@ pub fn handle_update_event(state: &mut AppState, event: &Event) -> Option<bool> 
     }
 }
 
-/// Dismisses the `/help` popup on Enter or Esc.
+/// Switches tabs on Tab/Shift+Tab/Left/Right, scrolls the current tab's content on Up/Down and
+/// PageUp/PageDown, and dismisses the `/help` popup on Esc.
 ///
 /// Returns `true` when the event was handled, so the caller can skip further dispatch.
 pub fn handle_help_event(state: &mut AppState, event: &Event) -> bool {
@@ -2515,6 +2798,7 @@ pub fn handle_help_event(state: &mut AppState, event: &Event) -> bool {
     }
     let Event::Key(KeyEvent {
         code,
+        modifiers,
         kind: KeyEventKind::Press,
         ..
     }) = event
@@ -2522,20 +2806,49 @@ pub fn handle_help_event(state: &mut AppState, event: &Event) -> bool {
         return false;
     };
     match code {
-        KeyCode::Enter | KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Enter => {
             state.help_visible = false;
-            true
         }
-        _ => true,
+        KeyCode::BackTab | KeyCode::Left => {
+            state.help_tab = state.help_tab.previous();
+            state.help_scroll = 0;
+        }
+        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
+            state.help_tab = state.help_tab.previous();
+            state.help_scroll = 0;
+        }
+        KeyCode::Tab | KeyCode::Right => {
+            state.help_tab = state.help_tab.next();
+            state.help_scroll = 0;
+        }
+        KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
+        KeyCode::Down => state.help_scroll = state.help_scroll.saturating_add(1),
+        KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(5),
+        KeyCode::PageDown => state.help_scroll = state.help_scroll.saturating_add(5),
+        _ => {}
     }
+    true
 }
 
-/// Dismisses the `/skills` popup on Enter or Esc.
+/// Outcome of dispatching a terminal event to the `/skills` popup.
+#[derive(Debug)]
+pub enum SkillsEventOutcome {
+    /// The popup is not shown, or the event isn't one it cares about.
+    NotHandled,
+    /// The event was consumed by the popup with no further side effect.
+    Handled,
+    /// A skill's enabled state was toggled and should be persisted.
+    ToggleSkill { name: String, enabled: bool },
+}
+
+/// Drives the `/skills` popup: its menu, the read-only skill list, and the enable/disable
+/// screen.
 ///
-/// Returns `true` when the event was handled, so the caller can skip further dispatch.
-pub fn handle_skills_event(state: &mut AppState, event: &Event) -> bool {
+/// Returns [`SkillsEventOutcome::NotHandled`] when the popup isn't shown or the event doesn't
+/// apply to it, so the caller can fall through to other dispatch.
+pub fn handle_skills_event(state: &mut AppState, event: &Event) -> SkillsEventOutcome {
     if !state.skills_visible {
-        return false;
+        return SkillsEventOutcome::NotHandled;
     }
     let Event::Key(KeyEvent {
         code,
@@ -2543,14 +2856,84 @@ pub fn handle_skills_event(state: &mut AppState, event: &Event) -> bool {
         ..
     }) = event
     else {
-        return false;
+        return SkillsEventOutcome::NotHandled;
     };
-    match code {
-        KeyCode::Enter | KeyCode::Esc => {
-            state.skills_visible = false;
-            true
-        }
-        _ => true,
+
+    match state.skills_view {
+        SkillsView::Menu => match code {
+            KeyCode::Up | KeyCode::Down => {
+                state.skills_selected = 1 - state.skills_selected.min(1);
+                SkillsEventOutcome::Handled
+            }
+            KeyCode::Enter => {
+                state.skills_view = if state.skills_selected == 0 {
+                    SkillsView::List
+                } else {
+                    SkillsView::EnableDisable
+                };
+                state.skills_selected = 0;
+                state.skills_list_scroll = 0;
+                SkillsEventOutcome::Handled
+            }
+            KeyCode::Esc => {
+                state.skills_visible = false;
+                SkillsEventOutcome::Handled
+            }
+            _ => SkillsEventOutcome::Handled,
+        },
+        SkillsView::List => match code {
+            KeyCode::Esc | KeyCode::Enter => {
+                state.skills_view = SkillsView::Menu;
+                state.skills_selected = 0;
+                state.skills_list_scroll = 0;
+                SkillsEventOutcome::Handled
+            }
+            KeyCode::Up => {
+                state.skills_list_scroll = state.skills_list_scroll.saturating_sub(1);
+                SkillsEventOutcome::Handled
+            }
+            KeyCode::Down => {
+                state.skills_list_scroll = state.skills_list_scroll.saturating_add(1);
+                SkillsEventOutcome::Handled
+            }
+            KeyCode::PageUp => {
+                state.skills_list_scroll = state.skills_list_scroll.saturating_sub(5);
+                SkillsEventOutcome::Handled
+            }
+            KeyCode::PageDown => {
+                state.skills_list_scroll = state.skills_list_scroll.saturating_add(5);
+                SkillsEventOutcome::Handled
+            }
+            _ => SkillsEventOutcome::Handled,
+        },
+        SkillsView::EnableDisable => match code {
+            KeyCode::Up => {
+                state.skills_selected = state.skills_selected.saturating_sub(1);
+                SkillsEventOutcome::Handled
+            }
+            KeyCode::Down => {
+                if !state.skills.is_empty() {
+                    state.skills_selected = (state.skills_selected + 1).min(state.skills.len() - 1);
+                }
+                SkillsEventOutcome::Handled
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let Some(skill) = state.skills.get_mut(state.skills_selected) else {
+                    return SkillsEventOutcome::Handled;
+                };
+                skill.enabled = !skill.enabled;
+                SkillsEventOutcome::ToggleSkill {
+                    name: skill.name.clone(),
+                    enabled: skill.enabled,
+                }
+            }
+            KeyCode::Esc => {
+                state.skills_view = SkillsView::Menu;
+                state.skills_selected = 0;
+                SkillsEventOutcome::Handled
+            }
+            _ => SkillsEventOutcome::Handled,
+        },
     }
 }
 
@@ -2685,17 +3068,17 @@ mod tests {
         MouseEventKind,
     };
     use gocode_core::{
-        AgentActivityState, AppEvent, ChatMessage, ErrorSeverity, SessionSummary,
-        ToolActivityStatus,
+        AgentActivityState, AppEvent, ChatMessage, ErrorSeverity, SessionSummary, SkillSource,
+        SkillSummary, ToolActivityStatus,
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
-        AppState, ChatEntry, ChatSubmission, InputAction, MAX_VISIBLE_SUGGESTIONS, Screen,
-        SlashCommand, classify_event, handle_chat_event, handle_effort_picker_event,
-        handle_help_event, handle_model_picker_event, handle_onboarding_event,
-        handle_permission_event, handle_session_picker_event, handle_update_event, render,
-        run_with_event_source, slash_suggestions,
+        AppState, ChatEntry, ChatSubmission, HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS, Screen,
+        SkillsEventOutcome, SkillsView, SlashCommand, classify_event, handle_chat_event,
+        handle_effort_picker_event, handle_help_event, handle_model_picker_event,
+        handle_onboarding_event, handle_permission_event, handle_session_picker_event,
+        handle_skills_event, handle_update_event, render, run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -3524,6 +3907,70 @@ mod tests {
     }
 
     #[test]
+    fn help_popup_cycles_tabs_with_tab_and_shift_tab() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            help_visible: true,
+            ..AppState::default()
+        };
+        assert_eq!(state.help_tab, HelpTab::General);
+
+        assert!(handle_help_event(&mut state, &press(KeyCode::Tab)));
+        assert_eq!(state.help_tab, HelpTab::Commands);
+
+        assert!(handle_help_event(&mut state, &press(KeyCode::Tab)));
+        assert_eq!(state.help_tab, HelpTab::Custom);
+
+        assert!(handle_help_event(&mut state, &press(KeyCode::Tab)));
+        assert_eq!(state.help_tab, HelpTab::General);
+
+        assert!(handle_help_event(&mut state, &press(KeyCode::BackTab)));
+        assert_eq!(state.help_tab, HelpTab::Custom);
+    }
+
+    #[test]
+    fn help_popup_scrolls_with_up_down_and_resets_on_tab_switch() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            help_visible: true,
+            ..AppState::default()
+        };
+
+        assert!(handle_help_event(&mut state, &press(KeyCode::Down)));
+        assert_eq!(state.help_scroll, 1);
+        assert!(handle_help_event(&mut state, &press(KeyCode::PageDown)));
+        assert_eq!(state.help_scroll, 6);
+        assert!(handle_help_event(&mut state, &press(KeyCode::Up)));
+        assert_eq!(state.help_scroll, 5);
+
+        assert!(handle_help_event(&mut state, &press(KeyCode::Tab)));
+        assert_eq!(state.help_scroll, 0);
+    }
+
+    #[test]
+    fn skills_list_scrolls_with_up_down_and_resets_when_leaving_the_view() {
+        let mut state = AppState {
+            skills_visible: true,
+            skills: sample_skills(),
+            skills_view: SkillsView::List,
+            ..AppState::default()
+        };
+
+        assert!(matches!(
+            handle_skills_event(&mut state, &press(KeyCode::Down)),
+            SkillsEventOutcome::Handled
+        ));
+        assert_eq!(state.skills_list_scroll, 1);
+
+        assert!(matches!(
+            handle_skills_event(&mut state, &press(KeyCode::Esc)),
+            SkillsEventOutcome::Handled
+        ));
+        assert_eq!(state.skills_view, SkillsView::Menu);
+        assert_eq!(state.skills_list_scroll, 0);
+    }
+
+    #[test]
     fn model_flow_chains_into_the_effort_picker_before_returning_to_chat() {
         let mut state = AppState {
             screen: Screen::ModelPicker,
@@ -4031,5 +4478,108 @@ mod tests {
             terminal_area
         ));
         assert!(state.selection.is_none());
+    }
+
+    fn sample_skills() -> Vec<SkillSummary> {
+        vec![
+            SkillSummary {
+                name: "brainstorming".into(),
+                description: "Use before creative work".into(),
+                source: SkillSource::Global,
+                path: "brainstorming/SKILL.md".into(),
+                enabled: true,
+            },
+            SkillSummary {
+                name: "brandkit".into(),
+                description: "Premium brand-kit skill".into(),
+                source: SkillSource::Project,
+                path: "brandkit/SKILL.md".into(),
+                enabled: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn skills_popup_opens_on_the_choose_an_action_menu() {
+        let mut state = AppState {
+            skills_visible: true,
+            skills: sample_skills(),
+            ..AppState::default()
+        };
+        assert_eq!(state.skills_view, SkillsView::Menu);
+        assert_eq!(state.skills_selected, 0);
+
+        assert!(matches!(
+            handle_skills_event(&mut state, &press(KeyCode::Down)),
+            SkillsEventOutcome::Handled
+        ));
+        assert_eq!(state.skills_selected, 1);
+    }
+
+    #[test]
+    fn selecting_list_skills_shows_every_skill_then_esc_returns_to_the_menu() {
+        let mut state = AppState {
+            skills_visible: true,
+            skills: sample_skills(),
+            ..AppState::default()
+        };
+
+        assert!(matches!(
+            handle_skills_event(&mut state, &press(KeyCode::Enter)),
+            SkillsEventOutcome::Handled
+        ));
+        assert_eq!(state.skills_view, SkillsView::List);
+
+        assert!(matches!(
+            handle_skills_event(&mut state, &press(KeyCode::Esc)),
+            SkillsEventOutcome::Handled
+        ));
+        assert_eq!(state.skills_view, SkillsView::Menu);
+        assert!(state.skills_visible);
+    }
+
+    #[test]
+    fn esc_on_the_menu_closes_the_whole_popup() {
+        let mut state = AppState {
+            skills_visible: true,
+            skills: sample_skills(),
+            ..AppState::default()
+        };
+
+        assert!(matches!(
+            handle_skills_event(&mut state, &press(KeyCode::Esc)),
+            SkillsEventOutcome::Handled
+        ));
+        assert!(!state.skills_visible);
+    }
+
+    #[test]
+    fn enable_disable_screen_toggles_a_skill_and_reports_it_for_persistence() {
+        let mut state = AppState {
+            skills_visible: true,
+            skills: sample_skills(),
+            skills_view: SkillsView::EnableDisable,
+            skills_selected: 0,
+            ..AppState::default()
+        };
+        assert!(state.skills[0].enabled);
+
+        match handle_skills_event(&mut state, &press(KeyCode::Enter)) {
+            SkillsEventOutcome::ToggleSkill { name, enabled } => {
+                assert_eq!(name, "brainstorming");
+                assert!(!enabled);
+            }
+            other => panic!("expected a toggle outcome, got a different result: {other:?}"),
+        }
+        assert!(!state.skills[0].enabled);
+
+        match handle_skills_event(&mut state, &press(KeyCode::Char(' '))) {
+            SkillsEventOutcome::ToggleSkill { name, enabled } => {
+                assert_eq!(name, "brainstorming");
+                assert!(enabled);
+            }
+            other => panic!("expected a toggle outcome, got a different result: {other:?}"),
+        }
+        assert!(state.skills[0].enabled);
     }
 }

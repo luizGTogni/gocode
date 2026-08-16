@@ -2,7 +2,11 @@
 //! slash commands (`.gocode/commands/*.md`) and skills (`.agents/skills/` or the project's
 //! `.gocode/skills/` fallback). Both share the same optional YAML-like frontmatter block.
 
-use std::{collections::HashMap, path::Path, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    path::PathBuf,
+};
 
 /// Splits a Markdown document into its optional leading `---`-delimited frontmatter and body.
 ///
@@ -93,6 +97,9 @@ pub struct SkillSummary {
     pub source: SkillSource,
     /// Path to the skill's Markdown file, for the model to read on demand.
     pub path: PathBuf,
+    /// Whether this skill is currently enabled for this project. Disabled skills stay
+    /// discoverable in the `/skills` UI but are left out of the model's system prompt.
+    pub enabled: bool,
 }
 
 /// Loads skills from `global_dir` (if given and present) and from `project_dir`.
@@ -138,12 +145,71 @@ fn load_skills_from(directory: &Path, source: SkillSource) -> Vec<SkillSummary> 
                 description: fields.get("description").cloned().unwrap_or_default(),
                 source,
                 path: skill_path,
+                enabled: true,
             })
         })
         .collect();
 
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+/// Name of the project-local file that records which skills are disabled.
+const DISABLED_SKILLS_FILE: &str = "disabled_skills.json";
+
+/// Reads the set of skill names disabled for this project from `<gocode_dir>/disabled_skills.json`.
+///
+/// Returns an empty set when the file is missing or unreadable, so a fresh project has every
+/// discovered skill enabled by default.
+#[must_use]
+pub fn load_disabled_skills(gocode_dir: &Path) -> HashSet<String> {
+    let path = gocode_dir.join(DISABLED_SKILLS_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HashSet::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// Writes the set of disabled skill names to `<gocode_dir>/disabled_skills.json`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be serialized or written.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "always called with the standard HashSet; a generic hasher adds no value here"
+)]
+pub fn save_disabled_skills(gocode_dir: &Path, disabled: &HashSet<String>) -> std::io::Result<()> {
+    let path = gocode_dir.join(DISABLED_SKILLS_FILE);
+    let json = serde_json::to_string_pretty(disabled).unwrap_or_else(|_| "[]".to_string());
+    std::fs::write(path, json)
+}
+
+/// Enables or disables a single skill by name for this project, persisting the change to
+/// `<gocode_dir>/disabled_skills.json`.
+///
+/// # Errors
+///
+/// Returns an error if the updated set cannot be written back to disk.
+pub fn set_skill_enabled(gocode_dir: &Path, name: &str, enabled: bool) -> std::io::Result<()> {
+    let mut disabled = load_disabled_skills(gocode_dir);
+    if enabled {
+        disabled.remove(name);
+    } else {
+        disabled.insert(name.to_string());
+    }
+    save_disabled_skills(gocode_dir, &disabled)
+}
+
+/// Applies a set of disabled skill names to a freshly loaded skill list, in place.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "always called with the standard HashSet; a generic hasher adds no value here"
+)]
+pub fn apply_disabled_skills(skills: &mut [SkillSummary], disabled: &HashSet<String>) {
+    for skill in skills {
+        skill.enabled = !disabled.contains(&skill.name);
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +292,52 @@ mod tests {
     fn load_skills_missing_directories_return_empty() {
         let missing = std::env::temp_dir().join(format!("gocode-missing-{}", uuid::Uuid::new_v4()));
         assert!(load_skills(Some(&missing), &missing).is_empty());
+    }
+
+    #[test]
+    fn missing_disabled_skills_file_yields_an_empty_set() {
+        let dir = std::env::temp_dir().join(format!("gocode-no-disabled-{}", uuid::Uuid::new_v4()));
+        assert!(load_disabled_skills(&dir).is_empty());
+    }
+
+    #[test]
+    fn set_skill_enabled_persists_across_reloads_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("gocode-disabled-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        set_skill_enabled(&dir, "brainstorming", false).unwrap();
+        let disabled = load_disabled_skills(&dir);
+        assert!(disabled.contains("brainstorming"));
+
+        set_skill_enabled(&dir, "brainstorming", true).unwrap();
+        let disabled = load_disabled_skills(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!disabled.contains("brainstorming"));
+    }
+
+    #[test]
+    fn apply_disabled_skills_marks_matching_names_disabled() {
+        let mut skills = vec![
+            SkillSummary {
+                name: "brainstorming".into(),
+                description: String::new(),
+                source: SkillSource::Global,
+                path: "brainstorming/SKILL.md".into(),
+                enabled: true,
+            },
+            SkillSummary {
+                name: "brandkit".into(),
+                description: String::new(),
+                source: SkillSource::Project,
+                path: "brandkit/SKILL.md".into(),
+                enabled: true,
+            },
+        ];
+        let disabled = HashSet::from(["brandkit".to_string()]);
+
+        apply_disabled_skills(&mut skills, &disabled);
+
+        assert!(skills[0].enabled);
+        assert!(!skills[1].enabled);
     }
 }

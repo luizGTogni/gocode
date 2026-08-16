@@ -1,7 +1,8 @@
 mod markdown_doc;
 mod session;
 pub use markdown_doc::{
-    CustomCommand, SkillSource, SkillSummary, load_custom_commands, load_skills, parse_frontmatter,
+    CustomCommand, SkillSource, SkillSummary, apply_disabled_skills, load_custom_commands,
+    load_disabled_skills, load_skills, parse_frontmatter, save_disabled_skills, set_skill_enabled,
 };
 pub use session::{
     SessionRecord, SessionSummary, list_sessions, load_session, save_session, sessions_dir,
@@ -50,6 +51,8 @@ pub enum AppCommand {
     RequestSessionList,
     /// Switch to a previously saved session, replacing the current one.
     ResumeSession(String),
+    /// Enable or disable a discovered skill by name for this project.
+    SetSkillEnabled { name: String, enabled: bool },
 }
 
 /// How permissively an agent run is allowed to act without asking the user first.
