@@ -376,10 +376,11 @@ struct AgentToolEventSink {
 impl ToolEventSink for AgentToolEventSink {
     fn emit(&self, event: ToolEvent) {
         if let ToolEvent::OutputChunk { id, chunk } = event {
-            let events = self.events.clone();
-            tokio::spawn(async move {
-                let _ = events.send(AgentEvent::ToolOutputChunk { id, chunk }).await;
-            });
+            // Sent synchronously (not spawned) so it lands on the channel in the same order it
+            // was emitted relative to the run's other events, notably `AgentEvent::Completed`.
+            let _ = self
+                .events
+                .try_send(AgentEvent::ToolOutputChunk { id, chunk });
         }
     }
 }
