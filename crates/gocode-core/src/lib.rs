@@ -1,8 +1,13 @@
 mod markdown_doc;
+mod mcp_config;
 mod session;
 pub use markdown_doc::{
     CustomCommand, SkillSource, SkillSummary, apply_disabled_skills, load_custom_commands,
     load_disabled_skills, load_skills, parse_frontmatter, save_disabled_skills, set_skill_enabled,
+};
+pub use mcp_config::{
+    McpAuthConfig, McpConfig, McpServerEntry, McpTransportConfig, load_or_default_mcp_config,
+    merge_mcp_servers, save_mcp_config,
 };
 pub use session::{
     SessionRecord, SessionSummary, list_sessions, load_session, save_session, sessions_dir,
@@ -1050,6 +1055,12 @@ impl PlatformPaths {
 
         Ok(())
     }
+
+    /// Path to the global MCP server configuration, alongside `config.toml`.
+    #[must_use]
+    pub fn mcp_config_path(&self) -> PathBuf {
+        self.config_dir.join("mcp.toml")
+    }
 }
 
 #[cfg(unix)]
@@ -1131,6 +1142,16 @@ pub fn initialize_project(project_root: &Path) -> Result<ProjectContext, AppErro
         root: project_root.to_path_buf(),
         gocode_dir,
     })
+}
+
+impl ProjectContext {
+    /// Path to the project-layer MCP server configuration, alongside `project.toml`. Not
+    /// created by [`initialize_project`] — servers are opt-in, so this file only exists once
+    /// one has been added.
+    #[must_use]
+    pub fn mcp_config_path(&self) -> PathBuf {
+        self.gocode_dir.join("mcp.toml")
+    }
 }
 
 fn create_file_if_missing(path: &Path, contents: &str) -> Result<(), AppError> {
