@@ -48,6 +48,31 @@ pub enum Screen {
     Chat,
 }
 
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+
+    #[test]
+    fn themes_expose_distinct_semantic_tokens_and_no_color_is_safe() {
+        assert_ne!(
+            theme_tokens(gocode_core::ThemeName::Light, true).background,
+            theme_tokens(gocode_core::ThemeName::Dark, true).background
+        );
+        let fallback = theme_tokens(gocode_core::ThemeName::HighContrast, false);
+        assert_eq!(fallback.primary, Color::Reset);
+        assert_eq!(fallback.danger, Color::Reset);
+    }
+
+    #[test]
+    fn help_includes_preference_commands() {
+        let state = AppState::default();
+        let help = help_tab_content(&state, HelpTab::Commands);
+        assert!(help.contains("/keymap"));
+        assert!(help.contains("/theme"));
+        assert!(help.contains("/personality"));
+    }
+}
+
 /// Reasoning-effort choices offered by the effort picker, paired with the provider value sent
 /// when selected (`None` omits the field entirely).
 const EFFORT_OPTIONS: &[(&str, Option<&str>)] = &[
@@ -60,8 +85,114 @@ const EFFORT_OPTIONS: &[(&str, Option<&str>)] = &[
 /// Menu items shown on the settings screen, in display order.
 const SETTINGS_ITEMS: &[&str] = &["Change API key", "Change model", "Change reasoning effort"];
 
-/// Highlight color for the currently selected slash-command suggestion (reddish pink).
-const SUGGESTION_HIGHLIGHT_COLOR: Color = Color::Rgb(255, 92, 130);
+/// Semantic colours consumed by renderers; named themes are centralized here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeTokens {
+    pub background: Color,
+    pub primary: Color,
+    pub secondary: Color,
+    pub border: Color,
+    pub highlight: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub error: Color,
+    pub command: Color,
+    pub diff_add: Color,
+    pub diff_remove: Color,
+    pub approval: Color,
+    pub danger: Color,
+}
+
+#[must_use]
+pub fn theme_tokens(theme: gocode_core::ThemeName, colors_supported: bool) -> ThemeTokens {
+    if !colors_supported {
+        return ThemeTokens {
+            background: Color::Reset,
+            primary: Color::Reset,
+            secondary: Color::Reset,
+            border: Color::Reset,
+            highlight: Color::Reset,
+            success: Color::Reset,
+            warning: Color::Reset,
+            error: Color::Reset,
+            command: Color::Reset,
+            diff_add: Color::Reset,
+            diff_remove: Color::Reset,
+            approval: Color::Reset,
+            danger: Color::Reset,
+        };
+    }
+    match theme {
+        gocode_core::ThemeName::Light => ThemeTokens {
+            background: Color::White,
+            primary: Color::Black,
+            secondary: Color::DarkGray,
+            border: Color::Gray,
+            highlight: Color::Blue,
+            success: Color::Green,
+            warning: Color::Yellow,
+            error: Color::Red,
+            command: Color::Blue,
+            diff_add: Color::Green,
+            diff_remove: Color::Red,
+            approval: Color::Green,
+            danger: Color::Red,
+        },
+        gocode_core::ThemeName::HighContrast => ThemeTokens {
+            background: Color::Black,
+            primary: Color::White,
+            secondary: Color::White,
+            border: Color::White,
+            highlight: Color::Yellow,
+            success: Color::Green,
+            warning: Color::Yellow,
+            error: Color::Red,
+            command: Color::Cyan,
+            diff_add: Color::Green,
+            diff_remove: Color::Red,
+            approval: Color::Green,
+            danger: Color::Red,
+        },
+        gocode_core::ThemeName::Dark | gocode_core::ThemeName::System => ThemeTokens {
+            background: Color::Black,
+            primary: Color::White,
+            secondary: Color::DarkGray,
+            border: Color::Gray,
+            highlight: Color::Rgb(120, 170, 230),
+            success: Color::Green,
+            warning: Color::Yellow,
+            error: Color::Red,
+            command: Color::Cyan,
+            diff_add: Color::Green,
+            diff_remove: Color::Red,
+            approval: Color::Green,
+            danger: Color::Red,
+        },
+    }
+}
+
+fn active_theme(state: &AppState) -> ThemeTokens {
+    let colors_supported = std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map_or(true, |term| term != "dumb");
+    let theme = if state.preferences.theme == gocode_core::ThemeName::System {
+        // COLORFGBG's final value is the terminal background; high ANSI values conventionally
+        // mean a light background. Absence is intentionally a dark, readable fallback.
+        std::env::var("COLORFGBG")
+            .ok()
+            .and_then(|value| value.rsplit(';').next()?.parse::<u8>().ok())
+            .filter(|background| *background >= 8)
+            .map_or(gocode_core::ThemeName::Dark, |_| {
+                gocode_core::ThemeName::Light
+            })
+    } else {
+        state.preferences.theme
+    };
+    theme_tokens(theme, colors_supported)
+}
+
+// Transitional alias used by legacy selection widgets; new rendering code resolves semantic
+// roles from `ThemeTokens` instead of introducing literal colours.
+const SELECTION_COLOR: Color = Color::Rgb(120, 170, 230);
 
 /// Maximum slash-command suggestion rows shown at once, so a large command list can never grow
 /// the composer without bound; the list scrolls to keep the highlighted entry in view instead.
@@ -69,9 +200,6 @@ const MAX_VISIBLE_SUGGESTIONS: usize = 6;
 
 /// Maximum prompt history entries remembered for Up/Down recall.
 const MAX_PROMPT_HISTORY: usize = 200;
-
-/// Highlight color for a mouse-selected range of transcript text (a weak/soft blue).
-const SELECTION_COLOR: Color = Color::Rgb(120, 170, 230);
 
 /// How long a second Ctrl+C must arrive after the first for the app to actually exit.
 const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_millis(600);
@@ -165,6 +293,12 @@ pub struct UpdatePrompt {
 /// A parsed slash command handled entirely by the interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
+    /// Manage keyboard bindings.
+    Keymap(String),
+    /// Manage named semantic palettes.
+    Theme(String),
+    /// Manage response presentation style.
+    Personality(String),
     /// Reopen the model picker.
     Model,
     /// Open the settings menu to change the API key, model, or reasoning effort.
@@ -290,6 +424,21 @@ impl HelpTab {
 
 /// One recognized slash command: its typed form, description, and variant.
 const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
+    (
+        "/keymap",
+        "List or change keyboard shortcuts",
+        SlashCommand::Keymap(String::new()),
+    ),
+    (
+        "/theme",
+        "List or change the visual theme",
+        SlashCommand::Theme(String::new()),
+    ),
+    (
+        "/personality",
+        "List or change the response style",
+        SlashCommand::Personality(String::new()),
+    ),
     ("/model", "Switch the active model", SlashCommand::Model),
     (
         "/settings",
@@ -451,6 +600,9 @@ pub struct AppState {
     settings_selected: usize,
     selected_effort: usize,
     current_effort: Option<String>,
+    /// User-local, presentation-only settings loaded by the runtime.
+    preferences: gocode_core::Preferences,
+    active_personality: gocode_core::PersonalityName,
     chat_input: String,
     /// Char index (not byte index) of the composer's insertion point.
     cursor: usize,
@@ -568,6 +720,18 @@ impl AppState {
         match event {
             AppEvent::BootStarted => self.screen = Screen::Boot,
             AppEvent::BootCompleted => self.screen = Screen::Chat,
+            AppEvent::PreferencesLoaded {
+                preferences,
+                recovery,
+            } => {
+                self.preferences.clone_from(preferences);
+                self.active_personality = preferences.personality;
+                if let Some(recovery) = recovery {
+                    self.entries.push(ChatEntry::Warning(format!(
+                        "Preferences recovery: {recovery}"
+                    )));
+                }
+            }
             AppEvent::ProjectContextAvailable { working_directory } => {
                 self.working_directory.clone_from(working_directory);
             }
@@ -1320,6 +1484,11 @@ pub enum InputAction {
 /// Renders the active application screen.
 pub fn render(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
+    let theme = active_theme(state);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.background).fg(theme.primary)),
+        area,
+    );
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
             Paragraph::new("Terminal too small — resize to continue.").wrap(Wrap { trim: false }),
@@ -1331,7 +1500,13 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     match state.screen {
         Screen::Boot => frame.render_widget(
             Paragraph::new("Starting Gocode...")
-                .block(Block::default().title("Gocode").borders(Borders::ALL)),
+                .style(Style::default().fg(theme.primary).bg(theme.background))
+                .block(
+                    Block::default()
+                        .title("Gocode")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme.border)),
+                ),
             area,
         ),
         Screen::Onboarding => render_onboarding(frame, state, area),
@@ -1344,6 +1519,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
 }
 
 fn render_onboarding(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = active_theme(state);
     let mut content = "NVIDIA API key:\n\n\
         Enter your key. It is validated immediately and stored only in your system credential \
         store afterward — never in plain configuration files.\n\n\
@@ -1355,16 +1531,21 @@ fn render_onboarding(frame: &mut Frame, state: &AppState, area: Rect) {
         content.push_str(status);
     }
     frame.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title("Gocode · NVIDIA setup")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(content)
+            .style(Style::default().fg(theme.primary).bg(theme.background))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Gocode · NVIDIA setup")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
         area,
     );
 }
 
 fn render_model_picker(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = active_theme(state);
     let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
     let first_visible = state.selected_model.saturating_sub(visible_rows - 1);
     let content = state.models[first_visible..]
@@ -1385,16 +1566,20 @@ fn render_model_picker(frame: &mut Frame, state: &AppState, area: Rect) {
         .collect::<Vec<_>>()
         .join("\n");
     frame.render_widget(
-        Paragraph::new(content).block(
-            Block::default()
-                .title("Gocode · Select NVIDIA model")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(content)
+            .style(Style::default().fg(theme.primary).bg(theme.background))
+            .block(
+                Block::default()
+                    .title("Gocode · Select NVIDIA model")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
         area,
     );
 }
 
 fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = active_theme(state);
     let model_label = state.current_model.as_deref().unwrap_or("none selected");
     let effort_label = effort_label(state.current_effort.as_deref());
     let content = SETTINGS_ITEMS
@@ -1416,11 +1601,14 @@ fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
         .collect::<Vec<_>>()
         .join("\n");
     frame.render_widget(
-        Paragraph::new(content).block(
-            Block::default()
-                .title("Gocode · Settings")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(content)
+            .style(Style::default().fg(theme.primary).bg(theme.background))
+            .block(
+                Block::default()
+                    .title("Gocode · Settings")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
         area,
     );
 }
@@ -2412,6 +2600,7 @@ fn render_update_result(frame: &mut Frame, title: &str, heading: &str, message: 
 }
 
 fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
+    let theme = active_theme(state);
     let content_width = usize::from(area.width.saturating_sub(2));
     let wrapped = wrap_lines(&compose_lines(state), content_width);
     let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
@@ -2453,7 +2642,13 @@ fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(Text::from(rendered_lines))
-            .block(Block::default().title(title).borders(Borders::ALL)),
+            .style(Style::default().fg(theme.primary).bg(theme.background))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
         area,
     );
 }
@@ -2572,6 +2767,7 @@ fn render_composer(
     area: Rect,
     suggestions: &[(String, String)],
 ) {
+    let theme = active_theme(state);
     let input_display_lines: Vec<&str> = state.chat_input.split('\n').collect();
     let input_line_count = input_display_lines.len();
     let mut lines: Vec<Line> = input_display_lines
@@ -2595,7 +2791,7 @@ fn render_composer(
             Line::from(Span::styled(
                 text,
                 Style::default()
-                    .fg(SUGGESTION_HIGHLIGHT_COLOR)
+                    .fg(theme.highlight)
                     .add_modifier(Modifier::BOLD),
             ))
         } else {
@@ -2613,10 +2809,7 @@ fn render_composer(
         "{} mode on (shift+tab or F2 to cycle)",
         state.permission_mode.label()
     );
-    let mode_span = Span::styled(
-        mode_text.clone(),
-        Style::default().fg(permission_mode_color(state.permission_mode)),
-    );
+    let mode_span = Span::styled(mode_text.clone(), Style::default().fg(theme.command));
     lines.push(if state.activity.is_some() {
         let interrupt_text = "ESC to interrupt";
         let content_width = usize::from(area.width.saturating_sub(2));
@@ -2629,7 +2822,7 @@ fn render_composer(
             Span::styled(
                 interrupt_text,
                 Style::default()
-                    .fg(SELECTION_COLOR)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             ),
         ])
@@ -2638,8 +2831,13 @@ fn render_composer(
     });
     frame.render_widget(
         Paragraph::new(Text::from(lines))
+            .style(Style::default().fg(theme.primary).bg(theme.background))
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
         area,
     );
 
@@ -2656,14 +2854,6 @@ fn render_composer(
             let cursor_y = area.y + 1 + u16::try_from(cursor_line).unwrap_or(0);
             frame.set_cursor_position((cursor_x, cursor_y));
         }
-    }
-}
-
-fn permission_mode_color(mode: PermissionMode) -> Color {
-    match mode {
-        PermissionMode::Auto => Color::Rgb(120, 200, 120),
-        PermissionMode::Plan => Color::Rgb(120, 170, 255),
-        PermissionMode::Approve => Color::Rgb(255, 170, 90),
     }
 }
 
@@ -2904,6 +3094,24 @@ fn run_terminal(
             continue;
         }
 
+        if let Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            ..
+        }) = &terminal_event
+            && state.activity.is_some()
+            && key_action_matches(
+                &state.preferences,
+                gocode_core::KeyAction::InterruptExecution,
+                code,
+                *modifiers,
+            )
+        {
+            send_command(&command_tx, AppCommand::CancelProviderRequest)?;
+            continue;
+        }
+
         if let Some(approved) = handle_permission_event(&mut state, &terminal_event) {
             send_command(&command_tx, AppCommand::PermissionResponse(approved))?;
             continue;
@@ -3034,6 +3242,217 @@ fn run_terminal(
 
         if let Some(submission) = handle_chat_event(&mut state, &terminal_event) {
             match submission {
+                ChatSubmission::Command(SlashCommand::Keymap(arguments)) => {
+                    let args: Vec<_> = arguments.split_whitespace().collect();
+                    if args.is_empty() {
+                        let defaults = gocode_core::default_keymap();
+                        let mut body = String::from("Keymap (action · shortcut · origin)\n");
+                        for action in gocode_core::KeyAction::all() {
+                            let binding = state
+                                .preferences
+                                .keymap
+                                .get(action)
+                                .expect("normalized keymap");
+                            let origin = if defaults.get(action) == Some(binding) {
+                                "default"
+                            } else {
+                                "custom"
+                            };
+                            let conflicts: Vec<_> = state
+                                .preferences
+                                .keymap
+                                .iter()
+                                .filter(|(other, value)| {
+                                    *other != action && value.eq_ignore_ascii_case(binding)
+                                })
+                                .map(|(other, _)| other.label())
+                                .collect();
+                            let conflict = if conflicts.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · conflict: {}", conflicts.join(", "))
+                            };
+                            let _ = writeln!(
+                                body,
+                                "{} · {} · {origin}{conflict}",
+                                action.label(),
+                                binding
+                            );
+                        }
+                        state.entries.push(ChatEntry::Info(body));
+                    } else if args[0] == "reset-all" {
+                        if !args.contains(&"--force") {
+                            state.entries.push(ChatEntry::Warning(
+                                "Confirm with `/keymap reset-all --force`.".into(),
+                            ));
+                        } else {
+                            state.preferences.keymap = gocode_core::default_keymap();
+                            send_command(
+                                &command_tx,
+                                AppCommand::SetPreferences(state.preferences.clone()),
+                            )?;
+                            state.entries.push(ChatEntry::Info(
+                                "All shortcuts restored to defaults.".into(),
+                            ));
+                        }
+                    } else if args.first() == Some(&"reset") && args.len() == 2 {
+                        if let Some(action) = gocode_core::KeyAction::parse(args[1]) {
+                            state
+                                .preferences
+                                .keymap
+                                .insert(action, gocode_core::default_keymap()[&action].clone());
+                            send_command(
+                                &command_tx,
+                                AppCommand::SetPreferences(state.preferences.clone()),
+                            )?;
+                            state
+                                .entries
+                                .push(ChatEntry::Info(format!("Reset {}.", action.label())));
+                        } else {
+                            state
+                                .entries
+                                .push(ChatEntry::Error("Unknown keymap action.".into()));
+                        }
+                    } else if args.first() == Some(&"set") && args.len() >= 3 {
+                        let Some(action) = gocode_core::KeyAction::parse(args[1]) else {
+                            state
+                                .entries
+                                .push(ChatEntry::Error("Unknown keymap action.".into()));
+                            continue;
+                        };
+                        let shortcut = args[2].to_ascii_lowercase();
+                        if !gocode_core::valid_shortcut(&shortcut) {
+                            state.entries.push(ChatEntry::Error(
+                                "Invalid shortcut. Example: ctrl+enter.".into(),
+                            ));
+                            continue;
+                        }
+                        let force = args.contains(&"--force");
+                        let conflicts: Vec<_> = state
+                            .preferences
+                            .keymap
+                            .iter()
+                            .filter(|(other, value)| {
+                                **other != action && value.eq_ignore_ascii_case(&shortcut)
+                            })
+                            .map(|(other, _)| *other)
+                            .collect();
+                        let essential =
+                            matches!(action, gocode_core::KeyAction::InterruptExecution);
+                        if (essential || !conflicts.is_empty()) && !force {
+                            state.entries.push(ChatEntry::Warning("This changes an essential shortcut or replaces a conflict. Repeat with `--force`.".into()));
+                            continue;
+                        }
+                        for conflict in conflicts {
+                            state
+                                .preferences
+                                .keymap
+                                .insert(conflict, gocode_core::default_keymap()[&conflict].clone());
+                        }
+                        state.preferences.keymap.insert(action, shortcut.clone());
+                        send_command(
+                            &command_tx,
+                            AppCommand::SetPreferences(state.preferences.clone()),
+                        )?;
+                        state.entries.push(ChatEntry::Info(format!(
+                            "{} bound to {shortcut}.",
+                            action.label()
+                        )));
+                    } else {
+                        state.entries.push(ChatEntry::Info("Usage: /keymap [set <action> <shortcut> [--force] | reset <action> | reset-all --force]".into()));
+                    }
+                }
+                ChatSubmission::Command(SlashCommand::Theme(arguments)) => {
+                    let args: Vec<_> = arguments.split_whitespace().collect();
+                    if args.is_empty() {
+                        state.entries.push(ChatEntry::Info(format!(
+                            "Themes: {}. Active: {}.",
+                            gocode_core::ThemeName::all()
+                                .iter()
+                                .map(|theme| theme.label())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            state.preferences.theme.label()
+                        )));
+                    } else if args == ["current"] {
+                        state.entries.push(ChatEntry::Info(format!(
+                            "Active theme: {}.",
+                            state.preferences.theme.label()
+                        )));
+                    } else if args == ["reset"] {
+                        state.preferences.theme = gocode_core::ThemeName::System;
+                        send_command(
+                            &command_tx,
+                            AppCommand::SetPreferences(state.preferences.clone()),
+                        )?;
+                    } else if args.len() == 2 && args[0] == "set" {
+                        if let Some(theme) = gocode_core::ThemeName::parse(args[1]) {
+                            state.preferences.theme = theme;
+                            send_command(
+                                &command_tx,
+                                AppCommand::SetPreferences(state.preferences.clone()),
+                            )?;
+                            state
+                                .entries
+                                .push(ChatEntry::Info(format!("Theme set to {}.", theme.label())));
+                        } else {
+                            state
+                                .entries
+                                .push(ChatEntry::Error("Unknown theme.".into()));
+                        }
+                    } else {
+                        state.entries.push(ChatEntry::Info(
+                            "Usage: /theme [current | set <name> | reset]".into(),
+                        ));
+                    }
+                }
+                ChatSubmission::Command(SlashCommand::Personality(arguments)) => {
+                    let args: Vec<_> = arguments.split_whitespace().collect();
+                    if args.is_empty() {
+                        state.entries.push(ChatEntry::Info(format!(
+                            "Personalities: {}. Active: {}.",
+                            gocode_core::PersonalityName::all()
+                                .iter()
+                                .map(|p| p.label())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            state.active_personality.label()
+                        )));
+                    } else if args == ["reset"] {
+                        state.active_personality = gocode_core::PersonalityName::Default;
+                        send_command(
+                            &command_tx,
+                            AppCommand::SetSessionPersonality(state.active_personality),
+                        )?;
+                    } else if args.len() == 2 && (args[0] == "set" || args[0] == "default") {
+                        if let Some(personality) = gocode_core::PersonalityName::parse(args[1]) {
+                            if args[0] == "default" {
+                                state.preferences.personality = personality;
+                                send_command(
+                                    &command_tx,
+                                    AppCommand::SetPreferences(state.preferences.clone()),
+                                )?;
+                            }
+                            state.active_personality = personality;
+                            send_command(
+                                &command_tx,
+                                AppCommand::SetSessionPersonality(personality),
+                            )?;
+                            state.entries.push(ChatEntry::Info(format!(
+                                "Personality set to {}.",
+                                personality.label()
+                            )));
+                        } else {
+                            state
+                                .entries
+                                .push(ChatEntry::Error("Unknown personality.".into()));
+                        }
+                    } else {
+                        state.entries.push(ChatEntry::Info(
+                            "Usage: /personality [set <name> | default <name> | reset]".into(),
+                        ));
+                    }
+                }
                 ChatSubmission::Prompt(text) => {
                     state.begin_run(text.clone());
                     send_command(&command_tx, AppCommand::SubmitChat(text))?;
@@ -3126,11 +3545,14 @@ fn run_terminal(
                     );
                     state.entries.push(ChatEntry::Info(format!(
                         "Provider: NVIDIA NIM · Model: {model} · Reasoning effort: {effort}\n\
+                         Personality: {}\n\
                          Directory: {directory}\n\
                          Session: {session}\n\
                          Context: {context}\n\
                          Undo: {} available · Redo: {} available",
-                        state.undo_count, state.redo_count
+                        state.active_personality.label(),
+                        state.undo_count,
+                        state.redo_count
                     )));
                 }
                 ChatSubmission::Command(SlashCommand::Help) => {
@@ -3732,6 +4154,7 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
     state.pending_permission.as_ref()?;
     let Event::Key(KeyEvent {
         code,
+        modifiers,
         kind: KeyEventKind::Press,
         ..
     }) = event
@@ -3740,11 +4163,23 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
     };
 
     match code {
-        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+        _ if key_action_matches(
+            &state.preferences,
+            gocode_core::KeyAction::Approve,
+            code,
+            *modifiers,
+        ) || matches!(code, KeyCode::Enter) =>
+        {
             state.pending_permission = None;
             Some(true)
         }
-        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+        _ if key_action_matches(
+            &state.preferences,
+            gocode_core::KeyAction::Reject,
+            code,
+            *modifiers,
+        ) || matches!(code, KeyCode::Esc) =>
+        {
             state.pending_permission = None;
             Some(false)
         }
@@ -4400,6 +4835,65 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         return None;
     };
 
+    if key_action_matches(
+        &state.preferences,
+        gocode_core::KeyAction::OpenHelp,
+        code,
+        *modifiers,
+    ) {
+        return Some(ChatSubmission::Command(SlashCommand::Help));
+    }
+    if key_action_matches(
+        &state.preferences,
+        gocode_core::KeyAction::OpenModelPicker,
+        code,
+        *modifiers,
+    ) {
+        return Some(ChatSubmission::Command(SlashCommand::Model));
+    }
+    if key_action_matches(
+        &state.preferences,
+        gocode_core::KeyAction::NewConversation,
+        code,
+        *modifiers,
+    ) {
+        return Some(ChatSubmission::Command(SlashCommand::NewSession));
+    }
+    if key_action_matches(
+        &state.preferences,
+        gocode_core::KeyAction::OpenCommandList,
+        code,
+        *modifiers,
+    ) {
+        state.set_chat_input("/".into());
+        return None;
+    }
+
+    let code = if key_action_matches(
+        &state.preferences,
+        gocode_core::KeyAction::SendMessage,
+        code,
+        *modifiers,
+    ) {
+        KeyCode::Enter
+    } else if key_action_matches(
+        &state.preferences,
+        gocode_core::KeyAction::HistoryPrevious,
+        code,
+        *modifiers,
+    ) {
+        KeyCode::Up
+    } else if key_action_matches(
+        &state.preferences,
+        gocode_core::KeyAction::HistoryNext,
+        code,
+        *modifiers,
+    ) {
+        KeyCode::Down
+    } else {
+        code.clone()
+    };
+
     let suggestion_count = slash_suggestions(&state.chat_input, &state.custom_commands).len();
 
     match code {
@@ -4492,6 +4986,23 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
                     state.clear_chat_input();
                     return Some(ChatSubmission::Command(SlashCommand::Redo(count)));
                 }
+                if name == "/keymap" {
+                    let arguments = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Keymap(arguments)));
+                }
+                if name == "/theme" {
+                    let arguments = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Theme(arguments)));
+                }
+                if name == "/personality" {
+                    let arguments = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Personality(
+                        arguments,
+                    )));
+                }
                 if let Some(command) = resolve_custom_command(&state.custom_commands, name) {
                     let body = expand_custom_command(&command.body, arguments.trim());
                     state.clear_chat_input();
@@ -4510,6 +5021,53 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         _ => {}
     }
     None
+}
+
+fn key_action_matches(
+    preferences: &gocode_core::Preferences,
+    action: gocode_core::KeyAction,
+    code: &KeyCode,
+    modifiers: KeyModifiers,
+) -> bool {
+    let Some(binding) = preferences.keymap.get(&action) else {
+        return false;
+    };
+    let normalized = binding.to_ascii_lowercase();
+    let mut parts = normalized.split('+').collect::<Vec<_>>();
+    let Some(key) = parts.pop() else {
+        return false;
+    };
+    let expected = parts
+        .into_iter()
+        .fold(KeyModifiers::empty(), |value, modifier| {
+            value
+                | match modifier {
+                    "ctrl" => KeyModifiers::CONTROL,
+                    "alt" => KeyModifiers::ALT,
+                    "shift" => KeyModifiers::SHIFT,
+                    _ => KeyModifiers::empty(),
+                }
+        });
+    if (modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)) != expected {
+        return false;
+    }
+    match key {
+        "enter" => *code == KeyCode::Enter,
+        "esc" => *code == KeyCode::Esc,
+        "tab" => *code == KeyCode::Tab,
+        "up" => *code == KeyCode::Up,
+        "down" => *code == KeyCode::Down,
+        "left" => *code == KeyCode::Left,
+        "right" => *code == KeyCode::Right,
+        "f1" => *code == KeyCode::F(1),
+        "f2" => *code == KeyCode::F(2),
+        "f3" => *code == KeyCode::F(3),
+        "f4" => *code == KeyCode::F(4),
+        one if one.chars().count() == 1 => {
+            matches!(code, KeyCode::Char(character) if character.to_string() == one)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

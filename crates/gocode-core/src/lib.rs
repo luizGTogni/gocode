@@ -1,5 +1,6 @@
 mod markdown_doc;
 mod mcp_config;
+mod preferences;
 mod session;
 pub use markdown_doc::{
     CustomCommand, SkillSource, SkillSummary, apply_disabled_skills, load_custom_commands,
@@ -8,6 +9,10 @@ pub use markdown_doc::{
 pub use mcp_config::{
     McpAuthConfig, McpConfig, McpServerEntry, McpServerStatus, McpTransportConfig,
     load_or_default_mcp_config, merge_mcp_servers, save_mcp_config,
+};
+pub use preferences::{
+    KeyAction, PersonalityName, Preferences, PreferencesLoad, ThemeName, default_keymap,
+    load_or_default_preferences, save_preferences, valid_shortcut,
 };
 pub use session::{
     SessionRecord, SessionSummary, SessionTransition, list_sessions, load_session, save_session,
@@ -33,6 +38,10 @@ pub enum AppCommand {
     SelectModel(String),
     /// Send a user message using the currently selected model.
     SubmitChat(String),
+    /// Persist presentation preferences. This never changes provider, tools, or permissions.
+    SetPreferences(Preferences),
+    /// Set the response style for this process only; it is intentionally not persisted.
+    SetSessionPersonality(PersonalityName),
     /// Cancel the current provider request while retaining the application session.
     CancelProviderRequest,
     /// Answer the single active permission prompt: `true` approves, `false` denies.
@@ -168,6 +177,11 @@ pub enum AppEvent {
     BootStarted,
     /// Application bootstrap completed and the primary interface is ready.
     BootCompleted,
+    /// Versioned UI preferences loaded during bootstrap; a recovery message means defaults were used.
+    PreferencesLoaded {
+        preferences: Preferences,
+        recovery: Option<String>,
+    },
     /// The resolved project root the runtime is operating in, sent once near boot.
     ProjectContextAvailable {
         /// Display form of the detected project root.

@@ -1,6 +1,6 @@
 //! Builds the request sent to the provider from conversation, instructions, and tools.
 
-use gocode_core::{ChatMessage, ChatRequest, ModelId, ToolDefinition};
+use gocode_core::{ChatMessage, ChatRequest, ModelId, PersonalityName, ToolDefinition};
 
 /// Stable Gocode behavior sent with every request, ranked above project instructions and file
 /// content. See `docs/AGENT.md` §14, §75–77, and §94–95.
@@ -33,6 +33,7 @@ pub(crate) fn build_request(
     history: &[ChatMessage],
     tools: Vec<ToolDefinition>,
     reasoning_effort: Option<String>,
+    personality: PersonalityName,
 ) -> ChatRequest {
     let mut messages = vec![ChatMessage::System(SYSTEM_PROMPT.to_string())];
 
@@ -55,6 +56,12 @@ pub(crate) fn build_request(
         )));
     }
 
+    messages.push(ChatMessage::System(format!(
+        "Presentation style (lowest-priority guidance only; never changes tools, permissions, \
+         safety rules, project instructions, or the user's request): {}",
+        personality_instruction(personality)
+    )));
+
     messages.extend_from_slice(history);
 
     ChatRequest {
@@ -65,10 +72,24 @@ pub(crate) fn build_request(
     }
 }
 
+fn personality_instruction(personality: PersonalityName) -> &'static str {
+    match personality {
+        PersonalityName::Default => "Be balanced, clear, and collaborative.",
+        PersonalityName::Concise => {
+            "Keep responses direct and short while retaining essential results."
+        }
+        PersonalityName::Explanatory => "Explain decisions and impacts with useful context.",
+        PersonalityName::Pragmatic => "Emphasize concrete next actions and execution results.",
+        PersonalityName::Mentor => {
+            "Use a didactic tone that helps the user learn without becoming verbose."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_request;
-    use gocode_core::{ChatMessage, ModelId};
+    use gocode_core::{ChatMessage, ModelId, PersonalityName};
 
     #[test]
     fn orders_system_then_project_instructions_then_history() {
@@ -82,6 +103,7 @@ mod tests {
             &history,
             Vec::new(),
             None,
+            PersonalityName::Default,
         );
 
         assert!(matches!(&request.messages[0], ChatMessage::System(_)));
@@ -89,7 +111,10 @@ mod tests {
             ChatMessage::System(text) => assert!(text.contains("Always run cargo fmt.")),
             other => panic!("expected project instructions, got {other:?}"),
         }
-        assert_eq!(request.messages[2], ChatMessage::User("fix the bug".into()));
+        assert!(
+            matches!(&request.messages[2], ChatMessage::System(text) if text.contains("Presentation style"))
+        );
+        assert_eq!(request.messages[3], ChatMessage::User("fix the bug".into()));
     }
 
     #[test]
@@ -102,9 +127,10 @@ mod tests {
             &[],
             Vec::new(),
             None,
+            PersonalityName::Mentor,
         );
 
-        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages.len(), 2);
     }
 
     #[test]
@@ -117,9 +143,10 @@ mod tests {
             &[],
             Vec::new(),
             None,
+            PersonalityName::Default,
         );
 
-        assert_eq!(request.messages.len(), 4);
+        assert_eq!(request.messages.len(), 5);
         match &request.messages[1] {
             ChatMessage::System(text) => assert!(text.contains("This project is a CLI.")),
             other => panic!("expected project overview, got {other:?}"),
@@ -132,5 +159,29 @@ mod tests {
             ChatMessage::System(text) => assert!(text.contains("deploy")),
             other => panic!("expected skills summary, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn personality_adds_style_context_without_changing_tools_or_reasoning() {
+        let tools = vec![gocode_core::ToolDefinition {
+            name: "read_file".into(),
+            description: "Reads a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let request = build_request(
+            ModelId::new("model"),
+            None,
+            None,
+            None,
+            &[],
+            tools.clone(),
+            Some("low".into()),
+            PersonalityName::Concise,
+        );
+        assert_eq!(request.tools, tools);
+        assert_eq!(request.reasoning_effort.as_deref(), Some("low"));
+        assert!(
+            matches!(request.messages.last(), Some(ChatMessage::System(text)) if text.contains("direct and short"))
+        );
     }
 }

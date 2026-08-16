@@ -7,8 +7,8 @@ use std::{
 };
 
 use gocode_core::{
-    CancellationToken, ChatMessage, ChatStreamEvent, FinishReason, ModelId, Provider,
-    ProviderToolCall,
+    CancellationToken, ChatMessage, ChatStreamEvent, FinishReason, ModelId, PersonalityName,
+    Provider, ProviderToolCall,
 };
 use gocode_tools::{
     FileSnapshot, ToolCall, ToolContext, ToolError, ToolEvent, ToolEventSink, ToolRegistry,
@@ -49,6 +49,8 @@ pub struct AgentRequest {
     pub tools_enabled: bool,
     /// User-selected reasoning-effort level, forwarded to the provider request as-is.
     pub reasoning_effort: Option<String>,
+    /// Presentation style only; it cannot alter tool access or permission policy.
+    pub personality: PersonalityName,
     /// Prior conversation turns to seed this run's history with, oldest first. Empty for a fresh
     /// conversation.
     pub history: Vec<ChatMessage>,
@@ -265,6 +267,7 @@ impl Agent {
             history,
             tool_defs.to_vec(),
             request.reasoning_effort.clone(),
+            request.personality,
         );
 
         let mut stream = self

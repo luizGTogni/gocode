@@ -259,6 +259,28 @@ ResolvedConfig
 
 # 12. Missing Config Files
 
+## UI preferences
+
+Gocode stores user-interface preferences separately in the global configuration directory as
+`preferences.toml`. It is schema-versioned and ignores unknown fields so newer versions remain
+compatible with older clients. If it is malformed, Gocode starts with safe defaults, reports a
+recovery warning, and leaves the original file untouched.
+
+The file persists only the selected theme, default personality, and key bindings. It never
+contains credentials, permissions, tools, model settings, or safety policy.
+
+### Extending preferences in code
+
+- Add a `KeyAction` and its default binding in `crates/gocode-core/src/preferences.rs`; the
+  `/keymap` command discovers it from `KeyAction::all`.
+- Add a `ThemeName` and its semantic `ThemeTokens` palette in `crates/gocode-tui/src/lib.rs`.
+  Components should consume semantic tokens (background, primary/secondary text, border,
+  highlight, success/warning/error, command, diffs, approval, danger), never a new literal
+  colour.
+- Add a `PersonalityName` plus its presentation instruction in
+  `crates/gocode-agent/src/context.rs`. The instruction must remain presentation-only and must
+  explicitly defer to system rules, project instructions, user requests, tools, and permissions.
+
 Missing config is not an error.
 
 If global config does not exist:

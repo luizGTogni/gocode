@@ -73,6 +73,7 @@ fn request(project_root: &Path, prompt: &str) -> AgentRequest {
         skills_summary: None,
         tools_enabled: true,
         reasoning_effort: None,
+        personality: gocode_core::PersonalityName::Default,
         history: Vec::new(),
     }
 }

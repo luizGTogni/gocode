@@ -633,6 +633,8 @@ async fn run_application() -> Result<(), AppError> {
     let paths = application_paths(current_platform(), process_environment())?;
     let _log_guard = init_logging(&paths.state_dir)?;
     let bootstrap = bootstrap_with_paths(&paths)?;
+    let preferences_path = paths.config_dir.join("preferences.toml");
+    let loaded_preferences = gocode_core::load_or_default_preferences(&preferences_path);
     tracing::info!("application bootstrapped");
 
     let environment_credential = std::env::var("NVIDIA_API_KEY").ok();
@@ -643,6 +645,16 @@ async fn run_application() -> Result<(), AppError> {
         .send(bootstrap.event)
         .await
         .map_err(|error| AppError::Initialization(format!("could not send boot event: {error}")))?;
+    driver
+        .event_tx
+        .send(gocode_core::AppEvent::PreferencesLoaded {
+            preferences: loaded_preferences.preferences.clone(),
+            recovery: loaded_preferences.recovered_from_error.clone(),
+        })
+        .await
+        .map_err(|error| {
+            AppError::Initialization(format!("could not send preferences: {error}"))
+        })?;
     start_update_check(driver.event_tx.clone());
     let tui = gocode_tui::run(client.event_rx, client.command_tx);
     let runtime = async move {
@@ -665,6 +677,7 @@ async fn run_application() -> Result<(), AppError> {
         let undo: UndoRegistry = Arc::new(Mutex::new(HashMap::new()));
         let undo_dir = gocode_tools::undo_dir(&paths.state_dir);
         let mut active_cancellation = None;
+        let mut active_personality = loaded_preferences.preferences.personality;
         let config_path = paths.config_dir.join("config.toml");
         let mut mcp_runtime = McpRuntime::bootstrap(&paths, &bootstrap.project).await;
         let mut tool_registry: Arc<ToolRegistry> = Arc::new(mcp_runtime.build_registry());
@@ -970,6 +983,7 @@ async fn run_application() -> Result<(), AppError> {
                         skills_summary: skills_summary.clone(),
                         tools_enabled,
                         reasoning_effort: reasoning_effort.clone(),
+                        personality: active_personality,
                         history: history_snapshot,
                     };
                     let event_tx = driver.event_tx.clone();
@@ -1032,6 +1046,10 @@ async fn run_application() -> Result<(), AppError> {
                         }
                     });
                 }
+                AppCommand::SetPreferences(updated) => {
+                    gocode_core::save_preferences(&preferences_path, &updated)?;
+                }
+                AppCommand::SetSessionPersonality(personality) => active_personality = personality,
                 AppCommand::CancelProviderRequest => {
                     if let Some(cancellation) = active_cancellation.take() {
                         cancellation.cancel();
