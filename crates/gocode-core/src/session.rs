@@ -59,12 +59,39 @@ impl SessionRecord {
         };
         self.summary = truncate_for_display(latest);
     }
+
+    /// Branches this session for `/fork`: an independent copy under a fresh id, carrying the
+    /// same history and summary forward, while this session's own saved file is untouched.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        let now = unix_now();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: format!("{} (fork)", self.name),
+            created_at_unix: now,
+            last_used_at_unix: now,
+            summary: self.summary.clone(),
+            history: self.history.clone(),
+        }
+    }
 }
 
 impl Default for SessionRecord {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// How the interface arrived at the current session, carried on [`crate::AppEvent::SessionSwitched`]
+/// so the transcript notice can name the right action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTransition {
+    /// `/new`: a brand-new, empty session.
+    New,
+    /// `/resume`: a previously saved session, reopened.
+    Resumed,
+    /// `/fork`: an independent copy of the session just left, carrying its history forward.
+    Forked,
 }
 
 /// Lightweight session metadata for the `/resume` picker, without the full history.
@@ -211,6 +238,20 @@ mod tests {
 
         assert_eq!(session.name, "first prompt");
         assert_eq!(session.summary, "second reply");
+    }
+
+    #[test]
+    fn forking_a_session_copies_its_history_under_a_new_id_and_leaves_the_original_alone() {
+        let mut original = SessionRecord::new();
+        original.record_turn("implement JWT auth", "Done, added the middleware.");
+
+        let fork = original.fork();
+
+        assert_ne!(fork.id, original.id);
+        assert_eq!(fork.name, "implement JWT auth (fork)");
+        assert_eq!(fork.summary, original.summary);
+        assert_eq!(fork.history, original.history);
+        assert_eq!(original.name, "implement JWT auth");
     }
 
     #[test]

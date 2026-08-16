@@ -10,7 +10,8 @@ pub use mcp_config::{
     load_or_default_mcp_config, merge_mcp_servers, save_mcp_config,
 };
 pub use session::{
-    SessionRecord, SessionSummary, list_sessions, load_session, save_session, sessions_dir,
+    SessionRecord, SessionSummary, SessionTransition, list_sessions, load_session, save_session,
+    sessions_dir,
 };
 
 /// Conservative trigger for automatic compaction: the provider's reported input-token count for
@@ -58,6 +59,9 @@ pub enum AppCommand {
     RequestSessionList,
     /// Switch to a previously saved session, replacing the current one.
     ResumeSession(String),
+    /// Branch the current session into a new one with the same history, leaving the current
+    /// session's saved file untouched.
+    ForkSession,
     /// Enable or disable a discovered skill by name for this project.
     SetSkillEnabled { name: String, enabled: bool },
     /// Connect a configured-but-not-yet-connected MCP server by name.
@@ -234,16 +238,17 @@ pub enum AppEvent {
     },
     /// Compaction could not be completed; the previous history is unchanged.
     ContextCompactionFailed(String),
-    /// The active session changed: a fresh one was started, or a saved one was resumed.
+    /// The active session changed: a fresh one was started, a saved one was resumed, or the
+    /// previous one was forked.
     SessionSwitched {
         /// The new current session's id.
         id: String,
         /// The new current session's display name.
         name: String,
-        /// `true` for a brand-new empty session, `false` when resuming a saved one.
-        is_new: bool,
-        /// The resumed session's messages, empty for a new session. The interface replays these
-        /// into the transcript so a resumed conversation looks the way you left it.
+        /// How the interface arrived at this session, to phrase the transcript notice.
+        transition: SessionTransition,
+        /// This session's messages, empty for a new session. The interface replays these into
+        /// the transcript so a resumed or forked conversation looks the way you left it.
         history: Vec<ChatMessage>,
     },
     /// The saved-session list finished loading, newest-used first.

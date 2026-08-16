@@ -551,7 +551,7 @@ async fn run_application() -> Result<(), AppError> {
             .send(gocode_core::AppEvent::SessionSwitched {
                 id: current_session.lock().await.id.clone(),
                 name: "New session".into(),
-                is_new: true,
+                transition: gocode_core::SessionTransition::New,
                 history: Vec::new(),
             })
             .await
@@ -942,7 +942,7 @@ async fn run_application() -> Result<(), AppError> {
                         .send(gocode_core::AppEvent::SessionSwitched {
                             id,
                             name: "New session".into(),
-                            is_new: true,
+                            transition: gocode_core::SessionTransition::New,
                             history: Vec::new(),
                         })
                         .await
@@ -986,7 +986,7 @@ async fn run_application() -> Result<(), AppError> {
                                 .send(gocode_core::AppEvent::SessionSwitched {
                                     id,
                                     name,
-                                    is_new: false,
+                                    transition: gocode_core::SessionTransition::Resumed,
                                     history,
                                 })
                                 .await
@@ -1010,6 +1010,34 @@ async fn run_application() -> Result<(), AppError> {
                                 })?;
                         }
                     }
+                }
+                AppCommand::ForkSession => {
+                    let (id, name, history) = {
+                        let mut session = current_session.lock().await;
+                        let _ = gocode_core::save_session(&sessions_dir, &session);
+                        let fork = session.fork();
+                        let _ = gocode_core::save_session(&sessions_dir, &fork);
+                        *session = fork;
+                        (
+                            session.id.clone(),
+                            session.name.clone(),
+                            session.history.clone(),
+                        )
+                    };
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::SessionSwitched {
+                            id,
+                            name,
+                            transition: gocode_core::SessionTransition::Forked,
+                            history,
+                        })
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not confirm the forked session: {error}"
+                            ))
+                        })?;
                 }
                 AppCommand::McpConnect(name) => {
                     if let Err(error) = mcp_runtime.connect(&name).await {

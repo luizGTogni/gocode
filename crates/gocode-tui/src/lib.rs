@@ -167,6 +167,8 @@ pub enum SlashCommand {
     NewSession,
     /// Open the saved-session picker.
     ResumeSession,
+    /// Branch this session into a new one with the same history, leaving this session untouched.
+    ForkSession,
     /// Open the command-reference popup.
     Help,
     /// Generate an `AGENTS.md` overview of the project by asking the agent to explore it.
@@ -302,6 +304,11 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "/resume",
         "Pick a previous session to continue",
         SlashCommand::ResumeSession,
+    ),
+    (
+        "/fork",
+        "Branch this conversation into a new session, leaving this one untouched",
+        SlashCommand::ForkSession,
     ),
     ("/help", "Show the command reference", SlashCommand::Help),
     (
@@ -678,7 +685,7 @@ impl AppState {
             AppEvent::SessionSwitched {
                 id,
                 name,
-                is_new,
+                transition,
                 history,
             } => {
                 self.current_session_id.clone_from(id);
@@ -702,7 +709,11 @@ impl AppState {
                         | ChatMessage::System(_) => {}
                     }
                 }
-                let verb = if *is_new { "Started" } else { "Resumed" };
+                let verb = match transition {
+                    gocode_core::SessionTransition::New => "Started",
+                    gocode_core::SessionTransition::Resumed => "Resumed",
+                    gocode_core::SessionTransition::Forked => "Forked",
+                };
                 self.entries
                     .push(ChatEntry::Info(format!("{verb} session: {name}")));
                 self.screen = Screen::Chat;
@@ -2673,6 +2684,9 @@ fn run_terminal(
                     state.screen = Screen::SessionPicker;
                     state.selected_session = 0;
                     send_command(&command_tx, AppCommand::RequestSessionList)?;
+                }
+                ChatSubmission::Command(SlashCommand::ForkSession) => {
+                    send_command(&command_tx, AppCommand::ForkSession)?;
                 }
                 ChatSubmission::Command(SlashCommand::Model) => {
                     state.screen = Screen::ModelPicker;
@@ -4686,7 +4700,7 @@ mod tests {
         state.apply(&AppEvent::SessionSwitched {
             id: "session-1".into(),
             name: "fix the login bug".into(),
-            is_new: false,
+            transition: gocode_core::SessionTransition::Resumed,
             history: vec![
                 ChatMessage::User("what broke login?".into()),
                 ChatMessage::assistant_text("A race condition in the token refresh."),
@@ -4707,13 +4721,34 @@ mod tests {
         state.apply(&AppEvent::SessionSwitched {
             id: "session-2".into(),
             name: "New session".into(),
-            is_new: true,
+            transition: gocode_core::SessionTransition::New,
             history: Vec::new(),
         });
         assert_eq!(state.entries.len(), 1);
         assert_eq!(
             state.entries[0],
             ChatEntry::Info("Started session: New session".into())
+        );
+    }
+
+    #[test]
+    fn forking_a_session_replays_its_history_and_announces_the_fork() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+
+        state.apply(&AppEvent::SessionSwitched {
+            id: "session-1-fork".into(),
+            name: "implement JWT auth (fork)".into(),
+            transition: gocode_core::SessionTransition::Forked,
+            history: vec![ChatMessage::User("implement JWT auth".into())],
+        });
+
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(
+            state.entries[1],
+            ChatEntry::Info("Forked session: implement JWT auth (fork)".into())
         );
     }
 
