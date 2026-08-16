@@ -33,9 +33,25 @@ pub enum Screen {
     Onboarding,
     /// Authenticated NVIDIA models waiting for a user selection.
     ModelPicker,
+    /// Menu to change the API key, model, or reasoning effort from the chat screen.
+    Settings,
+    /// Reasoning-effort level selection.
+    EffortPicker,
     /// Main conversational interface.
     Chat,
 }
+
+/// Reasoning-effort choices offered by the effort picker, paired with the provider value sent
+/// when selected (`None` omits the field entirely).
+const EFFORT_OPTIONS: &[(&str, Option<&str>)] = &[
+    ("None", None),
+    ("Low", Some("low")),
+    ("Medium", Some("medium")),
+    ("High", Some("high")),
+];
+
+/// Menu items shown on the settings screen, in display order.
+const SETTINGS_ITEMS: &[&str] = &["Change API key", "Change model", "Change reasoning effort"];
 
 /// One rendered fact in the chat transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +106,8 @@ pub struct UpdatePrompt {
 pub enum SlashCommand {
     /// Reopen the model picker.
     Model,
+    /// Open the settings menu to change the API key, model, or reasoning effort.
+    Settings,
     /// Show the active provider.
     Provider,
     /// Show the resolved model and provider.
@@ -105,6 +123,11 @@ pub enum SlashCommand {
 /// One recognized slash command: its typed form, description, and variant.
 const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
     ("/model", "Switch the active model", SlashCommand::Model),
+    (
+        "/settings",
+        "Change API key, model, or reasoning effort",
+        SlashCommand::Settings,
+    ),
     (
         "/provider",
         "Show the active provider",
@@ -158,6 +181,9 @@ pub struct AppState {
     models: Vec<String>,
     selected_model: usize,
     current_model: Option<String>,
+    settings_selected: usize,
+    selected_effort: usize,
+    current_effort: Option<String>,
     chat_input: String,
     entries: Vec<ChatEntry>,
     streaming_assistant: bool,
@@ -284,6 +310,14 @@ impl AppState {
                 self.last_submitted_prompt = None;
                 self.show_queued_update();
                 return self.queued.take();
+            }
+            AppEvent::ReasoningEffortChanged(effort) => {
+                self.current_effort.clone_from(effort);
+                self.screen = Screen::Chat;
+                let label = effort_label(effort.as_deref());
+                self.entries
+                    .push(ChatEntry::Info(format!("Reasoning effort set to: {label}")));
+                self.status = Some(format!("Reasoning effort: {label}"));
             }
         }
         None
@@ -548,6 +582,8 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ),
         Screen::Onboarding => render_onboarding(frame, state, area),
         Screen::ModelPicker => render_model_picker(frame, state, area),
+        Screen::Settings => render_settings(frame, state, area),
+        Screen::EffortPicker => render_effort_picker(frame, state, area),
         Screen::Chat => render_chat(frame, state, area),
     }
 }
@@ -597,6 +633,68 @@ fn render_model_picker(frame: &mut Frame, state: &AppState, area: Rect) {
         Paragraph::new(content).block(
             Block::default()
                 .title("Gocode · Select NVIDIA model")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
+    let model_label = state.current_model.as_deref().unwrap_or("none selected");
+    let effort_label = effort_label(state.current_effort.as_deref());
+    let content = SETTINGS_ITEMS
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let detail = match index {
+                1 => format!(" (current: {model_label})"),
+                2 => format!(" (current: {effort_label})"),
+                _ => String::new(),
+            };
+            let cursor = if index == state.settings_selected {
+                ">"
+            } else {
+                " "
+            };
+            format!("{cursor} {item}{detail}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.render_widget(
+        Paragraph::new(content).block(
+            Block::default()
+                .title("Gocode · Settings")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn effort_label(effort: Option<&str>) -> &'static str {
+    EFFORT_OPTIONS
+        .iter()
+        .find(|(_, value)| *value == effort)
+        .map_or("None", |(label, _)| *label)
+}
+
+fn render_effort_picker(frame: &mut Frame, state: &AppState, area: Rect) {
+    let content = EFFORT_OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, (label, _))| {
+            let cursor = if index == state.selected_effort {
+                ">"
+            } else {
+                " "
+            };
+            format!("{cursor} {label}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.render_widget(
+        Paragraph::new(content).block(
+            Block::default()
+                .title("Gocode · Reasoning effort")
                 .borders(Borders::ALL),
         ),
         area,
@@ -849,6 +947,15 @@ fn run_terminal(
             continue;
         }
 
+        if handle_settings_event(&mut state, &terminal_event) {
+            continue;
+        }
+
+        if let Some(effort) = handle_effort_picker_event(&mut state, &terminal_event) {
+            send_command(&command_tx, AppCommand::SetReasoningEffort(effort))?;
+            continue;
+        }
+
         if let Some(submission) = handle_chat_event(&mut state, &terminal_event) {
             match submission {
                 ChatSubmission::Prompt(text) => {
@@ -867,6 +974,10 @@ fn run_terminal(
                     state.screen = Screen::ModelPicker;
                     state.selected_model = 0;
                 }
+                ChatSubmission::Command(SlashCommand::Settings) => {
+                    state.screen = Screen::Settings;
+                    state.settings_selected = 0;
+                }
                 ChatSubmission::Command(SlashCommand::Provider) => {
                     state
                         .entries
@@ -877,13 +988,14 @@ fn run_terminal(
                         .current_model
                         .clone()
                         .unwrap_or_else(|| "none selected".into());
+                    let effort = effort_label(state.current_effort.as_deref());
                     state.entries.push(ChatEntry::Info(format!(
-                        "Provider: NVIDIA NIM · Model: {model}"
+                        "Provider: NVIDIA NIM · Model: {model} · Reasoning effort: {effort}"
                     )));
                 }
                 ChatSubmission::Command(SlashCommand::Help) => {
                     state.entries.push(ChatEntry::Info(
-                        "Commands: /model /provider /config /clear /help /exit".into(),
+                        "Commands: /model /settings /provider /config /clear /help /exit".into(),
                     ));
                 }
             }
@@ -1017,6 +1129,88 @@ pub fn handle_model_picker_event(state: &mut AppState, event: &Event) -> Option<
             state.selected_model = (state.selected_model + 1).min(state.models.len() - 1);
         }
         KeyCode::Enter => return state.selected_model(),
+        _ => {}
+    }
+    None
+}
+
+/// Applies navigation and selection keys to the settings menu.
+///
+/// Returns `true` when the event was handled (whether or not it changed anything), so the
+/// caller can skip further dispatch.
+pub fn handle_settings_event(state: &mut AppState, event: &Event) -> bool {
+    if state.screen != Screen::Settings {
+        return false;
+    }
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return false;
+    };
+
+    match code {
+        KeyCode::Up => state.settings_selected = state.settings_selected.saturating_sub(1),
+        KeyCode::Down => {
+            state.settings_selected = (state.settings_selected + 1).min(SETTINGS_ITEMS.len() - 1);
+        }
+        KeyCode::Enter => match state.settings_selected {
+            0 => {
+                state.screen = Screen::Onboarding;
+                state.credential_input.clear();
+                state.status = None;
+            }
+            1 => {
+                state.screen = Screen::ModelPicker;
+                state.selected_model = state
+                    .models
+                    .iter()
+                    .position(|model| Some(model) == state.current_model.as_ref())
+                    .unwrap_or(0);
+            }
+            _ => {
+                state.screen = Screen::EffortPicker;
+                state.selected_effort = EFFORT_OPTIONS
+                    .iter()
+                    .position(|(_, value)| *value == state.current_effort.as_deref())
+                    .unwrap_or(0);
+            }
+        },
+        KeyCode::Esc => state.screen = Screen::Chat,
+        _ => {}
+    }
+    true
+}
+
+/// Applies navigation and confirmation keys to the reasoning-effort picker.
+///
+/// Returns the selected provider value on confirmation (`None` clears the effort level).
+#[must_use]
+pub fn handle_effort_picker_event(state: &mut AppState, event: &Event) -> Option<Option<String>> {
+    if state.screen != Screen::EffortPicker {
+        return None;
+    }
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+
+    match code {
+        KeyCode::Up => state.selected_effort = state.selected_effort.saturating_sub(1),
+        KeyCode::Down => {
+            state.selected_effort = (state.selected_effort + 1).min(EFFORT_OPTIONS.len() - 1);
+        }
+        KeyCode::Enter => {
+            let (_, value) = EFFORT_OPTIONS[state.selected_effort];
+            return Some(value.map(str::to_string));
+        }
+        KeyCode::Esc => state.screen = Screen::Chat,
         _ => {}
     }
     None
@@ -1641,6 +1835,33 @@ mod tests {
             .expect("screen should render");
 
         assert!(buffer_text(&terminal).contains("thinking"));
+    }
+
+    #[test]
+    fn settings_menu_navigates_to_the_effort_picker_and_confirms_a_selection() {
+        use super::{handle_effort_picker_event, handle_settings_event};
+
+        let mut state = AppState {
+            screen: Screen::Settings,
+            ..AppState::default()
+        };
+
+        assert!(handle_settings_event(&mut state, &press(KeyCode::Down)));
+        assert_eq!(state.settings_selected, 1);
+        assert!(handle_settings_event(&mut state, &press(KeyCode::Down)));
+        assert_eq!(state.settings_selected, 2);
+        assert!(handle_settings_event(&mut state, &press(KeyCode::Enter)));
+        assert_eq!(state.screen, Screen::EffortPicker);
+
+        assert_eq!(
+            handle_effort_picker_event(&mut state, &press(KeyCode::Down)),
+            None
+        );
+        assert_eq!(state.selected_effort, 1);
+        assert_eq!(
+            handle_effort_picker_event(&mut state, &press(KeyCode::Enter)),
+            Some(Some("low".into()))
+        );
     }
 
     #[test]

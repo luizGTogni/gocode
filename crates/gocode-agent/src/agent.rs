@@ -37,6 +37,8 @@ pub struct AgentRequest {
     /// The Agent does not resolve model capabilities itself; the caller gates this using
     /// `gocode_core::ModelCapabilities` before starting the run (`docs/AGENT.md` §109).
     pub tools_enabled: bool,
+    /// User-selected reasoning-effort level, forwarded to the provider request as-is.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Long-lived collaborators an [`Agent`] uses to drive every run.
@@ -231,6 +233,7 @@ impl Agent {
             request.instructions.as_deref(),
             history,
             tool_defs.to_vec(),
+            request.reasoning_effort.clone(),
         );
 
         let mut stream = self

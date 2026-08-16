@@ -29,6 +29,7 @@ pub(crate) fn build_request(
     project_instructions: Option<&str>,
     history: &[ChatMessage],
     tools: Vec<ToolDefinition>,
+    reasoning_effort: Option<String>,
 ) -> ChatRequest {
     let mut messages = vec![ChatMessage::System(SYSTEM_PROMPT.to_string())];
 
@@ -45,6 +46,7 @@ pub(crate) fn build_request(
         model,
         messages,
         tools,
+        reasoning_effort,
     }
 }
 
@@ -62,6 +64,7 @@ mod tests {
             Some("Always run cargo fmt."),
             &history,
             Vec::new(),
+            None,
         );
 
         assert!(matches!(&request.messages[0], ChatMessage::System(_)));
@@ -74,7 +77,7 @@ mod tests {
 
     #[test]
     fn omits_blank_project_instructions() {
-        let request = build_request(ModelId::new("model"), Some("   "), &[], Vec::new());
+        let request = build_request(ModelId::new("model"), Some("   "), &[], Vec::new(), None);
 
         assert_eq!(request.messages.len(), 1);
     }

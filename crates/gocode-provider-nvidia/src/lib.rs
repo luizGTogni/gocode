@@ -260,6 +260,10 @@ pub fn build_chat_body(request: &ChatRequest) -> serde_json::Value {
         );
     }
 
+    if let Some(effort) = &request.reasoning_effort {
+        body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+    }
+
     body
 }
 

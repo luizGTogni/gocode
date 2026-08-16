@@ -19,6 +19,8 @@ pub enum AppCommand {
     AcceptUpdate,
     /// Dismiss this startup's update prompt without changing the installation.
     RejectUpdate,
+    /// Set the reasoning-effort level sent with future chat requests, or clear it.
+    SetReasoningEffort(Option<String>),
 }
 
 /// Fact emitted by the application runtime and rendered by an interface.
@@ -103,6 +105,8 @@ pub enum AppEvent {
     },
     /// The agent run was cancelled by the user.
     AgentCancelled,
+    /// The active reasoning-effort level changed.
+    ReasoningEffortChanged(Option<String>),
 }
 
 /// Coarse lifecycle phase of an active agent run, for a concise status indicator.
@@ -1462,6 +1466,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     /// Tool definitions offered to the model, empty when tools are not applicable.
     pub tools: Vec<ToolDefinition>,
+    /// User-selected reasoning-effort level, sent as-is to the provider when present.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Cooperative cancellation signal shared by one provider operation and its caller.
@@ -1516,6 +1522,7 @@ impl ChatRequest {
             model: ModelId::new(model),
             messages: vec![ChatMessage::User(message.into())],
             tools: Vec::new(),
+            reasoning_effort: None,
         }
     }
 }

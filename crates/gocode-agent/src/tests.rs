@@ -70,6 +70,7 @@ fn request(project_root: &Path, prompt: &str) -> AgentRequest {
         project_root: project_root.to_path_buf(),
         instructions: None,
         tools_enabled: true,
+        reasoning_effort: None,
     }
 }
 

@@ -217,6 +217,7 @@ async fn run_application() -> Result<(), AppError> {
         let mut provider = None;
         let mut selected_model = None;
         let mut model_catalog: Vec<gocode_core::Model> = Vec::new();
+        let mut reasoning_effort: Option<String> = None;
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
         let tool_registry: Arc<ToolRegistry> = Arc::new(builtin_registry());
@@ -224,25 +225,50 @@ async fn run_application() -> Result<(), AppError> {
         let instructions =
             std::fs::read_to_string(bootstrap.project.gocode_dir.join("instructions.md")).ok();
 
-        if let Some(key) = environment_credential {
-            let candidate = NvidiaProvider::hosted(SecretString::new(key));
+        let stored_credential = environment_credential
+            .map(SecretString::new)
+            .or_else(|| credential_store.get_nvidia().ok().flatten());
+
+        if let Some(secret) = stored_credential {
+            let candidate = NvidiaProvider::hosted(secret);
             match candidate.list_models().await {
                 Ok(models) => {
-                    let model_ids = models
+                    let model_ids: Vec<String> = models
                         .iter()
                         .map(|model| model.id.as_str().into())
                         .collect();
                     model_catalog = models;
                     provider = Some(candidate);
-                    driver
-                        .event_tx
-                        .send(gocode_core::AppEvent::ModelsAvailable(model_ids))
-                        .await
-                        .map_err(|error| {
-                            AppError::Initialization(format!(
-                                "could not send discovered models: {error}"
-                            ))
-                        })?;
+
+                    let remembered_model = bootstrap
+                        .resolved_config
+                        .model
+                        .as_deref()
+                        .filter(|model| model_ids.iter().any(|id| id == model))
+                        .map(str::to_string);
+
+                    if let Some(model) = remembered_model {
+                        selected_model = Some(model.clone());
+                        driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::ModelSelected(model))
+                            .await
+                            .map_err(|error| {
+                                AppError::Initialization(format!(
+                                    "could not confirm remembered model: {error}"
+                                ))
+                            })?;
+                    } else {
+                        driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::ModelsAvailable(model_ids))
+                            .await
+                            .map_err(|error| {
+                                AppError::Initialization(format!(
+                                    "could not send discovered models: {error}"
+                                ))
+                            })?;
+                    }
                 }
                 Err(error) => driver
                     .event_tx
@@ -383,6 +409,7 @@ async fn run_application() -> Result<(), AppError> {
                         project_root: bootstrap.project.root.clone(),
                         instructions: instructions.clone(),
                         tools_enabled,
+                        reasoning_effort: reasoning_effort.clone(),
                     };
                     let event_tx = driver.event_tx.clone();
                     let (agent_events_tx, agent_events_rx) = mpsc::channel(64);
@@ -433,6 +460,18 @@ async fn run_application() -> Result<(), AppError> {
                 }
                 AppCommand::RejectUpdate => {
                     tracing::info!("update declined for this startup");
+                }
+                AppCommand::SetReasoningEffort(effort) => {
+                    reasoning_effort = effort.clone();
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::ReasoningEffortChanged(effort))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not confirm reasoning-effort selection: {error}"
+                            ))
+                        })?;
                 }
                 AppCommand::AcceptUpdate => {
                     match prepare_windows_update(&paths.cache_dir, driver.event_tx.clone()).await {
