@@ -2,10 +2,10 @@
 
 use crossterm::event;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use gocode_core::{AgentActivityState, AppCommand, AppEvent, ToolActivityStatus};
+use gocode_core::{AgentActivityState, AppCommand, AppEvent, PermissionMode, ToolActivityStatus};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
@@ -14,7 +14,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const SCROLL_STEP: usize = 5;
@@ -56,6 +56,15 @@ const SETTINGS_ITEMS: &[&str] = &["Change API key", "Change model", "Change reas
 
 /// Highlight color for the currently selected slash-command suggestion (reddish pink).
 const SUGGESTION_HIGHLIGHT_COLOR: Color = Color::Rgb(255, 92, 130);
+
+/// Highlight color for a mouse-selected range of transcript text (a weak/soft blue).
+const SELECTION_COLOR: Color = Color::Rgb(120, 170, 230);
+
+/// How long a second Ctrl+C must arrive after the first for the app to actually exit.
+const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_millis(600);
+
+/// How long the "Copied N chars to clipboard" notification stays visible.
+const COPY_NOTIFICATION_DURATION: Duration = Duration::from_secs(2);
 
 /// One rendered fact in the chat transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +200,9 @@ pub struct AppState {
     current_effort: Option<String>,
     chat_input: String,
     suggestion_selected: usize,
+    permission_mode: PermissionMode,
+    selection: Option<Selection>,
+    copy_notification: Option<String>,
     entries: Vec<ChatEntry>,
     streaming_assistant: bool,
     file_change_buffer: Vec<String>,
@@ -317,13 +329,15 @@ impl AppState {
                 self.show_queued_update();
                 return self.queued.take();
             }
-            AppEvent::ReasoningEffortChanged(effort) => {
+            AppEvent::ReasoningEffortChanged { effort, announce } => {
                 self.current_effort.clone_from(effort);
-                self.screen = Screen::Chat;
-                let label = effort_label(effort.as_deref());
-                self.entries
-                    .push(ChatEntry::Info(format!("Reasoning effort set to: {label}")));
-                self.status = Some(format!("Reasoning effort: {label}"));
+                if *announce {
+                    self.screen = Screen::Chat;
+                    let label = effort_label(effort.as_deref());
+                    self.entries
+                        .push(ChatEntry::Info(format!("Reasoning effort set to: {label}")));
+                    self.status = Some(format!("Reasoning effort: {label}"));
+                }
             }
         }
         None
@@ -481,17 +495,49 @@ impl AppState {
     }
 }
 
+/// Gocode's version, taken from the workspace-wide package version so it always matches the
+/// running binary.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// ASCII banner: a blocky "GOCODE" wordmark. Scrolls up into history with the rest of the
+/// transcript rather than staying pinned to the top of the viewport.
+const GOCODE_BANNER: &[&str] = &[
+    "█████ █████ █████ █████ ████  █████",
+    "█     █   █ █     █   █ █   █ █    ",
+    "█  ██ █   █ █     █   █ █   █ ████ ",
+    "█   █ █   █ █     █   █ █   █ █    ",
+    "█████ █████ █████ █████ ████  █████",
+];
+
+/// Builds the scrolling banner: ASCII art, version, active model, and working directory.
+fn banner_lines(state: &AppState) -> Vec<String> {
+    let mut lines: Vec<String> = GOCODE_BANNER
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+    lines.push(String::new());
+    let model = state.current_model.as_deref().unwrap_or("no model selected");
+    lines.push(format!("Gocode v{VERSION} · {model} · NVIDIA NIM"));
+    if let Ok(cwd) = std::env::current_dir() {
+        lines.push(cwd.display().to_string());
+    }
+    lines.push(String::new());
+    lines
+}
+
 fn compose_lines(state: &AppState) -> Vec<String> {
+    let mut lines = banner_lines(state);
+
     if state.entries.is_empty() {
-        return vec![
-            "What can I help you build?".into(),
-            String::new(),
+        lines.push("What can I help you build?".into());
+        lines.push(String::new());
+        lines.push(
             "Prompts and the project context you share are sent to NVIDIA NIM for inference."
                 .into(),
-        ];
+        );
+        return lines;
     }
 
-    let mut lines = Vec::new();
     for entry in &state.entries {
         match entry {
             ChatEntry::User(text) => push_wrapped(&mut lines, "You: ", text),
@@ -711,20 +757,35 @@ fn render_effort_picker(frame: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
-fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
+/// Splits the chat screen into its history and composer areas. Shared by rendering and mouse
+/// hit-testing so both agree exactly on where the history viewport sits.
+fn chat_layout(area: Rect, state: &AppState) -> (Rect, Rect) {
     let suggestions = slash_suggestions(&state.chat_input);
     let input_lines = 1 + state.chat_input.matches('\n').count();
     let suggestion_lines = suggestions.len().min(4);
-    let compose_height = u16::try_from(input_lines + suggestion_lines + 2).unwrap_or(u16::MAX);
+    let status_lines = usize::from(state.status.is_some());
+    // +1 for the permission-mode line always shown below the composer, +2 for the block borders.
+    let compose_height =
+        u16::try_from(input_lines + suggestion_lines + status_lines + 1 + 2).unwrap_or(u16::MAX);
     let compose_height = compose_height.min(area.height.saturating_sub(3)).max(3);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(compose_height)])
         .split(area);
+    (layout[0], layout[1])
+}
 
-    render_history(frame, state, layout[0]);
-    render_composer(frame, state, layout[1], &suggestions);
+fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
+    let suggestions = slash_suggestions(&state.chat_input);
+    let (history_area, composer_area) = chat_layout(area, state);
+
+    render_history(frame, state, history_area);
+    render_composer(frame, state, composer_area, &suggestions);
+
+    if let Some(message) = &state.copy_notification {
+        render_copy_notification(frame, message, composer_area);
+    }
 
     if let Some(prompt) = &state.pending_permission {
         render_permission_modal(frame, prompt, area);
@@ -733,6 +794,31 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
     } else if let Some(message) = &state.blocking_error {
         render_blocking_error_modal(frame, message, area);
     }
+}
+
+fn render_copy_notification(frame: &mut Frame, message: &str, composer_area: Rect) {
+    if composer_area.y == 0 {
+        return;
+    }
+    let width = u16::try_from(message.chars().count())
+        .unwrap_or(u16::MAX)
+        .min(composer_area.width);
+    let notification_area = Rect {
+        x: composer_area.x + composer_area.width.saturating_sub(width),
+        y: composer_area.y - 1,
+        width,
+        height: 1,
+    };
+    frame.render_widget(Clear, notification_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            message.to_string(),
+            Style::default()
+                .fg(SELECTION_COLOR)
+                .add_modifier(Modifier::BOLD),
+        )),
+        notification_area,
+    );
 }
 
 fn render_update_modal(frame: &mut Frame, prompt: &UpdatePrompt, area: Rect) {
@@ -754,14 +840,39 @@ fn render_update_modal(frame: &mut Frame, prompt: &UpdatePrompt, area: Rect) {
 }
 
 fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
-    let lines = compose_lines(state);
+    let content_width = usize::from(area.width.saturating_sub(2));
+    let wrapped = wrap_lines(&compose_lines(state), content_width);
     let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible_rows);
-    let scroll = state.scroll.min(max_scroll);
-    let end = total.saturating_sub(scroll);
-    let start = end.saturating_sub(visible_rows);
-    let visible = lines[start..end].join("\n");
+    let (start, end) = compute_visible_window(wrapped.len(), visible_rows, state.scroll);
+
+    let rendered_lines: Vec<Line> = wrapped[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            let absolute_index = start + offset;
+            let chars: Vec<char> = line.chars().collect();
+            let selected_range = state
+                .selection
+                .as_ref()
+                .and_then(|selection| selected_char_range(selection, absolute_index, chars.len()));
+            match selected_range {
+                Some((from, to)) => {
+                    let before: String = chars[..from].iter().collect();
+                    let marked: String = chars[from..to].iter().collect();
+                    let after: String = chars[to..].iter().collect();
+                    Line::from(vec![
+                        Span::raw(before),
+                        Span::styled(
+                            marked,
+                            Style::default().bg(SELECTION_COLOR).fg(Color::Black),
+                        ),
+                        Span::raw(after),
+                    ])
+                }
+                None => Line::from(line.clone()),
+            }
+        })
+        .collect();
 
     let title = if state.is_scroll_locked() {
         "Gocode · Chat"
@@ -769,11 +880,91 @@ fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
         "Gocode · Chat (scrolled — End to follow)"
     };
     frame.render_widget(
-        Paragraph::new(visible)
-            .wrap(Wrap { trim: false })
+        Paragraph::new(Text::from(rendered_lines))
             .block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
+}
+
+/// Word-wraps every logical line to `width` columns so the resulting rows match 1:1 what gets
+/// drawn to the terminal — the same rows are then used for mouse-selection hit-testing, so
+/// rendering and hit-testing can never disagree about where a character lands.
+fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+        let mut start = 0usize;
+        while start < chars.len() {
+            let mut end = (start + width).min(chars.len());
+            if end < chars.len()
+                && let Some(break_at) = chars[start..end].iter().rposition(|c| *c == ' ')
+                && break_at > 0
+            {
+                end = start + break_at + 1;
+            }
+            let segment: String = chars[start..end].iter().collect();
+            wrapped.push(segment.trim_end_matches(' ').to_string());
+            start = end;
+            if start < chars.len() && chars[start] == ' ' {
+                start += 1;
+            }
+        }
+    }
+    wrapped
+}
+
+/// Computes the `[start, end)` slice of wrapped lines currently visible, given the scroll offset
+/// from the bottom. Shared by rendering and mouse hit-testing.
+fn compute_visible_window(total: usize, visible_rows: usize, scroll: usize) -> (usize, usize) {
+    let visible_rows = visible_rows.max(1);
+    let max_scroll = total.saturating_sub(visible_rows);
+    let scroll = scroll.min(max_scroll);
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(visible_rows);
+    (start, end)
+}
+
+/// One endpoint of a mouse selection: an absolute index into the full wrapped-lines vector, and
+/// a character column within that line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SelectionPoint {
+    line: usize,
+    col: usize,
+}
+
+/// A mouse text selection, anchored where the drag started and extended to the current cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    anchor: SelectionPoint,
+    cursor: SelectionPoint,
+}
+
+impl Selection {
+    /// Returns the two endpoints in document order, regardless of drag direction.
+    fn normalized(self) -> (SelectionPoint, SelectionPoint) {
+        if (self.anchor.line, self.anchor.col) <= (self.cursor.line, self.cursor.col) {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+}
+
+/// The character range selected on one wrapped line, if any: the full line for lines strictly
+/// between the two endpoints, and a partial range on the endpoint lines themselves.
+fn selected_char_range(selection: &Selection, line_index: usize, line_len: usize) -> Option<(usize, usize)> {
+    let (start, end) = selection.normalized();
+    if line_index < start.line || line_index > end.line {
+        return None;
+    }
+    let from = if line_index == start.line { start.col.min(line_len) } else { 0 };
+    let to = if line_index == end.line { end.col.min(line_len) } else { line_len };
+    (from < to).then_some((from, to))
 }
 
 fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions: &[(&str, &str)]) {
@@ -798,12 +989,27 @@ fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions:
     if let Some(status) = &state.status {
         lines.push(Line::from(status.clone()));
     }
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} mode on (shift+tab or F2 to cycle)",
+            state.permission_mode.label()
+        ),
+        Style::default().fg(permission_mode_color(state.permission_mode)),
+    )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+fn permission_mode_color(mode: PermissionMode) -> Color {
+    match mode {
+        PermissionMode::Auto => Color::Rgb(120, 200, 120),
+        PermissionMode::Plan => Color::Rgb(120, 170, 255),
+        PermissionMode::Approve => Color::Rgb(255, 170, 90),
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -906,9 +1112,11 @@ fn run_terminal(
     command_tx: mpsc::Sender<AppCommand>,
 ) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     let _terminal_guard = TerminalGuard;
     let mut state = AppState::default();
+    let mut last_ctrl_c: Option<Instant> = None;
+    let mut copy_notification_deadline: Option<Instant> = None;
 
     let send_command = |command_tx: &mpsc::Sender<AppCommand>, command: AppCommand| {
         command_tx.blocking_send(command).map_err(|error| {
@@ -920,6 +1128,11 @@ fn run_terminal(
     };
 
     loop {
+        if copy_notification_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            state.copy_notification = None;
+            copy_notification_deadline = None;
+        }
+
         terminal
             .draw(|frame| render(frame, &state))
             .map_err(std::io::Error::other)?;
@@ -942,6 +1155,42 @@ fn run_terminal(
         let terminal_event = event::read()?;
         if let Event::Resize(columns, rows) = terminal_event {
             send_command(&command_tx, AppCommand::Resize { columns, rows })?;
+        }
+
+        if let Event::Mouse(mouse_event) = &terminal_event {
+            let terminal_area: Rect = terminal.size().map_err(std::io::Error::other)?.into();
+            let handled = handle_mouse_event(&mut state, mouse_event, terminal_area);
+            if handled && matches!(mouse_event.kind, MouseEventKind::Up(MouseButton::Left)) {
+                try_copy_selection(&mut state, terminal_area, &mut copy_notification_deadline);
+            }
+            if handled {
+                continue;
+            }
+        }
+
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers,
+            kind: KeyEventKind::Press,
+            ..
+        }) = &terminal_event
+            && modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if state.selection.is_some() {
+                let terminal_area: Rect = terminal.size().map_err(std::io::Error::other)?.into();
+                try_copy_selection(&mut state, terminal_area, &mut copy_notification_deadline);
+                continue;
+            }
+            let now = Instant::now();
+            let should_exit = last_ctrl_c
+                .is_some_and(|previous| now.duration_since(previous) < DOUBLE_CTRL_C_WINDOW);
+            if should_exit {
+                send_command(&command_tx, AppCommand::Exit)?;
+                return Ok(());
+            }
+            last_ctrl_c = Some(now);
+            state.status = Some("Press Ctrl+C again to exit.".into());
+            continue;
         }
 
         if let Some(approved) = handle_permission_event(&mut state, &terminal_event) {
@@ -977,6 +1226,11 @@ fn run_terminal(
 
         if let Some(effort) = handle_effort_picker_event(&mut state, &terminal_event) {
             send_command(&command_tx, AppCommand::SetReasoningEffort(effort))?;
+            continue;
+        }
+
+        if let Some(mode) = handle_permission_mode_event(&mut state, &terminal_event) {
+            send_command(&command_tx, AppCommand::SetPermissionMode(mode))?;
             continue;
         }
 
@@ -1057,7 +1311,11 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         ratatui::restore();
     }
 }
@@ -1069,7 +1327,11 @@ pub fn install_panic_hook() {
     let previous_hook = std::panic::take_hook();
 
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         ratatui::restore();
         previous_hook(panic_info);
     }));
@@ -1247,6 +1509,164 @@ pub fn handle_effort_picker_event(state: &mut AppState, event: &Event) -> Option
     None
 }
 
+/// Cycles the permission mode (Auto → Plan → Approve → Auto) on Shift+Tab from the chat
+/// composer, returning the newly selected mode.
+///
+/// Handled ahead of [`handle_chat_event`] so a Shift+Tab keypress never falls through to plain
+/// Tab's autocomplete behavior.
+#[must_use]
+pub fn handle_permission_mode_event(state: &mut AppState, event: &Event) -> Option<PermissionMode> {
+    if state.screen != Screen::Chat
+        || state.blocking_error.is_some()
+        || state.pending_permission.is_some()
+        || state.pending_update.is_some()
+    {
+        return None;
+    }
+    let Event::Key(KeyEvent {
+        code,
+        modifiers,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+
+    // F2 is a fallback: some terminals/IDE panels intercept Shift+Tab for their own tab
+    // navigation before it ever reaches this app.
+    let is_cycle_key = matches!(code, KeyCode::BackTab | KeyCode::F(2))
+        || (*code == KeyCode::Tab && modifiers.contains(KeyModifiers::SHIFT));
+    if !is_cycle_key {
+        return None;
+    }
+
+    state.permission_mode = state.permission_mode.cycle();
+    Some(state.permission_mode)
+}
+
+/// Maps absolute terminal coordinates to a point in the wrapped-history coordinate space, or
+/// `None` when the coordinates fall outside the history viewport (its border included).
+fn point_from_terminal_coords(
+    state: &AppState,
+    terminal_area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<SelectionPoint> {
+    let (history_area, _) = chat_layout(terminal_area, state);
+    if column <= history_area.x
+        || column >= history_area.x + history_area.width.saturating_sub(1)
+        || row <= history_area.y
+        || row >= history_area.y + history_area.height.saturating_sub(1)
+    {
+        return None;
+    }
+
+    let local_col = usize::from(column - history_area.x - 1);
+    let local_row = usize::from(row - history_area.y - 1);
+
+    let content_width = usize::from(history_area.width.saturating_sub(2));
+    let wrapped = wrap_lines(&compose_lines(state), content_width);
+    let visible_rows = usize::from(history_area.height.saturating_sub(2)).max(1);
+    let (start, _end) = compute_visible_window(wrapped.len(), visible_rows, state.scroll);
+
+    let absolute_line = start + local_row;
+    let line_len = wrapped.get(absolute_line)?.chars().count();
+    Some(SelectionPoint {
+        line: absolute_line,
+        col: local_col.min(line_len),
+    })
+}
+
+/// Applies a mouse event to the transcript's text selection.
+///
+/// Returns `true` when the event was consumed by selection handling — a left-button press,
+/// drag, or release inside the chat screen.
+pub fn handle_mouse_event(state: &mut AppState, event: &MouseEvent, terminal_area: Rect) -> bool {
+    if state.screen != Screen::Chat {
+        return false;
+    }
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            state.selection = point_from_terminal_coords(state, terminal_area, event.column, event.row)
+                .map(|point| Selection {
+                    anchor: point,
+                    cursor: point,
+                });
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(point) = point_from_terminal_coords(state, terminal_area, event.column, event.row)
+                && let Some(selection) = state.selection.as_mut()
+            {
+                selection.cursor = point;
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => true,
+        MouseEventKind::Down(MouseButton::Right) => {
+            let (_, composer_area) = chat_layout(terminal_area, state);
+            if is_within(composer_area, event.column, event.row)
+                && let Ok(mut clipboard) = arboard::Clipboard::new()
+                && let Ok(text) = clipboard.get_text()
+            {
+                state.chat_input.push_str(&text);
+                state.suggestion_selected = 0;
+            }
+            true
+        }
+        MouseEventKind::ScrollUp => {
+            state.scroll_up();
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            state.scroll_down();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn is_within(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.x + area.width && row >= area.y && row < area.y + area.height
+}
+
+/// Extracts the currently selected transcript text, joined with newlines, or `None` when there
+/// is no selection or it is empty.
+fn extract_selected_text(state: &AppState, terminal_area: Rect) -> Option<String> {
+    let selection = state.selection?;
+    let (history_area, _) = chat_layout(terminal_area, state);
+    let content_width = usize::from(history_area.width.saturating_sub(2));
+    let wrapped = wrap_lines(&compose_lines(state), content_width);
+    let (start, end) = selection.normalized();
+
+    let mut collected = Vec::new();
+    for (line_index, line) in wrapped.iter().enumerate().take(end.line + 1).skip(start.line) {
+        let chars: Vec<char> = line.chars().collect();
+        if let Some((from, to)) = selected_char_range(&selection, line_index, chars.len()) {
+            collected.push(chars[from..to].iter().collect::<String>());
+        }
+    }
+    let text = collected.join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// Copies the active selection to the system clipboard and shows a transient confirmation.
+///
+/// Silently does nothing when there is no selection, or the clipboard cannot be reached (a
+/// missing clipboard service should not crash the interface).
+fn try_copy_selection(state: &mut AppState, terminal_area: Rect, notification_deadline: &mut Option<Instant>) {
+    let Some(text) = extract_selected_text(state, terminal_area) else {
+        return;
+    };
+    let char_count = text.chars().count();
+    let copied = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text));
+    if copied.is_ok() {
+        state.copy_notification = Some(format!("Copied {char_count} chars to clipboard"));
+        *notification_deadline = Some(Instant::now() + COPY_NOTIFICATION_DURATION);
+    }
+}
+
 /// Applies Y/N confirmation keys to a pending permission prompt.
 ///
 /// Returns `Some(true)` on approval, `Some(false)` on denial, clearing the prompt either way.
@@ -1351,7 +1771,10 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         KeyCode::PageUp => state.scroll_up(),
         KeyCode::PageDown | KeyCode::End => state.scroll_down(),
         KeyCode::Tab => state.autocomplete(),
-        KeyCode::Enter if modifiers.contains(KeyModifiers::ALT) => {
+        KeyCode::Enter if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
+            state.chat_input.push('\n');
+        }
+        KeyCode::Char('j' | 'J') if modifiers.contains(KeyModifiers::CONTROL) => {
             state.chat_input.push('\n');
         }
         KeyCode::Char(character)
@@ -1393,9 +1816,12 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
     use gocode_core::{AgentActivityState, AppEvent, ErrorSeverity, ToolActivityStatus};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
         AppState, ChatEntry, ChatSubmission, InputAction, Screen, SlashCommand, classify_event,
@@ -1438,6 +1864,26 @@ mod tests {
 
         state.apply(&AppEvent::BootCompleted);
         assert_eq!(state.screen, Screen::Chat);
+    }
+
+    #[test]
+    fn restoring_the_saved_reasoning_effort_at_boot_does_not_spam_the_transcript() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+
+        state.apply(&AppEvent::ReasoningEffortChanged {
+            effort: Some("high".into()),
+            announce: false,
+        });
+        assert!(state.entries.is_empty());
+
+        state.apply(&AppEvent::ReasoningEffortChanged {
+            effort: Some("low".into()),
+            announce: true,
+        });
+        assert_eq!(state.entries.len(), 1);
     }
 
     #[test]
@@ -1488,6 +1934,68 @@ mod tests {
         let content = buffer_text(&terminal);
         assert!(content.contains("What can I help you build?"));
         assert!(content.contains("sent to NVIDIA NIM"));
+    }
+
+    #[test]
+    fn the_ascii_banner_scrolls_with_history_instead_of_staying_pinned() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        let empty_lines = super::compose_lines(&state);
+        assert!(empty_lines.iter().any(|line| line.contains("GOCODE") || line.contains('█')));
+
+        state.begin_run("hello".into());
+        let busy_lines = super::compose_lines(&state);
+        assert!(busy_lines.iter().any(|line| line.contains('█')));
+        assert!(busy_lines.iter().any(|line| line.contains("You: hello")));
+    }
+
+    #[test]
+    fn the_permission_mode_line_is_visible_even_with_a_status_line_shown() {
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 20)).expect("terminal should initialize");
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::ModelSelected("nvidia/model".into()));
+
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("screen should render");
+
+        assert!(buffer_text(&terminal).contains("auto mode on"));
+    }
+
+    #[test]
+    fn shift_tab_cycles_the_permission_mode_through_auto_plan_approve() {
+        use gocode_core::PermissionMode;
+
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        assert_eq!(state.permission_mode, PermissionMode::Auto);
+
+        let back_tab = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::BackTab,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+
+        assert_eq!(
+            super::handle_permission_mode_event(&mut state, &back_tab),
+            Some(PermissionMode::Plan)
+        );
+        assert_eq!(
+            super::handle_permission_mode_event(&mut state, &back_tab),
+            Some(PermissionMode::Approve)
+        );
+        assert_eq!(
+            super::handle_permission_mode_event(&mut state, &back_tab),
+            Some(PermissionMode::Auto)
+        );
     }
 
     #[test]
@@ -2015,5 +2523,145 @@ mod tests {
             None
         );
         assert_eq!(state.chat_input, "multi\nline");
+    }
+
+    #[test]
+    fn shift_enter_and_ctrl_j_insert_a_newline_without_submitting() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+
+        let shift_enter = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(handle_chat_event(&mut state, &shift_enter), None);
+        assert_eq!(state.chat_input, "\n");
+
+        let ctrl_j = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(handle_chat_event(&mut state, &ctrl_j), None);
+        assert_eq!(state.chat_input, "\n\n");
+    }
+
+    #[test]
+    fn wrap_lines_breaks_long_lines_at_a_word_boundary() {
+        let lines = vec!["the quick brown fox jumps".to_string()];
+        let wrapped = super::wrap_lines(&lines, 10);
+
+        assert_eq!(wrapped, vec!["the quick", "brown fox", "jumps"]);
+    }
+
+    #[test]
+    fn wrap_lines_preserves_blank_lines() {
+        let lines = vec![String::new(), "hi".to_string()];
+        assert_eq!(super::wrap_lines(&lines, 10), vec!["", "hi"]);
+    }
+
+    #[test]
+    fn selected_char_range_spans_a_partial_first_line_full_middle_and_partial_last_line() {
+        let selection = super::Selection {
+            anchor: super::SelectionPoint { line: 0, col: 5 },
+            cursor: super::SelectionPoint { line: 2, col: 3 },
+        };
+
+        assert_eq!(
+            super::selected_char_range(&selection, 0, 10),
+            Some((5, 10))
+        );
+        assert_eq!(
+            super::selected_char_range(&selection, 1, 10),
+            Some((0, 10))
+        );
+        assert_eq!(super::selected_char_range(&selection, 2, 10), Some((0, 3)));
+        assert_eq!(super::selected_char_range(&selection, 3, 10), None);
+    }
+
+    #[test]
+    fn dragging_the_mouse_extends_the_selection_and_extracts_the_selected_text() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            entries: vec![ChatEntry::Info("hello world".into())],
+            ..AppState::default()
+        };
+        let terminal_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+
+        let (history_area, _) = super::chat_layout(terminal_area, &state);
+        let content_width = usize::from(history_area.width.saturating_sub(2));
+        let wrapped = super::wrap_lines(&super::compose_lines(&state), content_width);
+        let line_index = wrapped
+            .iter()
+            .position(|line| line.contains("hello world"))
+            .expect("the info entry should appear in the wrapped transcript");
+        let line_chars: Vec<char> = wrapped[line_index].chars().collect();
+        let needle: Vec<char> = "hello".chars().collect();
+        let hello_col = line_chars
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+            .expect("hello is on the line");
+        let visible_rows = usize::from(history_area.height.saturating_sub(2)).max(1);
+        let (start, _end) = super::compute_visible_window(wrapped.len(), visible_rows, state.scroll);
+        let row = history_area.y + 1 + u16::try_from(line_index - start).unwrap();
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: history_area.x + 1 + u16::try_from(hello_col).unwrap(),
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::handle_mouse_event(&mut state, &down, terminal_area));
+        assert!(state.selection.is_some());
+
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: down.column + 5,
+            row: down.row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::handle_mouse_event(&mut state, &drag, terminal_area));
+
+        let selected = super::extract_selected_text(&state, terminal_area);
+        assert_eq!(selected.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn clicking_outside_the_history_area_clears_the_selection() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            selection: Some(super::Selection {
+                anchor: super::SelectionPoint { line: 0, col: 0 },
+                cursor: super::SelectionPoint { line: 0, col: 3 },
+            }),
+            ..AppState::default()
+        };
+        let terminal_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+
+        let click_below_history = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: terminal_area.height - 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::handle_mouse_event(
+            &mut state,
+            &click_below_history,
+            terminal_area
+        ));
+        assert!(state.selection.is_none());
     }
 }

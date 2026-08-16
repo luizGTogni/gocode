@@ -12,8 +12,8 @@ use gocode_provider_nvidia::NvidiaProvider;
 use gocode_tools::{
     ChangeKind, ToolRegistry, ToolStatus, builtin_registry,
     permissions::{
-        DefaultPermissionPolicy, PermissionContext, PermissionRequest, PermissionResolver,
-        ResolveFuture,
+        ApproveEverythingPolicy, DefaultPermissionPolicy, PermissionContext, PermissionPolicy,
+        PermissionRequest, PermissionResolver, PlanPermissionPolicy, ResolveFuture,
     },
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -218,6 +218,7 @@ async fn run_application() -> Result<(), AppError> {
         let mut selected_model = None;
         let mut model_catalog: Vec<gocode_core::Model> = Vec::new();
         let mut reasoning_effort: Option<String> = bootstrap.resolved_config.reasoning_effort.clone();
+        let mut permission_mode = gocode_core::PermissionMode::default();
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
         let tool_registry: Arc<ToolRegistry> = Arc::new(builtin_registry());
@@ -228,9 +229,10 @@ async fn run_application() -> Result<(), AppError> {
         if let Some(effort) = reasoning_effort.clone() {
             driver
                 .event_tx
-                .send(gocode_core::AppEvent::ReasoningEffortChanged(Some(
-                    effort,
-                )))
+                .send(gocode_core::AppEvent::ReasoningEffortChanged {
+                    effort: Some(effort),
+                    announce: false,
+                })
                 .await
                 .map_err(|error| {
                     AppError::Initialization(format!(
@@ -412,10 +414,16 @@ async fn run_application() -> Result<(), AppError> {
                         event_tx: driver.event_tx.clone(),
                         pending: permission_pending.clone(),
                     });
-                    let permissions = PermissionContext::new(
-                        Arc::new(DefaultPermissionPolicy::editing()),
-                        resolver,
-                    );
+                    let policy: Arc<dyn PermissionPolicy> = match permission_mode {
+                        gocode_core::PermissionMode::Auto => {
+                            Arc::new(DefaultPermissionPolicy::editing())
+                        }
+                        gocode_core::PermissionMode::Plan => Arc::new(PlanPermissionPolicy),
+                        gocode_core::PermissionMode::Approve => {
+                            Arc::new(ApproveEverythingPolicy)
+                        }
+                    };
+                    let permissions = PermissionContext::new(policy, resolver);
                     let agent = Agent::new(
                         Arc::new(provider.clone()),
                         tool_registry.clone(),
@@ -490,13 +498,19 @@ async fn run_application() -> Result<(), AppError> {
                     )?;
                     driver
                         .event_tx
-                        .send(gocode_core::AppEvent::ReasoningEffortChanged(effort))
+                        .send(gocode_core::AppEvent::ReasoningEffortChanged {
+                            effort,
+                            announce: true,
+                        })
                         .await
                         .map_err(|error| {
                             AppError::Initialization(format!(
                                 "could not confirm reasoning-effort selection: {error}"
                             ))
                         })?;
+                }
+                AppCommand::SetPermissionMode(mode) => {
+                    permission_mode = mode;
                 }
                 AppCommand::AcceptUpdate => {
                     match prepare_windows_update(&paths.cache_dir, driver.event_tx.clone()).await {

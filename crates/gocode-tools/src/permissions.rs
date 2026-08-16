@@ -1,4 +1,9 @@
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+};
 
 /// Risk classification the permission engine assigns to a `run_command` request.
 ///
@@ -177,13 +182,49 @@ pub trait PermissionPolicy: Send + Sync {
     fn evaluate(&self, action: &PermissionAction) -> PermissionDecision;
 }
 
+/// Evaluates a command request by risk, shared by every policy in this module: low is allowed,
+/// medium asks for confirmation, high is denied outright (the MVP exposes no dedicated commit,
+/// push, reset, checkout, or generic network tool, so high-risk commands stay behind an explicit
+/// deny rather than a confirmable prompt).
+fn evaluate_command_risk(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    risk: CommandRisk,
+) -> PermissionDecision {
+    match risk {
+        CommandRisk::Low => PermissionDecision::Allow,
+        CommandRisk::Medium => PermissionDecision::Ask(PermissionRequest {
+            summary: format!("run: {program} {}", args.join(" "))
+                .trim()
+                .to_string(),
+            working_directory: cwd.to_path_buf(),
+        }),
+        CommandRisk::High => PermissionDecision::Deny(PermissionReason(format!(
+            "{program} is classified high-risk and requires an explicit, narrower tool"
+        ))),
+    }
+}
+
+/// Extensions treated as project documentation or planning notes rather than source code, for
+/// [`PlanPermissionPolicy`]. Illustrative, not exhaustive: an unrecognized extension is treated
+/// as code and denied, erring toward protecting source over allowing writes.
+const PLAN_WRITABLE_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "txt", "text", "rst", "adoc", "json", "yaml", "yml", "toml", "csv", "log",
+];
+
+fn is_plan_writable(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+        PLAN_WRITABLE_EXTENSIONS
+            .iter()
+            .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+    })
+}
+
 /// The MVP default policy described in `docs/TOOLS.md` §25.
 ///
 /// Read-only tools are always allowed. Writes are allowed while editing is enabled for the
-/// current task. Commands are evaluated by risk: low is allowed, medium asks for confirmation,
-/// high is denied outright (the MVP exposes no dedicated commit, push, reset, checkout, or
-/// generic network tool, so high-risk commands stay behind an explicit deny rather than a
-/// confirmable prompt).
+/// current task. Commands are evaluated by risk (see [`evaluate_command_risk`]).
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultPermissionPolicy {
     /// Whether the current task authorizes file-editing tools.
@@ -227,18 +268,81 @@ impl PermissionPolicy for DefaultPermissionPolicy {
                 args,
                 cwd,
                 risk,
-            } => match risk {
-                CommandRisk::Low => PermissionDecision::Allow,
-                CommandRisk::Medium => PermissionDecision::Ask(PermissionRequest {
+            } => evaluate_command_risk(program, args, cwd, *risk),
+        }
+    }
+}
+
+/// Plan-mode policy: gathers information and drafts documentation, but cannot touch source code.
+///
+/// Reads and commands are evaluated exactly as in [`DefaultPermissionPolicy`] — planning still
+/// needs to run `cargo check`, grep, or inspect `git status`. Writes are allowed only to files
+/// that look like documentation or planning notes (see [`is_plan_writable`]); creating, editing,
+/// or deleting a source file is denied outright rather than merely asked about, since the whole
+/// point of this mode is that code stays untouched until the plan is approved.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlanPermissionPolicy;
+
+impl PermissionPolicy for PlanPermissionPolicy {
+    fn evaluate(&self, action: &PermissionAction) -> PermissionDecision {
+        match action {
+            PermissionAction::ReadOnly => PermissionDecision::Allow,
+            PermissionAction::Write { path } => {
+                if is_plan_writable(path) {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny(PermissionReason(format!(
+                        "plan mode only allows writing documentation or notes files; cannot \
+                         write {}",
+                        path.display()
+                    )))
+                }
+            }
+            PermissionAction::Command {
+                program,
+                args,
+                cwd,
+                risk,
+            } => evaluate_command_risk(program, args, cwd, *risk),
+        }
+    }
+}
+
+/// Approve-mode policy: every write and every command, however low-risk, asks for explicit
+/// confirmation first. Reads still proceed without asking; there is nothing to confirm about
+/// looking at a file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApproveEverythingPolicy;
+
+impl PermissionPolicy for ApproveEverythingPolicy {
+    fn evaluate(&self, action: &PermissionAction) -> PermissionDecision {
+        match action {
+            PermissionAction::ReadOnly => PermissionDecision::Allow,
+            PermissionAction::Write { path } => PermissionDecision::Ask(PermissionRequest {
+                summary: format!("write: {}", path.display()),
+                working_directory: path
+                    .parent()
+                    .map_or_else(|| path.clone(), std::path::Path::to_path_buf),
+            }),
+            PermissionAction::Command {
+                program,
+                args,
+                cwd,
+                risk,
+            } => {
+                if *risk == CommandRisk::High {
+                    return PermissionDecision::Deny(PermissionReason(format!(
+                        "{program} is classified high-risk and requires an explicit, narrower \
+                         tool"
+                    )));
+                }
+                PermissionDecision::Ask(PermissionRequest {
                     summary: format!("run: {program} {}", args.join(" "))
                         .trim()
                         .to_string(),
                     working_directory: cwd.clone(),
-                }),
-                CommandRisk::High => PermissionDecision::Deny(PermissionReason(format!(
-                    "{program} is classified high-risk and requires an explicit, narrower tool"
-                ))),
-            },
+                })
+            }
         }
     }
 }
@@ -296,9 +400,10 @@ impl PermissionContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlwaysDenyResolver, CommandRisk, DefaultPermissionPolicy, PermissionAction,
-        PermissionContext, PermissionDecision, PermissionPolicy, PermissionRequest,
-        PermissionResolver, ResolveFuture, classify_command_risk,
+        AlwaysDenyResolver, ApproveEverythingPolicy, CommandRisk, DefaultPermissionPolicy,
+        PermissionAction, PermissionContext, PermissionDecision, PermissionPolicy,
+        PermissionRequest, PermissionResolver, PlanPermissionPolicy, ResolveFuture,
+        classify_command_risk,
     };
     use std::{path::PathBuf, sync::Arc};
 
@@ -376,6 +481,51 @@ mod tests {
             path: PathBuf::from("src/lib.rs"),
         });
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn plan_mode_allows_writing_documentation_but_denies_source_code() {
+        let policy = PlanPermissionPolicy;
+
+        let doc_decision = policy.evaluate(&PermissionAction::Write {
+            path: PathBuf::from("PLAN.md"),
+        });
+        assert!(matches!(doc_decision, PermissionDecision::Allow));
+
+        let code_decision = policy.evaluate(&PermissionAction::Write {
+            path: PathBuf::from("src/lib.rs"),
+        });
+        assert!(matches!(code_decision, PermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn plan_mode_still_allows_low_risk_commands_for_gathering_context() {
+        let policy = PlanPermissionPolicy;
+        let decision = policy.evaluate(&PermissionAction::Command {
+            program: "cargo".into(),
+            args: vec!["check".into()],
+            cwd: PathBuf::from("."),
+            risk: CommandRisk::Low,
+        });
+        assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn approve_mode_asks_before_every_write_and_low_risk_command() {
+        let policy = ApproveEverythingPolicy;
+
+        let write_decision = policy.evaluate(&PermissionAction::Write {
+            path: PathBuf::from("src/lib.rs"),
+        });
+        assert!(matches!(write_decision, PermissionDecision::Ask(_)));
+
+        let command_decision = policy.evaluate(&PermissionAction::Command {
+            program: "cargo".into(),
+            args: vec!["check".into()],
+            cwd: PathBuf::from("."),
+            risk: CommandRisk::Low,
+        });
+        assert!(matches!(command_decision, PermissionDecision::Ask(_)));
     }
 
     #[test]

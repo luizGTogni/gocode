@@ -21,6 +21,43 @@ pub enum AppCommand {
     RejectUpdate,
     /// Set the reasoning-effort level sent with future chat requests, or clear it.
     SetReasoningEffort(Option<String>),
+    /// Set the permission mode applied to future agent runs.
+    SetPermissionMode(PermissionMode),
+}
+
+/// How permissively an agent run is allowed to act without asking the user first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionMode {
+    /// The MVP default: reads and low-risk commands proceed, writes and other commands follow
+    /// the existing risk-based policy.
+    #[default]
+    Auto,
+    /// Read-only: gathers information but cannot write files or run risky commands.
+    Plan,
+    /// Every write and command, however low-risk, asks for explicit confirmation first.
+    Approve,
+}
+
+impl PermissionMode {
+    /// Advances to the next mode in the Auto → Plan → Approve → Auto cycle.
+    #[must_use]
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::Auto => Self::Plan,
+            Self::Plan => Self::Approve,
+            Self::Approve => Self::Auto,
+        }
+    }
+
+    /// Short, lowercase, user-facing name for this mode.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Plan => "plan",
+            Self::Approve => "approve",
+        }
+    }
 }
 
 /// Fact emitted by the application runtime and rendered by an interface.
@@ -106,7 +143,13 @@ pub enum AppEvent {
     /// The agent run was cancelled by the user.
     AgentCancelled,
     /// The active reasoning-effort level changed.
-    ReasoningEffortChanged(Option<String>),
+    ReasoningEffortChanged {
+        /// The newly active level, or `None` to clear it.
+        effort: Option<String>,
+        /// Whether to surface a confirmation in the transcript. `false` for the silent restore
+        /// performed at startup from a previously saved value.
+        announce: bool,
+    },
 }
 
 /// Coarse lifecycle phase of an active agent run, for a concise status indicator.
