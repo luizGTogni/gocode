@@ -830,6 +830,7 @@ dependencies = [
  "gocode-agent",
  "gocode-core",
  "gocode-credentials",
+ "gocode-mcp",
  "gocode-provider-nvidia",
  "gocode-tools",
  "gocode-tui",
@@ -876,6 +877,8 @@ dependencies = [
 name = "gocode-mcp"
 version = "0.3.0"
 dependencies = [
+ "gocode-core",
+ "gocode-tools",
  "serde",
  "serde_json",
  "tokio",

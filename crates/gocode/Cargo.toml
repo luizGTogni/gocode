@@ -10,6 +10,7 @@ repository.workspace = true
 gocode-agent = { path = "../gocode-agent" }
 gocode-credentials = { path = "../gocode-credentials" }
 gocode-core = { path = "../gocode-core" }
+gocode-mcp = { path = "../gocode-mcp" }
 gocode-provider-nvidia = { path = "../gocode-provider-nvidia" }
 gocode-tools = { path = "../gocode-tools" }
 gocode-tui = { path = "../gocode-tui" }

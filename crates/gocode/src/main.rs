@@ -9,7 +9,7 @@ use std::{
 use gocode_agent::{Agent, AgentEvent, AgentRequest};
 use gocode_core::{
     AUTO_COMPACT_TOKEN_THRESHOLD, AppCommand, AppError, EnvironmentPaths, Platform, PlatformPaths,
-    RuntimeChannels, bootstrap_with_paths,
+    ProjectContext, RuntimeChannels, bootstrap_with_paths,
 };
 use gocode_credentials::{CredentialStore, NativeCredentialStore, SecretString};
 use gocode_provider_nvidia::NvidiaProvider;
@@ -171,6 +171,48 @@ fn describe_warning(warning: &gocode_agent::AgentWarning) -> String {
             format!("Stopped a repeating tool call: {name}")
         }
     }
+}
+
+/// Loads the merged global+project MCP server configuration, connects every enabled server,
+/// and returns a tool registry with the built-ins plus every discovered MCP tool. Best-effort:
+/// a server that fails to connect is reported as an [`gocode_core::AppEvent::AgentWarning`] and
+/// simply contributes no tools, rather than preventing startup.
+async fn connect_configured_mcp_servers(
+    paths: &PlatformPaths,
+    project: &ProjectContext,
+    event_tx: &mpsc::Sender<gocode_core::AppEvent>,
+) -> ToolRegistry {
+    let mut registry = builtin_registry();
+
+    let load_layer = |path: &Path, layer: &str| match gocode_core::load_or_default_mcp_config(path)
+    {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!("could not load {layer} mcp.toml: {error}");
+            gocode_core::McpConfig::default()
+        }
+    };
+    let global_mcp = load_layer(&paths.mcp_config_path(), "global");
+    let project_mcp = load_layer(&project.mcp_config_path(), "project");
+    let servers = gocode_core::merge_mcp_servers(&global_mcp, &project_mcp);
+
+    if servers.is_empty() {
+        return registry;
+    }
+
+    let outcome = gocode_mcp::connect_configured_servers(&servers).await;
+    for tool in outcome.tools {
+        registry.register(tool);
+    }
+    for (server_name, error) in outcome.failures {
+        let _ = event_tx
+            .send(gocode_core::AppEvent::AgentWarning(format!(
+                "MCP server '{server_name}' failed to connect: {error}"
+            )))
+            .await;
+    }
+
+    registry
 }
 
 fn first_line(text: &str, max_chars: usize) -> String {
@@ -338,7 +380,9 @@ async fn run_application() -> Result<(), AppError> {
             Arc::new(Mutex::new(gocode_core::SessionRecord::new()));
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
-        let tool_registry: Arc<ToolRegistry> = Arc::new(builtin_registry());
+        let tool_registry: Arc<ToolRegistry> = Arc::new(
+            connect_configured_mcp_servers(&paths, &bootstrap.project, &driver.event_tx).await,
+        );
         let permission_pending: PendingPermission = Arc::new(Mutex::new(None));
         let instructions =
             std::fs::read_to_string(bootstrap.project.gocode_dir.join("instructions.md")).ok();

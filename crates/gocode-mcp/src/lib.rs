@@ -3,9 +3,13 @@
 
 pub mod client;
 pub mod jsonrpc;
+pub mod manager;
+pub mod tool_bridge;
 pub mod transport;
 
 pub use client::{McpClient, McpToolInfo, ToolCallOutcome};
+pub use manager::{McpConnectOutcome, connect_configured_servers};
+pub use tool_bridge::McpTool;
 pub use transport::{McpTransport, stdio::StdioTransport};
 
 /// Everything that can go wrong talking to an MCP server.
