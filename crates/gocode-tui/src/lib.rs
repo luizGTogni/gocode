@@ -530,11 +530,6 @@ fn compose_lines(state: &AppState) -> Vec<String> {
 
     if state.entries.is_empty() {
         lines.push("What can I help you build?".into());
-        lines.push(String::new());
-        lines.push(
-            "Prompts and the project context you share are sent to NVIDIA NIM for inference."
-                .into(),
-        );
         return lines;
     }
 
@@ -784,7 +779,7 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
     render_composer(frame, state, composer_area, &suggestions);
 
     if let Some(message) = &state.copy_notification {
-        render_copy_notification(frame, message, composer_area);
+        render_copy_notification(frame, message, history_area);
     }
 
     if let Some(prompt) = &state.pending_permission {
@@ -796,17 +791,29 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
     }
 }
 
-fn render_copy_notification(frame: &mut Frame, message: &str, composer_area: Rect) {
-    if composer_area.y == 0 {
+/// Space kept between the copy-notification text and the history box's border, so the toast
+/// never overwrites (and visually breaks) the border itself.
+const COPY_NOTIFICATION_MARGIN: u16 = 2;
+
+/// Renders the "Copied N chars to clipboard" toast inside the top-right corner of the history
+/// box, on its last content row (directly above the composer) — never on the border row itself.
+fn render_copy_notification(frame: &mut Frame, message: &str, history_area: Rect) {
+    if history_area.height < 3 || history_area.width <= COPY_NOTIFICATION_MARGIN * 2 + 2 {
         return;
     }
-    let width = u16::try_from(message.chars().count())
+    let max_text_width = history_area
+        .width
+        .saturating_sub(2 + COPY_NOTIFICATION_MARGIN);
+    let text_width = u16::try_from(message.chars().count())
         .unwrap_or(u16::MAX)
-        .min(composer_area.width);
+        .min(max_text_width);
+    if text_width == 0 {
+        return;
+    }
     let notification_area = Rect {
-        x: composer_area.x + composer_area.width.saturating_sub(width),
-        y: composer_area.y - 1,
-        width,
+        x: history_area.x + history_area.width - 1 - COPY_NOTIFICATION_MARGIN - text_width,
+        y: history_area.y + history_area.height - 2,
+        width: text_width,
         height: 1,
     };
     frame.render_widget(Clear, notification_area);
@@ -989,13 +996,33 @@ fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions:
     if let Some(status) = &state.status {
         lines.push(Line::from(status.clone()));
     }
-    lines.push(Line::from(Span::styled(
-        format!(
-            "{} mode on (shift+tab or F2 to cycle)",
-            state.permission_mode.label()
-        ),
+    let mode_text = format!(
+        "{} mode on (shift+tab or F2 to cycle)",
+        state.permission_mode.label()
+    );
+    let mode_span = Span::styled(
+        mode_text.clone(),
         Style::default().fg(permission_mode_color(state.permission_mode)),
-    )));
+    );
+    lines.push(if state.activity.is_some() {
+        let interrupt_text = "ESC to interrupt";
+        let content_width = usize::from(area.width.saturating_sub(2));
+        let gap = content_width
+            .saturating_sub(mode_text.chars().count())
+            .saturating_sub(interrupt_text.chars().count());
+        Line::from(vec![
+            mode_span,
+            Span::raw(" ".repeat(gap.max(1))),
+            Span::styled(
+                interrupt_text,
+                Style::default()
+                    .fg(SELECTION_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(mode_span)
+    });
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
@@ -1919,7 +1946,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_screen_renders_the_initial_prompt_and_privacy_disclosure() {
+    fn chat_screen_renders_the_initial_prompt() {
         let mut terminal =
             Terminal::new(TestBackend::new(80, 20)).expect("terminal should initialize");
         let state = AppState {
@@ -1933,7 +1960,6 @@ mod tests {
 
         let content = buffer_text(&terminal);
         assert!(content.contains("What can I help you build?"));
-        assert!(content.contains("sent to NVIDIA NIM"));
     }
 
     #[test]
@@ -1966,6 +1992,60 @@ mod tests {
             .expect("screen should render");
 
         assert!(buffer_text(&terminal).contains("auto mode on"));
+    }
+
+    #[test]
+    fn esc_to_interrupt_hint_shows_only_while_the_agent_is_active() {
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 20)).expect("terminal should initialize");
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("screen should render");
+        assert!(!buffer_text(&terminal).contains("ESC to interrupt"));
+
+        state.begin_run("hi".into());
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("screen should render");
+        assert!(buffer_text(&terminal).contains("ESC to interrupt"));
+    }
+
+    #[test]
+    fn the_copy_notification_does_not_overwrite_the_history_border() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.copy_notification = Some("Copied 78 chars to clipboard".into());
+        let terminal_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        let (history_area, _) = super::chat_layout(terminal_area, &state);
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 20)).expect("terminal should initialize");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("screen should render");
+
+        let buffer = terminal.backend().buffer();
+        let border_row = history_area.y + history_area.height - 1;
+        let border_char = buffer
+            .cell((history_area.x + history_area.width - 1, border_row))
+            .expect("border cell should exist")
+            .symbol();
+        assert_ne!(border_char, " ");
+        assert_ne!(border_char, "d");
+
+        assert!(buffer_text(&terminal).contains("Copied 78 chars to clipboard"));
     }
 
     #[test]
