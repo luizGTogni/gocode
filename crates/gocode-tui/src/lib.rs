@@ -10,9 +10,10 @@ use ratatui::{
     Frame, Terminal,
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use std::fmt::Write as _;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -52,6 +53,9 @@ const EFFORT_OPTIONS: &[(&str, Option<&str>)] = &[
 
 /// Menu items shown on the settings screen, in display order.
 const SETTINGS_ITEMS: &[&str] = &["Change API key", "Change model", "Change reasoning effort"];
+
+/// Highlight color for the currently selected slash-command suggestion (reddish pink).
+const SUGGESTION_HIGHLIGHT_COLOR: Color = Color::Rgb(255, 92, 130);
 
 /// One rendered fact in the chat transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +189,7 @@ pub struct AppState {
     selected_effort: usize,
     current_effort: Option<String>,
     chat_input: String,
+    suggestion_selected: usize,
     entries: Vec<ChatEntry>,
     streaming_assistant: bool,
     file_change_buffer: Vec<String>,
@@ -446,9 +451,13 @@ impl AppState {
     }
 
     fn autocomplete(&mut self) {
-        if let Some((name, _)) = slash_suggestions(&self.chat_input).first() {
-            self.chat_input = (*name).to_string();
+        let suggestions = slash_suggestions(&self.chat_input);
+        if suggestions.is_empty() {
+            return;
         }
+        let index = self.suggestion_selected.min(suggestions.len() - 1);
+        self.chat_input = suggestions[index].0.to_string();
+        self.suggestion_selected = 0;
     }
 
     /// Appends one masked-on-screen credential character during onboarding.
@@ -767,15 +776,29 @@ fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions: &[(&str, &str)]) {
-    let mut content = format!("> {}", state.chat_input);
-    for (name, description) in suggestions {
-        let _ = write!(content, "\n  {name} — {description}");
+    let mut lines = vec![Line::from(format!("> {}", state.chat_input))];
+
+    let selected = state
+        .suggestion_selected
+        .min(suggestions.len().saturating_sub(1));
+    for (index, (name, description)) in suggestions.iter().enumerate() {
+        let text = format!("  {name} — {description}");
+        lines.push(if index == selected {
+            Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(SUGGESTION_HIGHLIGHT_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(text)
+        });
     }
     if let Some(status) = &state.status {
-        let _ = write!(content, "\n{status}");
+        lines.push(Line::from(status.clone()));
     }
     frame.render_widget(
-        Paragraph::new(content)
+        Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL)),
         area,
@@ -1284,6 +1307,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
 
     if let Event::Paste(text) = event {
         state.chat_input.push_str(text);
+        state.suggestion_selected = 0;
         return None;
     }
 
@@ -1297,6 +1321,8 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         return None;
     };
 
+    let suggestion_count = slash_suggestions(&state.chat_input).len();
+
     match code {
         KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
             state.toggle_last_tool_output();
@@ -1304,7 +1330,15 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(prompt) = state.last_failed_prompt.take() {
                 state.chat_input = prompt;
+                state.suggestion_selected = 0;
             }
+        }
+        KeyCode::Up if suggestion_count > 0 => {
+            state.suggestion_selected = state.suggestion_selected.saturating_sub(1);
+        }
+        KeyCode::Down if suggestion_count > 0 => {
+            state.suggestion_selected =
+                (state.suggestion_selected + 1).min(suggestion_count - 1);
         }
         KeyCode::PageUp => state.scroll_up(),
         KeyCode::PageDown | KeyCode::End => state.scroll_down(),
@@ -1316,18 +1350,26 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
             if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
             state.chat_input.push(*character);
+            state.suggestion_selected = 0;
         }
         KeyCode::Backspace => {
             state.chat_input.pop();
+            state.suggestion_selected = 0;
         }
         KeyCode::Enter => {
             let trimmed = state.chat_input.trim();
             if trimmed.is_empty() {
                 return None;
             }
-            if let Some(command) = resolve_slash_command(trimmed) {
-                state.chat_input.clear();
-                return Some(ChatSubmission::Command(command));
+            let suggestions = slash_suggestions(&state.chat_input);
+            if !suggestions.is_empty() {
+                let index = state.suggestion_selected.min(suggestions.len() - 1);
+                let (name, _) = suggestions[index];
+                if let Some(command) = resolve_slash_command(name) {
+                    state.chat_input.clear();
+                    state.suggestion_selected = 0;
+                    return Some(ChatSubmission::Command(command));
+                }
             }
             let text = std::mem::take(&mut state.chat_input);
             if state.activity.is_some() {
@@ -1728,6 +1770,51 @@ mod tests {
         let _ = handle_chat_event(&mut state, &press(KeyCode::Tab));
 
         assert_eq!(state.chat_input, "/model");
+    }
+
+    #[test]
+    fn arrow_keys_move_the_highlighted_suggestion_and_tab_completes_it() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/c".into(),
+            ..AppState::default()
+        };
+        assert_eq!(slash_suggestions(&state.chat_input).len(), 2);
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(state.suggestion_selected, 1);
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Tab));
+        assert_eq!(state.chat_input, slash_suggestions("/c")[1].0);
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_suggestion_even_when_the_command_is_incomplete() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/set".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Settings))
+        );
+        assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn typing_resets_the_highlighted_suggestion_back_to_the_first_match() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/c".into(),
+            ..AppState::default()
+        };
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(state.suggestion_selected, 1);
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Char('o')));
+        assert_eq!(state.suggestion_selected, 0);
     }
 
     #[test]

@@ -247,6 +247,16 @@ async fn run_application() -> Result<(), AppError> {
                         .filter(|model| model_ids.iter().any(|id| id == model))
                         .map(str::to_string);
 
+                    driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::ModelsAvailable(model_ids))
+                        .await
+                        .map_err(|error| {
+                            AppError::Initialization(format!(
+                                "could not send discovered models: {error}"
+                            ))
+                        })?;
+
                     if let Some(model) = remembered_model {
                         selected_model = Some(model.clone());
                         driver
@@ -256,16 +266,6 @@ async fn run_application() -> Result<(), AppError> {
                             .map_err(|error| {
                                 AppError::Initialization(format!(
                                     "could not confirm remembered model: {error}"
-                                ))
-                            })?;
-                    } else {
-                        driver
-                            .event_tx
-                            .send(gocode_core::AppEvent::ModelsAvailable(model_ids))
-                            .await
-                            .map_err(|error| {
-                                AppError::Initialization(format!(
-                                    "could not send discovered models: {error}"
                                 ))
                             })?;
                     }
