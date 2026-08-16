@@ -72,6 +72,15 @@ pub fn is_git_repository(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
+/// Resolves `path` to its canonical form when possible, so a worktree's path is represented
+/// identically regardless of whether it was just created by this module (a native `PathBuf`
+/// join) or parsed back out of `git worktree list --porcelain` (forward-slash paths on Windows,
+/// sometimes via an 8.3 short alias). Falls back to `path` unchanged when it does not exist yet
+/// or canonicalization otherwise fails.
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Validates a user-supplied worktree or branch name segment: non-empty, no path separators, no
 /// `..`, no leading `-` (which `git` would otherwise parse as a flag), and restricted to a safe
 /// character set so it can never be interpreted as a shell token even if later logged or reused.
@@ -211,7 +220,7 @@ fn parse_worktree_list(porcelain: &str) -> Vec<WorktreeEntry> {
         if let Some(path) = path.take() {
             let is_main = entries.is_empty();
             entries.push(WorktreeEntry {
-                path,
+                path: canonicalize_best_effort(&path),
                 branch: branch.take(),
                 head: std::mem::take(head),
                 is_main,
@@ -316,7 +325,7 @@ pub async fn create_worktree(
     };
     let head = current_head(runner, &target).await.unwrap_or_default();
     Ok(WorktreeEntry {
-        path: target,
+        path: canonicalize_best_effort(&target),
         branch: branch_name,
         head,
         is_main: false,
