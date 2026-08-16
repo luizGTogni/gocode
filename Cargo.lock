@@ -873,6 +873,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gocode-mcp"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "gocode-provider-nvidia"
 version = "0.3.0"
 dependencies = [

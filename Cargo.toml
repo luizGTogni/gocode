@@ -4,6 +4,7 @@ members = [
     "crates/gocode-agent",
     "crates/gocode-credentials",
     "crates/gocode-core",
+    "crates/gocode-mcp",
     "crates/gocode-provider-nvidia",
     "crates/gocode-tools",
     "crates/gocode-tui",
