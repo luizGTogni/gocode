@@ -147,7 +147,7 @@ pub struct UpdatePrompt {
 }
 
 /// A parsed slash command handled entirely by the interface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     /// Reopen the model picker.
     Model,
@@ -175,6 +175,9 @@ pub enum SlashCommand {
     Skills,
     /// Switch permission mode to Plan (read-only).
     PlanMode,
+    /// Review a diff, branch, or the working tree's uncommitted changes. The `String` is the
+    /// user-supplied target (e.g. a branch name or path); empty means the working tree diff.
+    Review(String),
     /// Exit Gocode.
     Exit,
 }
@@ -283,6 +286,11 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "Switch to Plan mode (read-only, no writes or risky commands)",
         SlashCommand::PlanMode,
     ),
+    (
+        "/review",
+        "Review a diff, branch, or the working tree's changes",
+        SlashCommand::Review(String::new()),
+    ),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
     ("/quit", "Exit Gocode", SlashCommand::Exit),
 ];
@@ -312,7 +320,7 @@ fn resolve_slash_command(input: &str) -> Option<SlashCommand> {
     SLASH_COMMANDS
         .iter()
         .find(|(name, _, _)| *name == input)
-        .map(|(_, _, command)| *command)
+        .map(|(_, _, command)| command.clone())
 }
 
 /// Finds the custom command exactly named `name` (including the leading `/`), if any.
@@ -2397,6 +2405,31 @@ fn run_terminal(
                         AppCommand::SetPermissionMode(PermissionMode::Plan),
                     )?;
                 }
+                ChatSubmission::Command(SlashCommand::Review(target)) => {
+                    let scope = if target.is_empty() {
+                        "the current diff (uncommitted changes in the working tree; if there \
+                         are none, review the changes in the most recent commit instead)"
+                            .to_string()
+                    } else {
+                        format!(
+                            "the changes on/in \"{target}\" (this may be a branch name, commit \
+                             range, pull request number, or file/directory path — figure out \
+                             which from context and use the appropriate git or gh command to \
+                             get its diff)"
+                        )
+                    };
+                    let prompt = format!(
+                        "Review {scope}. Use git (and gh, if it's a pull request) to gather the \
+                         diff yourself. Focus on correctness bugs, security issues, and \
+                         significant simplification or efficiency opportunities in the changed \
+                         code — do not comment on unrelated pre-existing code. For each finding, \
+                         give the file and line, a one-sentence description of the defect, and \
+                         a concrete suggested fix. If nothing significant is found, say so \
+                         plainly instead of inventing minor nitpicks."
+                    );
+                    state.begin_run(prompt.clone());
+                    send_command(&command_tx, AppCommand::SubmitChat(prompt))?;
+                }
                 ChatSubmission::Command(SlashCommand::Init) => {
                     let prompt = "Explore this repository (its structure, languages, build \
                                    system, tests, and conventions) and write a complete \
@@ -3256,12 +3289,17 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
                     state.clear_chat_input();
                     return Some(ChatSubmission::Prompt(body));
                 }
-            } else if let Some((name, arguments)) = trimmed.split_once(char::is_whitespace)
-                && let Some(command) = resolve_custom_command(&state.custom_commands, name)
-            {
-                let body = expand_custom_command(&command.body, arguments.trim());
-                state.clear_chat_input();
-                return Some(ChatSubmission::Prompt(body));
+            } else if let Some((name, arguments)) = trimmed.split_once(char::is_whitespace) {
+                if name == "/review" {
+                    let target = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Review(target)));
+                }
+                if let Some(command) = resolve_custom_command(&state.custom_commands, name) {
+                    let body = expand_custom_command(&command.body, arguments.trim());
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Prompt(body));
+                }
             }
             let text = std::mem::take(&mut state.chat_input);
             state.cursor = 0;
@@ -3956,6 +3994,36 @@ mod tests {
         assert_eq!(
             handle_chat_event(&mut state, &press(KeyCode::Enter)),
             Some(ChatSubmission::Command(SlashCommand::Clear))
+        );
+        assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn review_with_no_target_reviews_the_working_tree_diff() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/review".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Review(String::new())))
+        );
+        assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn review_with_a_target_carries_it_through_as_an_argument() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/review main".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Review("main".into())))
         );
         assert!(state.chat_input.is_empty());
     }
