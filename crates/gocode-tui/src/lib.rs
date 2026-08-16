@@ -57,6 +57,13 @@ const SETTINGS_ITEMS: &[&str] = &["Change API key", "Change model", "Change reas
 /// Highlight color for the currently selected slash-command suggestion (reddish pink).
 const SUGGESTION_HIGHLIGHT_COLOR: Color = Color::Rgb(255, 92, 130);
 
+/// Maximum slash-command suggestion rows shown at once, so a large command list can never grow
+/// the composer without bound; the list scrolls to keep the highlighted entry in view instead.
+const MAX_VISIBLE_SUGGESTIONS: usize = 6;
+
+/// Maximum prompt history entries remembered for Up/Down recall.
+const MAX_PROMPT_HISTORY: usize = 200;
+
 /// Highlight color for a mouse-selected range of transcript text (a weak/soft blue).
 const SELECTION_COLOR: Color = Color::Rgb(120, 170, 230);
 
@@ -219,6 +226,13 @@ pub struct AppState {
     last_failed_prompt: Option<String>,
     last_submitted_prompt: Option<String>,
     queued: Option<String>,
+    /// Previously submitted prompts, oldest first, for Up/Down recall.
+    prompt_history: Vec<String>,
+    /// Index into `prompt_history` currently shown in the composer, while browsing history.
+    history_cursor: Option<usize>,
+    /// The composer's text right before history browsing started, restored once you cycle past
+    /// the newest entry back to "now".
+    draft_before_history: Option<String>,
 }
 
 impl AppState {
@@ -481,6 +495,8 @@ impl AppState {
         self.cursor = text.chars().count();
         self.chat_input = text;
         self.suggestion_selected = 0;
+        self.history_cursor = None;
+        self.draft_before_history = None;
     }
 
     /// Empties the composer and resets the cursor to the start.
@@ -496,6 +512,8 @@ impl AppState {
         self.chat_input.insert_str(byte_index, text);
         self.cursor += text.chars().count();
         self.suggestion_selected = 0;
+        self.history_cursor = None;
+        self.draft_before_history = None;
     }
 
     /// Removes the character immediately before the cursor, if any.
@@ -508,6 +526,58 @@ impl AppState {
         self.chat_input.replace_range(start_byte..end_byte, "");
         self.cursor -= 1;
         self.suggestion_selected = 0;
+        self.history_cursor = None;
+        self.draft_before_history = None;
+    }
+
+    /// Records a submitted prompt for Up/Down recall, skipping an immediate repeat of the last
+    /// entry (matching typical shell-history behavior).
+    fn remember_prompt(&mut self, prompt: &str) {
+        if !prompt.is_empty() && self.prompt_history.last().map(String::as_str) != Some(prompt) {
+            self.prompt_history.push(prompt.to_string());
+            if self.prompt_history.len() > MAX_PROMPT_HISTORY {
+                self.prompt_history.remove(0);
+            }
+        }
+        self.history_cursor = None;
+        self.draft_before_history = None;
+    }
+
+    /// Walks one entry further back (older) in prompt history, starting a browse session and
+    /// stashing the in-progress draft on the first press. A no-op once at the oldest entry.
+    fn recall_previous_prompt(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let target_index = match self.history_cursor {
+            None => self.prompt_history.len() - 1,
+            Some(0) => return,
+            Some(index) => index - 1,
+        };
+        if self.history_cursor.is_none() {
+            self.draft_before_history = Some(self.chat_input.clone());
+        }
+        let draft = self.draft_before_history.take();
+        self.set_chat_input(self.prompt_history[target_index].clone());
+        self.history_cursor = Some(target_index);
+        self.draft_before_history = draft;
+    }
+
+    /// Walks one entry forward (newer) in prompt history, restoring the stashed draft once you
+    /// cycle past the newest entry back to "now". A no-op when not currently browsing.
+    fn recall_next_prompt(&mut self) {
+        let Some(index) = self.history_cursor else {
+            return;
+        };
+        if index + 1 < self.prompt_history.len() {
+            let draft = self.draft_before_history.take();
+            self.set_chat_input(self.prompt_history[index + 1].clone());
+            self.history_cursor = Some(index + 1);
+            self.draft_before_history = draft;
+        } else {
+            let draft = self.draft_before_history.take().unwrap_or_default();
+            self.set_chat_input(draft);
+        }
     }
 
     /// Moves the cursor one character left, clamped to the start.
@@ -846,7 +916,7 @@ fn render_effort_picker(frame: &mut Frame, state: &AppState, area: Rect) {
 fn chat_layout(area: Rect, state: &AppState) -> (Rect, Rect) {
     let suggestions = slash_suggestions(&state.chat_input);
     let input_lines = 1 + state.chat_input.matches('\n').count();
-    let suggestion_lines = suggestions.len().min(4);
+    let suggestion_lines = suggestions.len().min(MAX_VISIBLE_SUGGESTIONS);
     let status_lines = usize::from(state.status.is_some());
     // +1 for the permission-mode line always shown below the composer, +2 for the block borders.
     let compose_height =
@@ -1025,6 +1095,19 @@ fn compute_visible_window(total: usize, visible_rows: usize, scroll: usize) -> (
     (start, end)
 }
 
+/// Determines which suggestions are visible given the current selection, keeping the composer's
+/// height bounded no matter how many commands match. Returns `(start, end, truncated)`; when
+/// `truncated`, one row of the `MAX_VISIBLE_SUGGESTIONS` budget is reserved for a "N more"
+/// summary instead of an entry.
+fn visible_suggestion_window(count: usize, selected: usize) -> (usize, usize, bool) {
+    if count <= MAX_VISIBLE_SUGGESTIONS {
+        return (0, count, false);
+    }
+    let rows = MAX_VISIBLE_SUGGESTIONS - 1;
+    let first = selected.saturating_sub(rows.saturating_sub(1)).min(count - rows);
+    (first, first + rows, true)
+}
+
 /// One endpoint of a mouse selection: an absolute index into the full wrapped-lines vector, and
 /// a character column within that line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1078,7 +1161,10 @@ fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions:
     let selected = state
         .suggestion_selected
         .min(suggestions.len().saturating_sub(1));
-    for (index, (name, description)) in suggestions.iter().enumerate() {
+    let (window_start, window_end, truncated) =
+        visible_suggestion_window(suggestions.len(), selected);
+    for (offset, (name, description)) in suggestions[window_start..window_end].iter().enumerate() {
+        let index = window_start + offset;
         let text = format!("  {name} — {description}");
         lines.push(if index == selected {
             Line::from(Span::styled(
@@ -1090,6 +1176,10 @@ fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions:
         } else {
             Line::from(text)
         });
+    }
+    if truncated {
+        let hidden = suggestions.len() - (window_end - window_start);
+        lines.push(Line::from(format!("  … {hidden} more (↑/↓ to scroll)")));
     }
     if let Some(status) = &state.status {
         lines.push(Line::from(status.clone()));
@@ -1943,8 +2033,24 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
             state.suggestion_selected =
                 (state.suggestion_selected + 1).min(suggestion_count - 1);
         }
-        KeyCode::Up => state.move_cursor_vertical(-1),
-        KeyCode::Down => state.move_cursor_vertical(1),
+        KeyCode::Up => {
+            let lines: Vec<&str> = state.chat_input.split('\n').collect();
+            let (cursor_line, _) = cursor_line_col(&lines, state.cursor);
+            if cursor_line == 0 {
+                state.recall_previous_prompt();
+            } else {
+                state.move_cursor_vertical(-1);
+            }
+        }
+        KeyCode::Down => {
+            let lines: Vec<&str> = state.chat_input.split('\n').collect();
+            let (cursor_line, _) = cursor_line_col(&lines, state.cursor);
+            if cursor_line == lines.len() - 1 {
+                state.recall_next_prompt();
+            } else {
+                state.move_cursor_vertical(1);
+            }
+        }
         KeyCode::Left => state.move_cursor_left(),
         KeyCode::Right => state.move_cursor_right(),
         KeyCode::PageUp => state.scroll_up(),
@@ -1979,6 +2085,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
             }
             let text = std::mem::take(&mut state.chat_input);
             state.cursor = 0;
+            state.remember_prompt(&text);
             if state.activity.is_some() {
                 state.queued = Some(text);
                 return None;
@@ -2000,9 +2107,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
-        AppState, ChatEntry, ChatSubmission, InputAction, Screen, SlashCommand, classify_event,
-        handle_chat_event, handle_onboarding_event, handle_permission_event, handle_update_event,
-        render, run_with_event_source, slash_suggestions,
+        AppState, ChatEntry, ChatSubmission, InputAction, MAX_VISIBLE_SUGGESTIONS, Screen,
+        SlashCommand, classify_event, handle_chat_event, handle_onboarding_event,
+        handle_permission_event, handle_update_event, render, run_with_event_source,
+        slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -2853,6 +2961,102 @@ mod tests {
 
         let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
         assert_eq!(state.cursor, 3);
+    }
+
+    #[test]
+    fn up_arrow_recalls_prompt_history_and_down_arrow_walks_back_to_the_draft() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.remember_prompt("first prompt");
+        state.remember_prompt("second prompt");
+        state.chat_input = "unsent draft".into();
+        state.cursor = state.chat_input.chars().count();
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
+        assert_eq!(state.chat_input, "second prompt");
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
+        assert_eq!(state.chat_input, "first prompt");
+
+        // Already at the oldest entry: another Up is a no-op.
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
+        assert_eq!(state.chat_input, "first prompt");
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(state.chat_input, "second prompt");
+
+        // Past the newest entry, the original in-progress draft comes back.
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(state.chat_input, "unsent draft");
+    }
+
+    #[test]
+    fn submitting_a_prompt_makes_it_recallable_and_typing_exits_history_browsing() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "hello agent".into(),
+            cursor: "hello agent".chars().count(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Prompt("hello agent".into()))
+        );
+        assert!(state.chat_input.is_empty());
+
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
+        assert_eq!(state.chat_input, "hello agent");
+
+        // Typing while browsing history detaches from it instead of mutating the saved entry.
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Char('!')));
+        assert_eq!(state.chat_input, "hello agent!");
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
+        assert_eq!(state.chat_input, "hello agent");
+    }
+
+    #[test]
+    fn multiline_up_only_recalls_history_from_the_first_line() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "first\nsecond".into(),
+            cursor: super::char_index_from_line_col(&["first", "second"], 1, 2),
+            ..AppState::default()
+        };
+        state.remember_prompt("older prompt");
+
+        // On the last line: Up moves the cursor up a line, not history.
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
+        assert_eq!(state.chat_input, "first\nsecond");
+        assert_eq!(state.cursor, super::char_index_from_line_col(&["first", "second"], 0, 2));
+
+        // Now on the first line: Up recalls history instead of moving further up.
+        let _ = handle_chat_event(&mut state, &press(KeyCode::Up));
+        assert_eq!(state.chat_input, "older prompt");
+    }
+
+    #[test]
+    fn the_suggestion_list_scrolls_instead_of_growing_without_bound() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/".into(),
+            cursor: 1,
+            ..AppState::default()
+        };
+        let total = slash_suggestions("/").len();
+        assert!(total >= 6, "test assumes at least 6 commands share the '/' prefix");
+
+        let (start, end, truncated) = super::visible_suggestion_window(total, 0);
+        assert!(truncated);
+        assert_eq!(end - start, MAX_VISIBLE_SUGGESTIONS - 1);
+
+        state.suggestion_selected = total - 1;
+        let (start, end, truncated) = super::visible_suggestion_window(total, total - 1);
+        assert!(truncated);
+        assert_eq!(end, total);
+        assert!(end - start <= MAX_VISIBLE_SUGGESTIONS - 1);
     }
 
     #[test]
