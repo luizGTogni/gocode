@@ -182,6 +182,10 @@ pub enum SlashCommand {
     /// Review a diff, branch, or the working tree's uncommitted changes. The `String` is the
     /// user-supplied target (e.g. a branch name or path); empty means the working tree diff.
     Review(String),
+    /// Create, list, switch to, or remove an isolated Git worktree. The `String` is the raw text
+    /// typed after `/worktree` (e.g. `list`, `switch my-task`, `remove my-task`, `my-task`, or
+    /// `my-task existing-branch`); empty suggests a name for the user to edit and confirm.
+    Worktree(String),
     /// Exit Gocode.
     Exit,
 }
@@ -336,6 +340,11 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "Review a diff, branch, or the working tree's changes",
         SlashCommand::Review(String::new()),
     ),
+    (
+        "/worktree",
+        "Create, list, switch to, or remove an isolated Git worktree",
+        SlashCommand::Worktree(String::new()),
+    ),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
     ("/quit", "Exit Gocode", SlashCommand::Exit),
 ];
@@ -427,6 +436,8 @@ pub struct AppState {
     file_change_buffer: Vec<String>,
     activity: Option<AgentActivityState>,
     pending_permission: Option<PermissionPrompt>,
+    /// A `/worktree remove <target>` awaiting explicit Y/N confirmation before it is sent.
+    pending_worktree_removal: Option<String>,
     pending_update: Option<UpdatePrompt>,
     /// Which button is highlighted on the update popup's Yes/No prompt screen: `false` selects
     /// Yes (the default), `true` selects No.
@@ -577,6 +588,7 @@ impl AppState {
                 if self.screen == Screen::Chat
                     && self.activity.is_none()
                     && self.pending_permission.is_none()
+                    && self.pending_worktree_removal.is_none()
                 {
                     self.pending_update = Some(prompt);
                     self.update_selected_no = false;
@@ -728,6 +740,37 @@ impl AppState {
                 )));
                 self.screen = Screen::Chat;
             }
+            AppEvent::WorktreeListAvailable(worktrees) => {
+                self.entries
+                    .push(ChatEntry::Info(format_worktree_list(worktrees)));
+            }
+            AppEvent::WorktreeCreated { path, branch } => {
+                self.entries.push(ChatEntry::Info(format!(
+                    "Created worktree at {path} on branch '{branch}'.\n\
+                     Switched this session's working directory there.\n\
+                     Return to the original workspace with `/worktree switch` \
+                     (or `/worktree list` to see every worktree)."
+                )));
+            }
+            AppEvent::WorktreeSwitched { path, branch } => {
+                self.entries.push(ChatEntry::Info(format!(
+                    "Switched this session's working directory to {path} (branch '{branch}')."
+                )));
+            }
+            AppEvent::WorktreeRemoved { path, switched_to } => {
+                let mut message = format!("Removed worktree {path}.");
+                if let Some(switched_to) = switched_to {
+                    let _ = write!(
+                        message,
+                        "\nThat was this session's current worktree; switched back to {switched_to}."
+                    );
+                }
+                self.entries.push(ChatEntry::Info(message));
+            }
+            AppEvent::WorktreeOperationFailed(message) => {
+                self.entries
+                    .push(ChatEntry::Error(format!("Worktree: {message}")));
+            }
         }
         None
     }
@@ -746,6 +789,7 @@ impl AppState {
     fn show_queued_update(&mut self) {
         if self.screen == Screen::Chat
             && self.pending_permission.is_none()
+            && self.pending_worktree_removal.is_none()
             && self.pending_update.is_none()
             && self.queued_update.is_some()
         {
@@ -1273,6 +1317,113 @@ fn render_settings(frame: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
+/// Renders `/worktree list` output: the main worktree first, then every linked one, each with
+/// its branch.
+fn format_worktree_list(worktrees: &[gocode_core::WorktreeSummary]) -> String {
+    if worktrees.is_empty() {
+        return "No worktrees found.".into();
+    }
+    let mut lines = Vec::with_capacity(worktrees.len());
+    for worktree in worktrees {
+        let branch = worktree.branch.as_deref().unwrap_or("(detached HEAD)");
+        let label = if worktree.is_main { " (main)" } else { "" };
+        lines.push(format!("{}{label} — {branch}", worktree.path));
+    }
+    lines.join("\n")
+}
+
+/// What a `/worktree` invocation, once parsed, should do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeInvocation {
+    /// No arguments were given: prefill the composer with `/worktree <name>` for the user to
+    /// edit or confirm, rather than acting immediately.
+    SuggestName(String),
+    List,
+    Switch(String),
+    /// `remove <target>`, still awaiting the user's explicit Y/N confirmation.
+    ConfirmRemove(String),
+    Create {
+        name: String,
+        branch: gocode_core::WorktreeBranchSource,
+    },
+    /// Malformed subcommand usage, reported inline without contacting the runtime.
+    Invalid(String),
+}
+
+/// Parses the raw text typed after `/worktree` into a concrete action. Recognizes `list`,
+/// `switch <target>`, and `remove <target>` as subcommands; anything else is treated as
+/// `<name> [existing-branch]` for creation.
+fn parse_worktree_command(raw: &str, state: &AppState) -> WorktreeInvocation {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return WorktreeInvocation::SuggestName(suggest_worktree_name(state));
+    }
+
+    let mut tokens = trimmed.split_whitespace();
+    let first = tokens.next().unwrap_or_default();
+    match first {
+        "list" => WorktreeInvocation::List,
+        "switch" => tokens.next().map_or_else(
+            || WorktreeInvocation::Invalid("Usage: /worktree switch <name-or-path>".into()),
+            |target| WorktreeInvocation::Switch(target.to_string()),
+        ),
+        "remove" => tokens.next().map_or_else(
+            || WorktreeInvocation::Invalid("Usage: /worktree remove <name-or-path>".into()),
+            |target| WorktreeInvocation::ConfirmRemove(target.to_string()),
+        ),
+        name => {
+            let branch = tokens
+                .next()
+                .map_or(gocode_core::WorktreeBranchSource::New, |existing| {
+                    gocode_core::WorktreeBranchSource::Existing(existing.to_string())
+                });
+            WorktreeInvocation::Create {
+                name: name.to_string(),
+                branch,
+            }
+        }
+    }
+}
+
+/// Derives a worktree/branch name candidate from the active session's name, falling back to a
+/// timestamped default for a fresh session that has no name yet.
+fn suggest_worktree_name(state: &AppState) -> String {
+    let from_session =
+        if state.current_session_name.is_empty() || state.current_session_name == "New session" {
+            None
+        } else {
+            Some(slugify(&state.current_session_name))
+        }
+        .filter(|slug| !slug.is_empty());
+
+    from_session.unwrap_or_else(|| {
+        let unix_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        format!("task-{unix_seconds}")
+    })
+}
+
+/// Converts arbitrary text into a valid worktree/branch name segment: lowercase alphanumerics
+/// separated by single hyphens, capped at a reasonable length.
+fn slugify(text: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = true; // avoids a leading '-'
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.len() > 40 {
+        slug.pop();
+    }
+    slug.trim_end_matches('-').to_string()
+}
+
 fn effort_label(effort: Option<&str>) -> &'static str {
     EFFORT_OPTIONS
         .iter()
@@ -1414,6 +1565,8 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
 
     if let Some(prompt) = &state.pending_permission {
         render_permission_modal(frame, prompt, area);
+    } else if let Some(target) = &state.pending_worktree_removal {
+        render_worktree_removal_modal(frame, target, area);
     } else if let Some(prompt) = &state.pending_update {
         render_update_modal(frame, state, prompt, area);
     } else if let Some(message) = &state.blocking_error {
@@ -2338,6 +2491,7 @@ fn render_composer(
     );
 
     let editing = state.pending_permission.is_none()
+        && state.pending_worktree_removal.is_none()
         && state.pending_update.is_none()
         && state.blocking_error.is_none();
     if editing {
@@ -2375,6 +2529,21 @@ fn render_permission_modal(frame: &mut Frame, prompt: &PermissionPrompt, area: R
     let content = format!(
         "Permission needed\n\n{}\nin {}\n\n[y] Approve   [n] Deny",
         prompt.summary, prompt.working_directory
+    );
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title("Confirm").borders(Borders::ALL)),
+        modal,
+    );
+}
+
+fn render_worktree_removal_modal(frame: &mut Frame, target: &str, area: Rect) {
+    let modal = centered(area, 60, 7);
+    let content = format!(
+        "Remove worktree '{target}'?\n\nThis runs `git worktree remove` (no --force); \
+                  git refuses if it has uncommitted changes.\n\n[y] Remove   [n] Cancel"
     );
     frame.render_widget(Clear, modal);
     frame.render_widget(
@@ -2542,6 +2711,19 @@ fn run_terminal(
 
         if let Some(approved) = handle_permission_event(&mut state, &terminal_event) {
             send_command(&command_tx, AppCommand::PermissionResponse(approved))?;
+            continue;
+        }
+
+        if let Some((target, confirmed)) =
+            handle_worktree_removal_event(&mut state, &terminal_event)
+        {
+            if confirmed {
+                send_command(&command_tx, AppCommand::WorktreeRemove(target))?;
+            } else {
+                state.entries.push(ChatEntry::Info(format!(
+                    "Cancelled removing worktree '{target}'."
+                )));
+            }
             continue;
         }
 
@@ -2784,6 +2966,28 @@ fn run_terminal(
                     state.begin_run(prompt.clone());
                     send_command(&command_tx, AppCommand::SubmitChat(prompt))?;
                 }
+                ChatSubmission::Command(SlashCommand::Worktree(raw)) => {
+                    match parse_worktree_command(&raw, &state) {
+                        WorktreeInvocation::SuggestName(suggested) => {
+                            state.set_chat_input(format!("/worktree {suggested}"));
+                        }
+                        WorktreeInvocation::List => {
+                            send_command(&command_tx, AppCommand::WorktreeList)?;
+                        }
+                        WorktreeInvocation::Switch(target) => {
+                            send_command(&command_tx, AppCommand::WorktreeSwitch(target))?;
+                        }
+                        WorktreeInvocation::ConfirmRemove(target) => {
+                            state.pending_worktree_removal = Some(target);
+                        }
+                        WorktreeInvocation::Create { name, branch } => {
+                            send_command(&command_tx, AppCommand::WorktreeCreate { name, branch })?;
+                        }
+                        WorktreeInvocation::Invalid(message) => {
+                            state.entries.push(ChatEntry::Error(message));
+                        }
+                    }
+                }
                 ChatSubmission::Command(SlashCommand::Init) => {
                     let prompt = "Explore this repository (its structure, languages, build \
                                    system, tests, and conventions) and write a complete \
@@ -2803,6 +3007,7 @@ fn run_terminal(
         if state.screen == Screen::Chat
             && state.blocking_error.is_none()
             && state.pending_permission.is_none()
+            && state.pending_worktree_removal.is_none()
             && matches!(
                 terminal_event,
                 Event::Key(KeyEvent {
@@ -3088,6 +3293,7 @@ pub fn handle_permission_mode_event(state: &mut AppState, event: &Event) -> Opti
     if state.screen != Screen::Chat
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
+        || state.pending_worktree_removal.is_some()
         || state.pending_update.is_some()
     {
         return None;
@@ -3313,6 +3519,38 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             state.pending_permission = None;
             Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Applies Y/N confirmation keys to a pending `/worktree remove` prompt.
+///
+/// Returns the removal target together with `true` on confirmation or `false` on cancellation,
+/// clearing the prompt either way.
+#[must_use]
+pub fn handle_worktree_removal_event(
+    state: &mut AppState,
+    event: &Event,
+) -> Option<(String, bool)> {
+    let target = state.pending_worktree_removal.as_ref()?.clone();
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+
+    match code {
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+            state.pending_worktree_removal = None;
+            Some((target, true))
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            state.pending_worktree_removal = None;
+            Some((target, false))
         }
         _ => None,
     }
@@ -3859,6 +4097,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     if state.screen != Screen::Chat
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
+        || state.pending_worktree_removal.is_some()
         || state.pending_update.is_some()
     {
         return None;
@@ -3956,6 +4195,11 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
                     state.clear_chat_input();
                     return Some(ChatSubmission::Command(SlashCommand::Review(target)));
                 }
+                if name == "/worktree" {
+                    let target = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Worktree(target)));
+                }
                 if let Some(command) = resolve_custom_command(&state.custom_commands, name) {
                     let body = expand_custom_command(&command.body, arguments.trim());
                     state.clear_chat_input();
@@ -3991,10 +4235,11 @@ mod tests {
     use super::{
         AppState, ChatEntry, ChatSubmission, HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS,
         McpAddStep, McpEventOutcome, McpView, Screen, SkillsEventOutcome, SkillsView, SlashCommand,
-        UpdateEventOutcome, UpdateStage, classify_event, handle_chat_event,
+        UpdateEventOutcome, UpdateStage, WorktreeInvocation, classify_event, handle_chat_event,
         handle_effort_picker_event, handle_help_event, handle_mcp_event, handle_model_picker_event,
         handle_onboarding_event, handle_permission_event, handle_session_picker_event,
-        handle_skills_event, handle_update_event, render, run_with_event_source, slash_suggestions,
+        handle_skills_event, handle_update_event, handle_worktree_removal_event,
+        parse_worktree_command, render, run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -4687,6 +4932,191 @@ mod tests {
             Some(ChatSubmission::Command(SlashCommand::Review("main".into())))
         );
         assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn worktree_with_no_argument_is_recognized_and_carries_empty_text() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/worktree".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Worktree(
+                String::new()
+            )))
+        );
+        assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn worktree_with_arguments_carries_them_through_as_raw_text() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/worktree list".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Worktree(
+                "list".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn worktree_with_no_argument_suggests_a_name_from_the_session() {
+        let state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        // A fresh session has no name yet, so the suggestion falls back to a timestamp.
+        match parse_worktree_command("", &state) {
+            WorktreeInvocation::SuggestName(name) => assert!(name.starts_with("task-")),
+            other => panic!("expected a name suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worktree_suggests_a_name_derived_from_a_named_session() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::SessionSwitched {
+            id: "abc".into(),
+            name: "Fix the flaky login test!".into(),
+            transition: gocode_core::SessionTransition::New,
+            history: Vec::new(),
+        });
+
+        match parse_worktree_command("", &state) {
+            WorktreeInvocation::SuggestName(name) => {
+                assert_eq!(name, "fix-the-flaky-login-test");
+            }
+            other => panic!("expected a name suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worktree_list_is_parsed_as_the_list_subcommand() {
+        let state = AppState::default();
+        assert_eq!(
+            parse_worktree_command("list", &state),
+            WorktreeInvocation::List
+        );
+    }
+
+    #[test]
+    fn worktree_switch_carries_the_target_through() {
+        let state = AppState::default();
+        assert_eq!(
+            parse_worktree_command("switch my-task", &state),
+            WorktreeInvocation::Switch("my-task".into())
+        );
+        assert!(matches!(
+            parse_worktree_command("switch", &state),
+            WorktreeInvocation::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn worktree_remove_requires_confirmation_before_it_is_sent() {
+        let state = AppState::default();
+        assert_eq!(
+            parse_worktree_command("remove my-task", &state),
+            WorktreeInvocation::ConfirmRemove("my-task".into())
+        );
+        assert!(matches!(
+            parse_worktree_command("remove", &state),
+            WorktreeInvocation::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn worktree_create_defaults_to_a_new_branch_from_the_current_one() {
+        let state = AppState::default();
+        assert_eq!(
+            parse_worktree_command("my-task", &state),
+            WorktreeInvocation::Create {
+                name: "my-task".into(),
+                branch: gocode_core::WorktreeBranchSource::New,
+            }
+        );
+    }
+
+    #[test]
+    fn worktree_create_uses_an_existing_branch_when_given_one() {
+        let state = AppState::default();
+        assert_eq!(
+            parse_worktree_command("my-task some-existing-branch", &state),
+            WorktreeInvocation::Create {
+                name: "my-task".into(),
+                branch: gocode_core::WorktreeBranchSource::Existing("some-existing-branch".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn worktree_removal_confirmation_resolves_on_yes_and_cancels_on_no() {
+        let mut state = AppState {
+            pending_worktree_removal: Some("my-task".into()),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_worktree_removal_event(&mut state, &press(KeyCode::Char('n'))),
+            Some(("my-task".into(), false))
+        );
+        assert!(state.pending_worktree_removal.is_none());
+
+        state.pending_worktree_removal = Some("my-task".into());
+        assert_eq!(
+            handle_worktree_removal_event(&mut state, &press(KeyCode::Char('y'))),
+            Some(("my-task".into(), true))
+        );
+        assert!(state.pending_worktree_removal.is_none());
+    }
+
+    #[test]
+    fn worktree_removal_confirmation_blocks_chat_input_while_pending() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            pending_worktree_removal: Some("my-task".into()),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Char('x'))),
+            None
+        );
+    }
+
+    #[test]
+    fn worktree_list_is_rendered_as_an_info_entry() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::WorktreeListAvailable(vec![
+            gocode_core::WorktreeSummary {
+                path: "/code/myapp".into(),
+                branch: Some("main".into()),
+                is_main: true,
+            },
+            gocode_core::WorktreeSummary {
+                path: "/code/myapp-worktrees/my-task".into(),
+                branch: Some("my-task".into()),
+                is_main: false,
+            },
+        ]));
+
+        let ChatEntry::Info(text) = state.entries.last().expect("an entry should be pushed") else {
+            panic!("expected an Info entry");
+        };
+        assert!(text.contains("/code/myapp"));
+        assert!(text.contains("(main)"));
+        assert!(text.contains("my-task"));
     }
 
     #[test]

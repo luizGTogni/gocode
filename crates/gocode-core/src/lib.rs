@@ -77,6 +77,41 @@ pub enum AppCommand {
     },
     /// Start (or restart) the OAuth authorization flow for a configured server by name.
     McpAuthorize(String),
+    /// List every Git worktree registered against the current project.
+    WorktreeList,
+    /// Create a new, isolated Git worktree for `name` and switch the session's working directory
+    /// to it.
+    WorktreeCreate {
+        name: String,
+        branch: WorktreeBranchSource,
+    },
+    /// Switch the session's working directory to an existing worktree, resolved by name or path.
+    WorktreeSwitch(String),
+    /// Remove an existing worktree (already confirmed by the interface), resolved by name or
+    /// path. Never removes the repository's main worktree.
+    WorktreeRemove(String),
+}
+
+/// Where a new worktree's branch comes from, mirroring [`gocode_tools`]'s `BranchSource` at the
+/// interface boundary so `gocode-tui` does not need to depend on `gocode-tools`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeBranchSource {
+    /// Create a new branch named after the worktree, based on the project's currently checked-out
+    /// branch.
+    New,
+    /// Check out an already-existing branch instead of creating one.
+    Existing(String),
+}
+
+/// One worktree registered against the current project, for `/worktree list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSummary {
+    /// Absolute filesystem path.
+    pub path: String,
+    /// Checked-out branch name, or `None` for a detached HEAD.
+    pub branch: Option<String>,
+    /// Whether this is the repository's original (non-linked) worktree.
+    pub is_main: bool,
 }
 
 /// How permissively an agent run is allowed to act without asking the user first.
@@ -261,6 +296,21 @@ pub enum AppEvent {
     /// An OAuth authorization URL was opened in the system browser; shown as a fallback in case
     /// opening it failed. `McpServersAvailable` reflects the eventual outcome.
     McpAuthorizationUrlReady { server: String, url: String },
+    /// `/worktree list` finished loading, main worktree first.
+    WorktreeListAvailable(Vec<WorktreeSummary>),
+    /// A new worktree was created and the session's working directory switched to it.
+    WorktreeCreated { path: String, branch: String },
+    /// The session's working directory switched to an already-existing worktree.
+    WorktreeSwitched { path: String, branch: String },
+    /// A worktree was removed. `switched_to` is set when the removed worktree was the session's
+    /// current one, in which case the session fell back to the main worktree.
+    WorktreeRemoved {
+        path: String,
+        switched_to: Option<String>,
+    },
+    /// A worktree list/create/switch/remove operation failed with a safe, user-actionable
+    /// message.
+    WorktreeOperationFailed(String),
 }
 
 /// Coarse lifecycle phase of an active agent run, for a concise status indicator.

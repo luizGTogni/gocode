@@ -466,6 +466,10 @@ async fn run_application() -> Result<(), AppError> {
         let sessions_dir = gocode_core::sessions_dir(&paths.state_dir);
         let current_session: Arc<Mutex<gocode_core::SessionRecord>> =
             Arc::new(Mutex::new(gocode_core::SessionRecord::new()));
+        // The session's active working directory. Starts at the detected project root and moves
+        // to a Git worktree on `/worktree` create/switch, without ever touching the original
+        // project root's files or checked-out branch.
+        let mut project_root = bootstrap.project.root.clone();
         let mut active_cancellation = None;
         let config_path = paths.config_dir.join("config.toml");
         let mut mcp_runtime = McpRuntime::bootstrap(&paths, &bootstrap.project).await;
@@ -766,7 +770,7 @@ async fn run_application() -> Result<(), AppError> {
                     let request = AgentRequest {
                         prompt: message,
                         model: gocode_core::ModelId::new(model.clone()),
-                        project_root: bootstrap.project.root.clone(),
+                        project_root: project_root.clone(),
                         instructions: instructions.clone(),
                         project_overview: project_overview.clone(),
                         skills_summary: skills_summary.clone(),
@@ -1220,6 +1224,202 @@ async fn run_application() -> Result<(), AppError> {
                                 "could not report MCP server status: {error}"
                             ))
                         })?;
+                }
+                AppCommand::WorktreeList => {
+                    let runner = gocode_tools::process::TokioProcessRunner;
+                    match gocode_tools::worktree::list_worktrees(&runner, &project_root).await {
+                        Ok(entries) => {
+                            let summaries = entries
+                                .into_iter()
+                                .map(|entry| gocode_core::WorktreeSummary {
+                                    path: entry.path.display().to_string(),
+                                    branch: entry.branch,
+                                    is_main: entry.is_main,
+                                })
+                                .collect();
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::WorktreeListAvailable(summaries))
+                                .await;
+                        }
+                        Err(error) => {
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::WorktreeOperationFailed(
+                                    error.to_string(),
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                AppCommand::WorktreeCreate { name, branch } => {
+                    let runner = gocode_tools::process::TokioProcessRunner;
+                    let source = match branch {
+                        gocode_core::WorktreeBranchSource::New => {
+                            match gocode_tools::worktree::current_branch(&runner, &project_root)
+                                .await
+                            {
+                                Ok(Some(base)) => {
+                                    gocode_tools::worktree::BranchSource::New { base }
+                                }
+                                Ok(None) => {
+                                    let _ = driver
+                                        .event_tx
+                                        .send(gocode_core::AppEvent::WorktreeOperationFailed(
+                                            "the current worktree has no branch checked out \
+                                             (detached HEAD); pass an existing branch instead"
+                                                .into(),
+                                        ))
+                                        .await;
+                                    continue;
+                                }
+                                Err(error) => {
+                                    let _ = driver
+                                        .event_tx
+                                        .send(gocode_core::AppEvent::WorktreeOperationFailed(
+                                            error.to_string(),
+                                        ))
+                                        .await;
+                                    continue;
+                                }
+                            }
+                        }
+                        gocode_core::WorktreeBranchSource::Existing(existing) => {
+                            gocode_tools::worktree::BranchSource::Existing(existing)
+                        }
+                    };
+                    match gocode_tools::worktree::create_worktree(
+                        &runner,
+                        &project_root,
+                        &name,
+                        &source,
+                    )
+                    .await
+                    {
+                        Ok(entry) => {
+                            project_root = entry.path.clone();
+                            let branch_name = entry.branch.clone().unwrap_or_default();
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::WorktreeCreated {
+                                    path: entry.path.display().to_string(),
+                                    branch: branch_name,
+                                })
+                                .await;
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::ProjectContextAvailable {
+                                    working_directory: project_root.display().to_string(),
+                                })
+                                .await;
+                        }
+                        Err(error) => {
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::WorktreeOperationFailed(
+                                    error.to_string(),
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                AppCommand::WorktreeSwitch(target) => {
+                    let runner = gocode_tools::process::TokioProcessRunner;
+                    match gocode_tools::worktree::list_worktrees(&runner, &project_root).await {
+                        Ok(entries) => {
+                            match gocode_tools::worktree::resolve_target(&entries, &target) {
+                                Ok(entry) => {
+                                    project_root = entry.path.clone();
+                                    let _ = driver
+                                        .event_tx
+                                        .send(gocode_core::AppEvent::WorktreeSwitched {
+                                            path: entry.path.display().to_string(),
+                                            branch: entry.branch.clone().unwrap_or_default(),
+                                        })
+                                        .await;
+                                    let _ = driver
+                                        .event_tx
+                                        .send(gocode_core::AppEvent::ProjectContextAvailable {
+                                            working_directory: project_root.display().to_string(),
+                                        })
+                                        .await;
+                                }
+                                Err(error) => {
+                                    let _ = driver
+                                        .event_tx
+                                        .send(gocode_core::AppEvent::WorktreeOperationFailed(
+                                            error.to_string(),
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::WorktreeOperationFailed(
+                                    error.to_string(),
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                AppCommand::WorktreeRemove(target) => {
+                    let runner = gocode_tools::process::TokioProcessRunner;
+                    // Resolve against the repository from the main worktree when the session is
+                    // currently inside a linked worktree: `git worktree` subcommands work from any
+                    // worktree, but resolving from wherever we happen to be keeps this correct even
+                    // if the session is inside the worktree being removed.
+                    match gocode_tools::worktree::remove_worktree(&runner, &project_root, &target)
+                        .await
+                    {
+                        Ok(removed_path) => {
+                            let switched_to = if removed_path == project_root {
+                                if let Ok(entries) = gocode_tools::worktree::list_worktrees(
+                                    &runner,
+                                    &bootstrap.project.root,
+                                )
+                                .await
+                                {
+                                    let main_path = entries
+                                        .into_iter()
+                                        .find(|entry| entry.is_main)
+                                        .map_or_else(
+                                            || bootstrap.project.root.clone(),
+                                            |entry| entry.path,
+                                        );
+                                    project_root = main_path.clone();
+                                    let _ = driver
+                                        .event_tx
+                                        .send(gocode_core::AppEvent::ProjectContextAvailable {
+                                            working_directory: project_root.display().to_string(),
+                                        })
+                                        .await;
+                                    Some(main_path.display().to_string())
+                                } else {
+                                    project_root = bootstrap.project.root.clone();
+                                    Some(project_root.display().to_string())
+                                }
+                            } else {
+                                None
+                            };
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::WorktreeRemoved {
+                                    path: removed_path.display().to_string(),
+                                    switched_to,
+                                })
+                                .await;
+                        }
+                        Err(error) => {
+                            let _ = driver
+                                .event_tx
+                                .send(gocode_core::AppEvent::WorktreeOperationFailed(
+                                    error.to_string(),
+                                ))
+                                .await;
+                        }
+                    }
                 }
                 AppCommand::AcceptUpdate => {
                     match prepare_update(&paths.cache_dir, driver.event_tx.clone()).await {

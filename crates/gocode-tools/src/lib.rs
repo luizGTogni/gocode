@@ -11,6 +11,7 @@ pub mod process;
 pub mod registry;
 pub mod tools;
 pub mod workspace;
+pub mod worktree;
 
 pub use contract::{
     ChangeKind, FileChange, NullEventSink, Tool, ToolCall, ToolCallId, ToolContext, ToolDefinition,
