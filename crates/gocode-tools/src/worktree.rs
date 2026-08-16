@@ -74,11 +74,25 @@ pub fn is_git_repository(path: &Path) -> bool {
 
 /// Resolves `path` to its canonical form when possible, so a worktree's path is represented
 /// identically regardless of whether it was just created by this module (a native `PathBuf`
-/// join) or parsed back out of `git worktree list --porcelain` (forward-slash paths on Windows,
-/// sometimes via an 8.3 short alias). Falls back to `path` unchanged when it does not exist yet
-/// or canonicalization otherwise fails.
+/// join, possibly via an 8.3 short alias on Windows) or parsed back out of `git worktree list
+/// --porcelain` (forward-slash paths on Windows). Falls back to `path` unchanged when it does
+/// not exist yet or canonicalization otherwise fails.
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    match path.canonicalize() {
+        Ok(canonical) => strip_windows_verbatim_prefix(canonical),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Strips the `\\?\` verbatim-path prefix [`Path::canonicalize`] adds on Windows, so a
+/// canonicalized worktree path still looks like a normal path anywhere it's displayed to the
+/// user or passed back to `git`. A no-op wherever the prefix is absent, including every other
+/// platform.
+fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path,
+    }
 }
 
 /// Validates a user-supplied worktree or branch name segment: non-empty, no path separators, no
@@ -383,8 +397,9 @@ pub async fn remove_worktree(
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchSource, WorktreeError, create_worktree, current_branch, is_git_repository,
-        list_worktrees, remove_worktree, resolve_target, validate_name, worktrees_root,
+        BranchSource, WorktreeError, canonicalize_best_effort, create_worktree, current_branch,
+        is_git_repository, list_worktrees, remove_worktree, resolve_target, validate_name,
+        worktrees_root,
     };
     use crate::process::TokioProcessRunner;
     use std::{
@@ -479,7 +494,10 @@ mod tests {
 
         assert!(entry.path.exists());
         assert_eq!(entry.branch.as_deref(), Some("my-task"));
-        assert_eq!(entry.path, worktrees_root(&root).unwrap().join("my-task"));
+        assert_eq!(
+            entry.path,
+            canonicalize_best_effort(&worktrees_root(&root).unwrap().join("my-task"))
+        );
 
         // The main worktree's branch and files are untouched.
         let still_on_main = current_branch(&runner, &root).await.unwrap().unwrap();
