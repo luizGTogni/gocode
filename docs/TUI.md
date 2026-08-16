@@ -887,6 +887,7 @@ MVP:
 /help
 /init
 /skills
+/mcp
 /exit
 ```
 
@@ -922,6 +923,7 @@ Example:
 /help       Show help
 /init       Write an AGENTS.md overview of the project
 /skills     List discovered skills
+/mcp        Manage MCP server connections
 /exit       Exit Gocode
 ```
 
@@ -2505,7 +2507,33 @@ the existing read-file tool.
 
 ---
 
-# 142. Final Rule
+# 142. `/mcp`
+
+Manages MCP (Model Context Protocol) server connections. Added in v0.4.0; see
+[docs/MCP.md](MCP.md) for the full guide.
+
+Opens a popup with three screens:
+
+```text
+Menu
+ ├─ Servers        list configured servers, connect/disconnect, inspect tools
+ └─ Add server     guided wizard: name, transport, command/URL, auth
+```
+
+The server list shows each configured server's transport, live connection status, and tool
+count. From there:
+
+- `Enter` connects a disconnected server, or disconnects a connected one;
+- `o` starts the OAuth authorization flow for a server that needs it (opens the system browser);
+- `→` drills into a server's discovered tools;
+- `Esc` steps back a screen.
+
+Connected servers' tools are merged into the model's tool set automatically, namespaced as
+`mcp__<server>__<tool>` so they never collide with built-in tools or another server's tools.
+
+---
+
+# 143. Final Rule
 
 The Gocode TUI should not feel like an interface for an AI API.
 

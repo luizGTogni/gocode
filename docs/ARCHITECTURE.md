@@ -1745,7 +1745,9 @@ No mandatory remote telemetry should be assumed by the architecture.
 Do not create now:
 
 - full plugin engine;
-- complex MCP framework;
+- complex MCP framework (v0.4.0 added a minimal MCP client — `gocode-mcp`: JSON-RPC framing,
+  stdio/streamable-HTTP transports, OAuth — reusing the existing `Tool` trait rather than a
+  generic plugin engine; keep it that way);
 - distributed agents;
 - database abstraction;
 - full event sourcing;

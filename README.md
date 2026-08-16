@@ -19,7 +19,9 @@ commands remain inside the detected workspace and follow permission policy.
 
 Gocode has no telemetry in v0.1.0. See [security](docs/SECURITY.md),
 [provider details](docs/NVIDIA_NIM.md), [configuration](docs/CONFIG.md), and
-[tool permissions](docs/TOOLS.md) before using it with sensitive projects.
+[tool permissions](docs/TOOLS.md) before using it with sensitive projects. Gocode can also
+connect to [MCP servers](docs/MCP.md) — read that guide before adding one, since a server's
+tools run with the same permissions as Gocode's own.
 
 ## Support
 
