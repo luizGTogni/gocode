@@ -885,6 +885,8 @@ MVP:
 /config
 /clear
 /help
+/init
+/skills
 /exit
 ```
 
@@ -918,6 +920,8 @@ Example:
 /config     Open settings
 /clear      Clear conversation
 /help       Show help
+/init       Write an AGENTS.md overview of the project
+/skills     List discovered skills
 /exit       Exit Gocode
 ```
 
@@ -2064,6 +2068,8 @@ Ctrl+C      Exit
 /config     Settings
 /clear      Clear conversation
 /help       Help
+/init       Write an AGENTS.md overview
+/skills     List discovered skills
 /exit       Exit
 ```
 
@@ -2477,7 +2483,29 @@ Update now / Not now
 
 ---
 
-# 140. Final Rule
+# 140. `/init`
+
+Asks the agent to explore the project and write a complete `AGENTS.md` at the project root:
+purpose, structure, build/test/lint commands, and conventions an AI coding agent should follow.
+
+Implemented as a canned prompt sent through the normal chat path, the same way a user would
+type the request by hand — the agent uses its existing file tools, no dedicated tool needed.
+
+Distinct from automatic `.gocode/` project bootstrap, which happens unconditionally at every
+startup and needs no command.
+
+---
+
+# 141. `/skills`
+
+Lists skills discovered from `~/.agents/skills/` (global) and the project's `.agents/skills/`
+(or `.gocode/skills/` fallback when `.agents/` doesn't exist). Each skill's name and description
+are also surfaced to the model as a system message so it can read the full file on demand via
+the existing read-file tool.
+
+---
+
+# 142. Final Rule
 
 The Gocode TUI should not feel like an interface for an AI API.
 

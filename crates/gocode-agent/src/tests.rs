@@ -69,6 +69,8 @@ fn request(project_root: &Path, prompt: &str) -> AgentRequest {
         model: ModelId::new("fake/model"),
         project_root: project_root.to_path_buf(),
         instructions: None,
+        project_overview: None,
+        skills_summary: None,
         tools_enabled: true,
         reasoning_effort: None,
         history: Vec::new(),

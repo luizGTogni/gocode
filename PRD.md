@@ -691,11 +691,14 @@ Possible future commands:
 
 ```text
 /review
-/compact
-/context
 ```
 
-`/init` is probably unnecessary because project initialization is automatic.
+Implemented beyond the original MVP list: `/compact` (and `/autocompact`), `/skills`, and
+`/init`. Project-local `.gocode/` bootstrap (config, instructions file, sessions, commands, and
+skills directories) is automatic and needs no command — but `/init` turned out to have a
+different, useful meaning: it asks the agent to explore the repository and write an `AGENTS.md`
+overview at the project root, the same convention other coding agents use. That is additive
+project context, not initialization, so it earns a command after all.
 
 ---
 

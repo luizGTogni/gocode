@@ -4,8 +4,8 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use gocode_agent::{Agent, AgentEvent, AgentRequest};
 use gocode_core::{
-    AppCommand, AppError, EnvironmentPaths, Platform, PlatformPaths, RuntimeChannels,
-    bootstrap_with_paths,
+    AUTO_COMPACT_TOKEN_THRESHOLD, AppCommand, AppError, EnvironmentPaths, Platform, PlatformPaths,
+    RuntimeChannels, bootstrap_with_paths,
 };
 use gocode_credentials::{CredentialStore, NativeCredentialStore, SecretString};
 use gocode_provider_nvidia::NvidiaProvider;
@@ -145,6 +145,7 @@ async fn bridge_agent_events(
                 turns: completion.stats.turns,
                 tool_calls: completion.stats.tool_calls,
                 failed_tool_calls: completion.stats.failed_tool_calls,
+                last_input_tokens: completion.stats.last_input_tokens,
             }),
             AgentEvent::Cancelled => Some(gocode_core::AppEvent::AgentCancelled),
         };
@@ -178,12 +179,6 @@ fn first_line(text: &str, max_chars: usize) -> String {
         first.into()
     }
 }
-
-/// Conservative trigger for automatic compaction: the provider's reported input-token count for
-/// the run's last turn. NVIDIA NIM's model listing does not expose each model's real context
-/// window, so this errs toward compacting earlier rather than risking an oversized request
-/// against a smaller-context model.
-const AUTO_COMPACT_TOKEN_THRESHOLD: u64 = 24_000;
 
 /// Everything a compaction (automatic or `/compact`) needs to read and update the active session.
 struct CompactionContext<'a> {
@@ -342,6 +337,78 @@ async fn run_application() -> Result<(), AppError> {
         let permission_pending: PendingPermission = Arc::new(Mutex::new(None));
         let instructions =
             std::fs::read_to_string(bootstrap.project.gocode_dir.join("instructions.md")).ok();
+        let project_overview =
+            std::fs::read_to_string(bootstrap.project.root.join("AGENTS.md")).ok();
+
+        let custom_commands =
+            gocode_core::load_custom_commands(&bootstrap.project.gocode_dir.join("commands"));
+        driver
+            .event_tx
+            .send(gocode_core::AppEvent::CustomCommandsAvailable(
+                custom_commands,
+            ))
+            .await
+            .map_err(|error| {
+                AppError::Initialization(format!(
+                    "could not send discovered custom commands: {error}"
+                ))
+            })?;
+
+        let global_skills_dir = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|home| Path::new(&home).join(".agents").join("skills"));
+        let project_agents_skills_dir = bootstrap.project.root.join(".agents").join("skills");
+        let project_skills_dir = if project_agents_skills_dir.is_dir() {
+            project_agents_skills_dir
+        } else {
+            bootstrap.project.gocode_dir.join("skills")
+        };
+        let skills = gocode_core::load_skills(global_skills_dir.as_deref(), &project_skills_dir);
+        let skills_summary = (!skills.is_empty()).then(|| {
+            skills
+                .iter()
+                .map(|skill| {
+                    format!(
+                        "- {}: {} (read {} to use)",
+                        skill.name,
+                        skill.description,
+                        skill.path.display()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        driver
+            .event_tx
+            .send(gocode_core::AppEvent::SkillsAvailable(skills))
+            .await
+            .map_err(|error| {
+                AppError::Initialization(format!("could not send discovered skills: {error}"))
+            })?;
+
+        driver
+            .event_tx
+            .send(gocode_core::AppEvent::ProjectContextAvailable {
+                working_directory: bootstrap.project.root.display().to_string(),
+            })
+            .await
+            .map_err(|error| {
+                AppError::Initialization(format!(
+                    "could not send the project working directory: {error}"
+                ))
+            })?;
+        driver
+            .event_tx
+            .send(gocode_core::AppEvent::SessionSwitched {
+                id: current_session.lock().await.id.clone(),
+                name: "New session".into(),
+                is_new: true,
+                history: Vec::new(),
+            })
+            .await
+            .map_err(|error| {
+                AppError::Initialization(format!("could not confirm the initial session: {error}"))
+            })?;
 
         if let Some(effort) = reasoning_effort.clone() {
             driver
@@ -552,6 +619,8 @@ async fn run_application() -> Result<(), AppError> {
                         model: gocode_core::ModelId::new(model.clone()),
                         project_root: bootstrap.project.root.clone(),
                         instructions: instructions.clone(),
+                        project_overview: project_overview.clone(),
+                        skills_summary: skills_summary.clone(),
                         tools_enabled,
                         reasoning_effort: reasoning_effort.clone(),
                         history: history_snapshot,
@@ -705,10 +774,15 @@ async fn run_application() -> Result<(), AppError> {
                     let _ = std::fs::remove_file(sessions_dir.join(format!("{stale_id}.json")));
                 }
                 AppCommand::NewSession => {
-                    *current_session.lock().await = gocode_core::SessionRecord::new();
+                    let id = {
+                        let mut session = current_session.lock().await;
+                        *session = gocode_core::SessionRecord::new();
+                        session.id.clone()
+                    };
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::SessionSwitched {
+                            id,
                             name: "New session".into(),
                             is_new: true,
                             history: Vec::new(),
@@ -745,12 +819,14 @@ async fn run_application() -> Result<(), AppError> {
                                     i64::try_from(duration.as_secs()).unwrap_or(0)
                                 });
                             let _ = gocode_core::save_session(&sessions_dir, &session);
+                            let id = session.id.clone();
                             let name = session.name.clone();
                             let history = session.history.clone();
                             *current_session.lock().await = session;
                             driver
                                 .event_tx
                                 .send(gocode_core::AppEvent::SessionSwitched {
+                                    id,
                                     name,
                                     is_new: false,
                                     history,

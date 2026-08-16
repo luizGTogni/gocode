@@ -17,6 +17,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -147,8 +148,12 @@ pub enum SlashCommand {
     NewSession,
     /// Open the saved-session picker.
     ResumeSession,
-    /// List available commands.
+    /// Open the command-reference popup.
     Help,
+    /// Generate an `AGENTS.md` overview of the project by asking the agent to explore it.
+    Init,
+    /// Open the discovered-skills popup.
+    Skills,
     /// Exit Gocode.
     Exit,
 }
@@ -196,22 +201,40 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "Pick a previous session to continue",
         SlashCommand::ResumeSession,
     ),
-    ("/help", "List available commands", SlashCommand::Help),
+    ("/help", "Show the command reference", SlashCommand::Help),
+    (
+        "/init",
+        "Explore the project and write an AGENTS.md overview",
+        SlashCommand::Init,
+    ),
+    (
+        "/skills",
+        "List discovered skills (global and project)",
+        SlashCommand::Skills,
+    ),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
     ("/quit", "Exit Gocode", SlashCommand::Exit),
 ];
 
-/// Slash-command suggestions matching the current composer prefix.
+/// Slash-command suggestions matching the current composer prefix: every built-in command plus
+/// any discovered project-local custom command, in that order.
 #[must_use]
-pub fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
+pub fn slash_suggestions(
+    input: &str,
+    custom_commands: &[gocode_core::CustomCommand],
+) -> Vec<(String, String)> {
     if !input.starts_with('/') {
         return Vec::new();
     }
-    SLASH_COMMANDS
+    let builtins = SLASH_COMMANDS
         .iter()
         .filter(|(name, _, _)| name.starts_with(input))
-        .map(|(name, description, _)| (*name, *description))
-        .collect()
+        .map(|(name, description, _)| ((*name).to_string(), (*description).to_string()));
+    let custom = custom_commands
+        .iter()
+        .map(|command| (format!("/{}", command.name), command.description.clone()))
+        .filter(|(name, _)| name.starts_with(input));
+    builtins.chain(custom).collect()
 }
 
 fn resolve_slash_command(input: &str) -> Option<SlashCommand> {
@@ -219,6 +242,22 @@ fn resolve_slash_command(input: &str) -> Option<SlashCommand> {
         .iter()
         .find(|(name, _, _)| *name == input)
         .map(|(_, _, command)| *command)
+}
+
+/// Finds the custom command exactly named `name` (including the leading `/`), if any.
+fn resolve_custom_command<'a>(
+    custom_commands: &'a [gocode_core::CustomCommand],
+    name: &str,
+) -> Option<&'a gocode_core::CustomCommand> {
+    custom_commands
+        .iter()
+        .find(|command| format!("/{}", command.name) == name)
+}
+
+/// Expands a custom command's body, substituting every `$ARGUMENTS` with the text typed after
+/// the command name (empty when none was given).
+fn expand_custom_command(body: &str, arguments: &str) -> String {
+    body.replace("$ARGUMENTS", arguments)
 }
 
 /// A composer submission: either a model prompt or a client-handled command.
@@ -232,6 +271,11 @@ pub enum ChatSubmission {
 
 /// Renderable interface state derived from application events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag independently tracks one popup/toggle's visibility; a state machine \
+              would not simplify the largely orthogonal screen and modal state here"
+)]
 pub struct AppState {
     /// Visible top-level screen.
     pub screen: Screen,
@@ -260,6 +304,29 @@ pub struct AppState {
     activity: Option<AgentActivityState>,
     pending_permission: Option<PermissionPrompt>,
     pending_update: Option<UpdatePrompt>,
+    /// Whether the `/help` popup is currently shown over the chat screen.
+    help_visible: bool,
+    /// Whether the `/skills` popup is currently shown over the chat screen.
+    skills_visible: bool,
+    /// Project-local slash commands discovered under `.gocode/commands/`.
+    custom_commands: Vec<gocode_core::CustomCommand>,
+    /// Global and project skills discovered at boot.
+    skills: Vec<gocode_core::SkillSummary>,
+    /// Display form of the detected project root, shown by `/status`.
+    working_directory: String,
+    /// The active session's id, shown by `/status`.
+    current_session_id: String,
+    /// The active session's display name, shown by `/status`.
+    current_session_name: String,
+    /// Input tokens reported for the last completed run's last turn, shown by `/status` as an
+    /// approximate context-usage figure.
+    last_input_tokens: Option<u64>,
+    /// Set while `/model` (not `/settings`) is driving the model picker, so a selection there
+    /// chains into the effort picker instead of returning straight to chat.
+    model_flow_pending_effort: bool,
+    /// The model chosen by an in-progress `/model` flow, applied together with whatever effort
+    /// is chosen next.
+    pending_model: Option<String>,
     queued_update: Option<UpdatePrompt>,
     exit_for_update: bool,
     blocking_error: Option<String>,
@@ -289,6 +356,13 @@ impl AppState {
         match event {
             AppEvent::BootStarted => self.screen = Screen::Boot,
             AppEvent::BootCompleted => self.screen = Screen::Chat,
+            AppEvent::ProjectContextAvailable { working_directory } => {
+                self.working_directory.clone_from(working_directory);
+            }
+            AppEvent::CustomCommandsAvailable(commands) => {
+                self.custom_commands.clone_from(commands);
+            }
+            AppEvent::SkillsAvailable(skills) => self.skills.clone_from(skills),
             AppEvent::TerminalResized { .. } => {}
             AppEvent::CredentialRequired => self.screen = Screen::Onboarding,
             AppEvent::CredentialValidationStarted => {
@@ -363,7 +437,9 @@ impl AppState {
                 turns,
                 tool_calls,
                 failed_tool_calls,
+                last_input_tokens,
             } => {
+                self.last_input_tokens = *last_input_tokens;
                 self.activity = None;
                 self.streaming_assistant = false;
                 if let Some(text) = final_text.as_ref().filter(|text| !text.is_empty()) {
@@ -411,10 +487,13 @@ impl AppState {
                 )));
             }
             AppEvent::SessionSwitched {
+                id,
                 name,
                 is_new,
                 history,
             } => {
+                self.current_session_id.clone_from(id);
+                self.current_session_name.clone_from(name);
                 self.entries.clear();
                 self.scroll = 0;
                 self.streaming_assistant = false;
@@ -576,12 +655,12 @@ impl AppState {
     }
 
     fn autocomplete(&mut self) {
-        let suggestions = slash_suggestions(&self.chat_input);
+        let suggestions = slash_suggestions(&self.chat_input, &self.custom_commands);
         if suggestions.is_empty() {
             return;
         }
         let index = self.suggestion_selected.min(suggestions.len() - 1);
-        self.set_chat_input(suggestions[index].0.to_string());
+        self.set_chat_input(suggestions[index].0.clone());
     }
 
     /// Replaces the composer's text wholesale, moving the cursor to its end.
@@ -1092,7 +1171,7 @@ fn format_relative_time(unix_seconds: i64) -> String {
 /// Splits the chat screen into its history and composer areas. Shared by rendering and mouse
 /// hit-testing so both agree exactly on where the history viewport sits.
 fn chat_layout(area: Rect, state: &AppState) -> (Rect, Rect) {
-    let suggestions = slash_suggestions(&state.chat_input);
+    let suggestions = slash_suggestions(&state.chat_input, &state.custom_commands);
     let input_lines = 1 + state.chat_input.matches('\n').count();
     let suggestion_lines = suggestions.len().min(MAX_VISIBLE_SUGGESTIONS);
     let status_lines = usize::from(state.status.is_some());
@@ -1109,7 +1188,7 @@ fn chat_layout(area: Rect, state: &AppState) -> (Rect, Rect) {
 }
 
 fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
-    let suggestions = slash_suggestions(&state.chat_input);
+    let suggestions = slash_suggestions(&state.chat_input, &state.custom_commands);
     let (history_area, composer_area) = chat_layout(area, state);
 
     render_history(frame, state, history_area);
@@ -1125,7 +1204,74 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
         render_update_modal(frame, prompt, area);
     } else if let Some(message) = &state.blocking_error {
         render_blocking_error_modal(frame, message, area);
+    } else if state.help_visible {
+        render_help_modal(frame, state, area);
+    } else if state.skills_visible {
+        render_skills_modal(frame, state, area);
     }
+}
+
+fn render_help_modal(frame: &mut Frame, state: &AppState, area: Rect) {
+    let height = u16::try_from((14 + state.custom_commands.len()).min(24)).unwrap_or(24);
+    let modal = centered(area, 76, height);
+    let mut content = String::from("Commands\n\n");
+    for (name, description, _) in SLASH_COMMANDS {
+        let _ = writeln!(content, "{name:<14} {description}");
+    }
+    if !state.custom_commands.is_empty() {
+        content.push_str("\nProject commands (.gocode/commands/)\n\n");
+        for command in &state.custom_commands {
+            let name = format!("/{}", command.name);
+            let description = if command.description.is_empty() {
+                "(no description)"
+            } else {
+                command.description.as_str()
+            };
+            let _ = writeln!(content, "{name:<14} {description}");
+        }
+    }
+    content.push_str("\nEsc/Enter to close");
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Gocode · Help")
+                .borders(Borders::ALL),
+        ),
+        modal,
+    );
+}
+
+fn render_skills_modal(frame: &mut Frame, state: &AppState, area: Rect) {
+    let height = u16::try_from((6 + state.skills.len()).min(24)).unwrap_or(24);
+    let modal = centered(area, 76, height);
+    let mut content = String::from("Discovered skills\n\n");
+    if state.skills.is_empty() {
+        content.push_str("None found in ~/.agents/skills or the project's skills directory.\n");
+    } else {
+        for skill in &state.skills {
+            let source = match skill.source {
+                gocode_core::SkillSource::Global => "global",
+                gocode_core::SkillSource::Project => "project",
+            };
+            let description = if skill.description.is_empty() {
+                "(no description)"
+            } else {
+                skill.description.as_str()
+            };
+            let _ = writeln!(content, "{} — {description} ({source})", skill.name);
+        }
+    }
+    content.push_str("\nEsc/Enter to close");
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Gocode · Skills")
+                .borders(Borders::ALL),
+        ),
+        modal,
+    );
 }
 
 /// Space kept between the copy-notification text and the history box's border, so the toast
@@ -1338,7 +1484,12 @@ fn selected_char_range(
     (from < to).then_some((from, to))
 }
 
-fn render_composer(frame: &mut Frame, state: &AppState, area: Rect, suggestions: &[(&str, &str)]) {
+fn render_composer(
+    frame: &mut Frame,
+    state: &AppState,
+    area: Rect,
+    suggestions: &[(String, String)],
+) {
     let input_display_lines: Vec<&str> = state.chat_input.split('\n').collect();
     let input_line_count = input_display_lines.len();
     let mut lines: Vec<Line> = input_display_lines
@@ -1644,8 +1795,21 @@ fn run_terminal(
             continue;
         }
 
+        let was_effort_picker = state.screen == Screen::EffortPicker;
         if let Some(effort) = handle_effort_picker_event(&mut state, &terminal_event) {
+            if let Some(model) = state.pending_model.take() {
+                state.model_flow_pending_effort = false;
+                send_command(&command_tx, AppCommand::SelectModel(model))?;
+            }
             send_command(&command_tx, AppCommand::SetReasoningEffort(effort))?;
+            continue;
+        }
+        if was_effort_picker
+            && state.screen != Screen::EffortPicker
+            && let Some(model) = state.pending_model.take()
+        {
+            state.model_flow_pending_effort = false;
+            send_command(&command_tx, AppCommand::SelectModel(model))?;
             continue;
         }
 
@@ -1656,6 +1820,14 @@ fn run_terminal(
 
         if let Some(mode) = handle_permission_mode_event(&mut state, &terminal_event) {
             send_command(&command_tx, AppCommand::SetPermissionMode(mode))?;
+            continue;
+        }
+
+        if handle_help_event(&mut state, &terminal_event) {
+            continue;
+        }
+
+        if handle_skills_event(&mut state, &terminal_event) {
             continue;
         }
 
@@ -1709,6 +1881,7 @@ fn run_terminal(
                 ChatSubmission::Command(SlashCommand::Model) => {
                     state.screen = Screen::ModelPicker;
                     state.selected_model = 0;
+                    state.model_flow_pending_effort = true;
                 }
                 ChatSubmission::Command(SlashCommand::Settings) => {
                     state.screen = Screen::Settings;
@@ -1725,16 +1898,52 @@ fn run_terminal(
                         .clone()
                         .unwrap_or_else(|| "none selected".into());
                     let effort = effort_label(state.current_effort.as_deref());
+                    let directory = if state.working_directory.is_empty() {
+                        "unknown".into()
+                    } else {
+                        state.working_directory.clone()
+                    };
+                    let session = if state.current_session_id.is_empty() {
+                        "none".into()
+                    } else {
+                        format!(
+                            "{} ({})",
+                            state.current_session_name,
+                            &state.current_session_id[..state.current_session_id.len().min(8)]
+                        )
+                    };
+                    let context = state.last_input_tokens.map_or_else(
+                        || "not yet measured".into(),
+                        |tokens| {
+                            let percent = tokens.saturating_mul(100)
+                                / gocode_core::AUTO_COMPACT_TOKEN_THRESHOLD;
+                            format!("~{percent}% ({tokens} tok, approx.)")
+                        },
+                    );
                     state.entries.push(ChatEntry::Info(format!(
-                        "Provider: NVIDIA NIM · Model: {model} · Reasoning effort: {effort}"
+                        "Provider: NVIDIA NIM · Model: {model} · Reasoning effort: {effort}\n\
+                         Directory: {directory}\n\
+                         Session: {session}\n\
+                         Context: {context}"
                     )));
                 }
                 ChatSubmission::Command(SlashCommand::Help) => {
-                    state.entries.push(ChatEntry::Info(
-                        "Commands: /model /settings /provider /status /clear /compact \
-                         /autocompact /new /resume /help /exit /quit"
-                            .into(),
-                    ));
+                    state.help_visible = true;
+                }
+                ChatSubmission::Command(SlashCommand::Skills) => {
+                    state.skills_visible = true;
+                }
+                ChatSubmission::Command(SlashCommand::Init) => {
+                    let prompt = "Explore this repository (its structure, languages, build \
+                                   system, tests, and conventions) and write a complete \
+                                   AGENTS.md file at the project root. Cover: what the project \
+                                   is and does, its directory structure, how to build/run/test/ \
+                                   lint it, and coding conventions an AI coding agent should \
+                                   follow when working in this codebase. Use the file tools to \
+                                   create the file."
+                        .to_string();
+                    state.begin_run(prompt.clone());
+                    send_command(&command_tx, AppCommand::SubmitChat(prompt))?;
                 }
             }
             continue;
@@ -1879,8 +2088,23 @@ pub fn handle_model_picker_event(state: &mut AppState, event: &Event) -> Option<
         KeyCode::Down if !state.models.is_empty() => {
             state.selected_model = (state.selected_model + 1).min(state.models.len() - 1);
         }
-        KeyCode::Enter => return state.selected_model(),
-        KeyCode::Esc if state.current_model.is_some() => state.screen = Screen::Chat,
+        KeyCode::Enter => {
+            let model = state.selected_model()?;
+            if state.model_flow_pending_effort {
+                state.pending_model = Some(model);
+                state.screen = Screen::EffortPicker;
+                state.selected_effort = EFFORT_OPTIONS
+                    .iter()
+                    .position(|(_, value)| *value == state.current_effort.as_deref())
+                    .unwrap_or(0);
+                return None;
+            }
+            return Some(model);
+        }
+        KeyCode::Esc if state.current_model.is_some() => {
+            state.model_flow_pending_effort = false;
+            state.screen = Screen::Chat;
+        }
         _ => {}
     }
     None
@@ -1916,6 +2140,7 @@ pub fn handle_settings_event(state: &mut AppState, event: &Event) -> bool {
             }
             1 => {
                 state.screen = Screen::ModelPicker;
+                state.model_flow_pending_effort = false;
                 state.selected_model = state
                     .models
                     .iter()
@@ -2267,10 +2492,62 @@ pub fn handle_update_event(state: &mut AppState, event: &Event) -> Option<bool> 
     }
 }
 
+/// Dismisses the `/help` popup on Enter or Esc.
+///
+/// Returns `true` when the event was handled, so the caller can skip further dispatch.
+pub fn handle_help_event(state: &mut AppState, event: &Event) -> bool {
+    if !state.help_visible {
+        return false;
+    }
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return false;
+    };
+    match code {
+        KeyCode::Enter | KeyCode::Esc => {
+            state.help_visible = false;
+            true
+        }
+        _ => true,
+    }
+}
+
+/// Dismisses the `/skills` popup on Enter or Esc.
+///
+/// Returns `true` when the event was handled, so the caller can skip further dispatch.
+pub fn handle_skills_event(state: &mut AppState, event: &Event) -> bool {
+    if !state.skills_visible {
+        return false;
+    }
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return false;
+    };
+    match code {
+        KeyCode::Enter | KeyCode::Esc => {
+            state.skills_visible = false;
+            true
+        }
+        _ => true,
+    }
+}
+
 /// Applies text input, navigation, and control keys to the chat composer.
 ///
 /// Returns a submission on Enter: a prompt for the model, or a recognized slash command.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat key-dispatch match is clearer here than splitting it across helpers"
+)]
 pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubmission> {
     if state.screen != Screen::Chat
         || state.blocking_error.is_some()
@@ -2295,7 +2572,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         return None;
     };
 
-    let suggestion_count = slash_suggestions(&state.chat_input).len();
+    let suggestion_count = slash_suggestions(&state.chat_input, &state.custom_commands).len();
 
     match code {
         KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2353,14 +2630,25 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
             if trimmed.is_empty() {
                 return None;
             }
-            let suggestions = slash_suggestions(&state.chat_input);
+            let suggestions = slash_suggestions(&state.chat_input, &state.custom_commands);
             if !suggestions.is_empty() {
                 let index = state.suggestion_selected.min(suggestions.len() - 1);
-                let (name, _) = suggestions[index];
-                if let Some(command) = resolve_slash_command(name) {
+                let name = suggestions[index].0.clone();
+                if let Some(command) = resolve_slash_command(&name) {
                     state.clear_chat_input();
                     return Some(ChatSubmission::Command(command));
                 }
+                if let Some(command) = resolve_custom_command(&state.custom_commands, &name) {
+                    let body = expand_custom_command(&command.body, "");
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Prompt(body));
+                }
+            } else if let Some((name, arguments)) = trimmed.split_once(char::is_whitespace)
+                && let Some(command) = resolve_custom_command(&state.custom_commands, name)
+            {
+                let body = expand_custom_command(&command.body, arguments.trim());
+                state.clear_chat_input();
+                return Some(ChatSubmission::Prompt(body));
             }
             let text = std::mem::take(&mut state.chat_input);
             state.cursor = 0;
@@ -2390,7 +2678,8 @@ mod tests {
 
     use super::{
         AppState, ChatEntry, ChatSubmission, InputAction, MAX_VISIBLE_SUGGESTIONS, Screen,
-        SlashCommand, classify_event, handle_chat_event, handle_onboarding_event,
+        SlashCommand, classify_event, handle_chat_event, handle_effort_picker_event,
+        handle_help_event, handle_model_picker_event, handle_onboarding_event,
         handle_permission_event, handle_session_picker_event, handle_update_event, render,
         run_with_event_source, slash_suggestions,
     };
@@ -2469,6 +2758,7 @@ mod tests {
             turns: 1,
             tool_calls: 0,
             failed_tool_calls: 0,
+            last_input_tokens: None,
         });
         assert_eq!(
             state
@@ -2937,6 +3227,7 @@ mod tests {
         state.begin_run("leftover prompt".into());
 
         state.apply(&AppEvent::SessionSwitched {
+            id: "session-1".into(),
             name: "fix the login bug".into(),
             is_new: false,
             history: vec![
@@ -2957,6 +3248,7 @@ mod tests {
         );
 
         state.apply(&AppEvent::SessionSwitched {
+            id: "session-2".into(),
             name: "New session".into(),
             is_new: true,
             history: Vec::new(),
@@ -3099,13 +3391,16 @@ mod tests {
             chat_input: "/s".into(),
             ..AppState::default()
         };
-        assert_eq!(slash_suggestions(&state.chat_input).len(), 2);
+        assert_eq!(
+            slash_suggestions(&state.chat_input, &state.custom_commands).len(),
+            3
+        );
 
         let _ = handle_chat_event(&mut state, &press(KeyCode::Down));
         assert_eq!(state.suggestion_selected, 1);
 
         let _ = handle_chat_event(&mut state, &press(KeyCode::Tab));
-        assert_eq!(state.chat_input, slash_suggestions("/s")[1].0);
+        assert_eq!(state.chat_input, slash_suggestions("/s", &[])[1].0);
     }
 
     #[test]
@@ -3139,8 +3434,102 @@ mod tests {
 
     #[test]
     fn slash_suggestions_filter_by_prefix() {
-        assert_eq!(slash_suggestions("/s").len(), 2);
-        assert!(slash_suggestions("hello").is_empty());
+        assert_eq!(slash_suggestions("/s", &[]).len(), 3);
+        assert!(slash_suggestions("hello", &[]).is_empty());
+    }
+
+    #[test]
+    fn slash_suggestions_include_custom_commands_and_are_matched_before_a_builtin_lookup() {
+        let custom = vec![gocode_core::CustomCommand {
+            name: "deploy".into(),
+            description: "Ship the app".into(),
+            body: "Deploy to $ARGUMENTS.".into(),
+        }];
+
+        let suggestions = slash_suggestions("/dep", &custom);
+        assert_eq!(
+            suggestions,
+            vec![("/deploy".to_string(), "Ship the app".to_string())]
+        );
+    }
+
+    #[test]
+    fn enter_expands_a_custom_command_with_its_arguments() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/deploy staging".into(),
+            custom_commands: vec![gocode_core::CustomCommand {
+                name: "deploy".into(),
+                description: "Ship the app".into(),
+                body: "Deploy to $ARGUMENTS now.".into(),
+            }],
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Prompt("Deploy to staging now.".into()))
+        );
+        assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn enter_expands_a_custom_command_with_no_arguments() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/deploy".into(),
+            custom_commands: vec![gocode_core::CustomCommand {
+                name: "deploy".into(),
+                description: "Ship the app".into(),
+                body: "Deploy to $ARGUMENTS now.".into(),
+            }],
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Prompt("Deploy to  now.".into()))
+        );
+    }
+
+    #[test]
+    fn help_popup_toggles_visible_and_dismisses_on_escape() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/help".into(),
+            ..AppState::default()
+        };
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Help))
+        );
+
+        state.help_visible = true;
+        assert!(handle_help_event(&mut state, &press(KeyCode::Esc)));
+        assert!(!state.help_visible);
+    }
+
+    #[test]
+    fn model_flow_chains_into_the_effort_picker_before_returning_to_chat() {
+        let mut state = AppState {
+            screen: Screen::ModelPicker,
+            models: vec!["nvidia/model-a".into()],
+            selected_model: 0,
+            model_flow_pending_effort: true,
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_model_picker_event(&mut state, &press(KeyCode::Enter)),
+            None
+        );
+        assert_eq!(state.screen, Screen::EffortPicker);
+        assert_eq!(state.pending_model.as_deref(), Some("nvidia/model-a"));
+
+        assert_eq!(
+            handle_effort_picker_event(&mut state, &press(KeyCode::Enter)),
+            Some(None)
+        );
     }
 
     #[test]
@@ -3167,6 +3556,7 @@ mod tests {
             turns: 1,
             tool_calls: 0,
             failed_tool_calls: 0,
+            last_input_tokens: None,
         });
 
         assert_eq!(dispatched, Some("second".into()));
@@ -3474,7 +3864,7 @@ mod tests {
             cursor: 1,
             ..AppState::default()
         };
-        let total = slash_suggestions("/").len();
+        let total = slash_suggestions("/", &[]).len();
         assert!(
             total >= 6,
             "test assumes at least 6 commands share the '/' prefix"

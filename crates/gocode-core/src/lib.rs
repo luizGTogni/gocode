@@ -1,7 +1,17 @@
+mod markdown_doc;
 mod session;
+pub use markdown_doc::{
+    CustomCommand, SkillSource, SkillSummary, load_custom_commands, load_skills, parse_frontmatter,
+};
 pub use session::{
     SessionRecord, SessionSummary, list_sessions, load_session, save_session, sessions_dir,
 };
+
+/// Conservative trigger for automatic compaction: the provider's reported input-token count for
+/// the run's last turn. NVIDIA NIM's model listing does not expose each model's real context
+/// window, so this errs toward compacting earlier rather than risking an oversized request
+/// against a smaller-context model.
+pub const AUTO_COMPACT_TOKEN_THRESHOLD: u64 = 24_000;
 
 /// Intent emitted by an interface and handled by the application runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +94,16 @@ pub enum AppEvent {
     BootStarted,
     /// Application bootstrap completed and the primary interface is ready.
     BootCompleted,
+    /// The resolved project root the runtime is operating in, sent once near boot.
+    ProjectContextAvailable {
+        /// Display form of the detected project root.
+        working_directory: String,
+    },
+    /// Project-local custom slash commands discovered under `.gocode/commands/`.
+    CustomCommandsAvailable(Vec<CustomCommand>),
+    /// Global and project skills discovered under `.agents/skills/` (or the project's
+    /// `.gocode/skills/` fallback).
+    SkillsAvailable(Vec<SkillSummary>),
     /// Confirm the terminal viewport dimensions known by the runtime.
     TerminalResized { columns: u16, rows: u16 },
     /// NVIDIA requires a credential before provider work can start.
@@ -156,6 +176,10 @@ pub enum AppEvent {
         tool_calls: usize,
         /// Number of tool calls that did not succeed.
         failed_tool_calls: usize,
+        /// Input tokens reported for the run's last turn, when the provider reports them. An
+        /// approximate signal for context usage, since NVIDIA NIM does not expose real
+        /// per-model context-window sizes.
+        last_input_tokens: Option<u64>,
     },
     /// The agent run was cancelled by the user.
     AgentCancelled,
@@ -176,6 +200,8 @@ pub enum AppEvent {
     ContextCompactionFailed(String),
     /// The active session changed: a fresh one was started, or a saved one was resumed.
     SessionSwitched {
+        /// The new current session's id.
+        id: String,
         /// The new current session's display name.
         name: String,
         /// `true` for a brand-new empty session, `false` when resuming a saved one.
@@ -1068,12 +1094,14 @@ pub struct ProjectContext {
 /// Returns [`AppError::Io`] when required files or directories cannot be created.
 pub fn initialize_project(project_root: &Path) -> Result<ProjectContext, AppError> {
     let gocode_dir = project_root.join(".gocode");
-    std::fs::create_dir_all(gocode_dir.join("sessions")).map_err(|error| {
-        AppError::Io(format!(
-            "could not create {}: {error}",
-            gocode_dir.display()
-        ))
-    })?;
+    for subdirectory in ["sessions", "commands", "skills"] {
+        std::fs::create_dir_all(gocode_dir.join(subdirectory)).map_err(|error| {
+            AppError::Io(format!(
+                "could not create {}: {error}",
+                gocode_dir.display()
+            ))
+        })?;
+    }
 
     create_file_if_missing(&gocode_dir.join("project.toml"), "schema_version = 1\n")?;
     create_file_if_missing(
