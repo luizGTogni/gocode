@@ -115,33 +115,6 @@ async fn bridge_subagent_events(
     }
 }
 
-/// Renders `/agents`: one line per subagent, most recently updated first.
-fn format_subagent_list(records: &[gocode_core::SubagentRecord]) -> String {
-    if records.is_empty() {
-        return "No subagents yet. Use `/agent spawn <task>` to create one.".to_string();
-    }
-    records
-        .iter()
-        .map(|record| {
-            format!(
-                "{} [{}] {} — {} ({}s, model {}{})",
-                short_id(&record.id),
-                record.mode.label(),
-                record.task_summary,
-                record.status.label(),
-                record.elapsed_seconds(),
-                record.model,
-                record
-                    .worktree_path
-                    .as_ref()
-                    .map(|path| format!(", worktree {}", path.display()))
-                    .unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Renders `/agent status <id>`: current state plus the last few messages.
 fn format_subagent_status(record: &gocode_core::SubagentRecord) -> String {
     let recent = record
@@ -243,76 +216,169 @@ async fn compute_subagent_diff(
     }
 }
 
-/// Merges a subagent's worktree branch into the current branch of the main workspace for
-/// `/agent apply <id> confirm`. On conflict, aborts the merge (never leaving the workspace
-/// mid-conflict) and reports git's own conflict summary instead of applying anything.
-async fn apply_subagent_branch(
+/// Outcome of attempting to merge a subagent's worktree branch, for `/agent apply <id> confirm`.
+enum MergeAttempt {
+    /// The merge completed cleanly.
+    Applied(String),
+    /// The merge conflicted; left in progress in the main workspace (never aborted) so the guided
+    /// resolver can walk the user through each file in `files`.
+    Conflict(Vec<String>),
+    /// The merge could not even be attempted, or its output didn't match the expected conflict
+    /// shape; the merge was aborted defensively since there is nothing to guide the user through.
+    Error(String),
+}
+
+async fn git(
     runner: &TokioProcessRunner,
     project_root: &Path,
-    id: &str,
-    branch: &str,
-) -> String {
-    let merge_request = CommandRequest {
-        program: "git".into(),
-        args: vec!["merge".into(), "--no-ff".into(), branch.to_string()],
-        cwd: project_root.to_path_buf(),
-        shell: false,
-        timeout: Duration::from_secs(60),
-    };
-    match runner
+    args: Vec<String>,
+    timeout: Duration,
+) -> Result<gocode_tools::process::ProcessResult, gocode_tools::process::ProcessError> {
+    runner
         .run(
-            merge_request,
+            CommandRequest {
+                program: "git".into(),
+                args,
+                cwd: project_root.to_path_buf(),
+                shell: false,
+                timeout,
+            },
             tokio_util::sync::CancellationToken::new(),
             None,
         )
         .await
+}
+
+/// Attempts to merge `branch` into the current branch of the main workspace. On a conflict, the
+/// merge is deliberately left in progress (not aborted) so `/agent apply`'s guided resolver
+/// (`AppCommand::AgentResolveConflict`/`AgentFinishMerge`/`AgentAbortMerge`) can walk the user
+/// through it file by file.
+async fn attempt_merge(
+    runner: &TokioProcessRunner,
+    project_root: &Path,
+    id: &str,
+    branch: &str,
+) -> MergeAttempt {
+    match git(
+        runner,
+        project_root,
+        vec!["merge".into(), "--no-ff".into(), branch.to_string()],
+        Duration::from_secs(60),
+    )
+    .await
     {
-        Ok(result) if result.exit_code == Some(0) => {
-            format!(
-                "Applied subagent {}'s changes (merged branch {branch}).",
-                short_id(id)
-            )
-        }
+        Ok(result) if result.exit_code == Some(0) => MergeAttempt::Applied(format!(
+            "Applied subagent {}'s changes (merged branch {branch}).",
+            short_id(id)
+        )),
         Ok(result) => {
-            let abort_request = CommandRequest {
-                program: "git".into(),
-                args: vec!["merge".into(), "--abort".into()],
-                cwd: project_root.to_path_buf(),
-                shell: false,
-                timeout: Duration::from_secs(30),
-            };
-            let _ = runner
-                .run(
-                    abort_request,
-                    tokio_util::sync::CancellationToken::new(),
-                    None,
+            let conflicts = parse_conflicting_files(&result.stdout);
+            if conflicts.is_empty() {
+                // Unexpected output shape: nothing to guide the user through, so fall back to
+                // aborting and reporting git's own text rather than leaving an unexplained
+                // conflict in progress.
+                let _ = git(
+                    runner,
+                    project_root,
+                    vec!["merge".into(), "--abort".into()],
+                    Duration::from_secs(30),
                 )
                 .await;
-            let conflicts = parse_conflicting_files(&result.stdout);
-            let detail = if conflicts.is_empty() {
-                format!("{}\n{}", result.stdout.trim(), result.stderr.trim())
+                MergeAttempt::Error(format!(
+                    "Could not apply subagent {}'s changes; the merge was aborted so nothing was \
+                     left half-applied.\n\n{}\n{}",
+                    short_id(id),
+                    result.stdout.trim(),
+                    result.stderr.trim(),
+                ))
             } else {
-                format!(
-                    "Conflicting files:\n{}",
-                    conflicts
-                        .iter()
-                        .map(|path| format!("- {path}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
-            };
-            format!(
-                "Could not apply subagent {}'s changes; the merge was aborted so nothing was \
-                 left half-applied.\n\n{detail}\n\nResolve manually in the subagent's worktree \
-                 and re-run `/agent apply {}`.",
-                short_id(id),
-                short_id(id),
-            )
+                MergeAttempt::Conflict(conflicts)
+            }
         }
         Err(gocode_tools::process::ProcessError::SpawnFailed(message)) => {
-            format!("Could not run git merge: {message}")
+            MergeAttempt::Error(format!("Could not run git merge: {message}"))
         }
     }
+}
+
+/// Resolves one conflicting file from an in-progress merge by checking out either side and
+/// staging it, for `AppCommand::AgentResolveConflict`. Returns `true` once the file is staged.
+async fn resolve_conflict_file(
+    runner: &TokioProcessRunner,
+    project_root: &Path,
+    file: &str,
+    ours: bool,
+) -> bool {
+    let flag = if ours { "--ours" } else { "--theirs" };
+    let checked_out = matches!(
+        git(
+            runner,
+            project_root,
+            vec!["checkout".into(), flag.into(), "--".into(), file.to_string()],
+            Duration::from_secs(30),
+        )
+        .await,
+        Ok(result) if result.exit_code == Some(0)
+    );
+    if !checked_out {
+        return false;
+    }
+    matches!(
+        git(
+            runner,
+            project_root,
+            vec!["add".into(), "--".into(), file.to_string()],
+            Duration::from_secs(30),
+        )
+        .await,
+        Ok(result) if result.exit_code == Some(0)
+    )
+}
+
+/// Completes an in-progress merge for `AppCommand::AgentFinishMerge`, once every conflicting file
+/// has been resolved and staged.
+async fn finish_merge(
+    runner: &TokioProcessRunner,
+    project_root: &Path,
+    id: &str,
+) -> (bool, String) {
+    match git(
+        runner,
+        project_root,
+        vec!["commit".into(), "--no-edit".into()],
+        Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(result) if result.exit_code == Some(0) => (
+            true,
+            format!("Applied subagent {}'s changes.", short_id(id)),
+        ),
+        Ok(result) => (
+            false,
+            format!(
+                "Could not finish the merge; files may still be unresolved.\n\n{}\n{}",
+                result.stdout.trim(),
+                result.stderr.trim(),
+            ),
+        ),
+        Err(gocode_tools::process::ProcessError::SpawnFailed(message)) => {
+            (false, format!("Could not run git commit: {message}"))
+        }
+    }
+}
+
+/// Aborts an in-progress merge for `AppCommand::AgentAbortMerge`, discarding every resolution
+/// made so far.
+async fn abort_merge(runner: &TokioProcessRunner, project_root: &Path) -> String {
+    let _ = git(
+        runner,
+        project_root,
+        vec!["merge".into(), "--abort".into()],
+        Duration::from_secs(30),
+    )
+    .await;
+    "Merge aborted; no changes were applied.".into()
 }
 
 /// Extracts the file paths git reports as conflicting from `git merge`'s stdout, e.g. lines like
@@ -2294,10 +2360,9 @@ async fn run_application() -> Result<(), AppError> {
                 }
                 AppCommand::AgentList => {
                     let records = subagent_manager.list().await;
-                    let text = format_subagent_list(&records);
                     let _ = driver
                         .event_tx
-                        .send(gocode_core::AppEvent::AgentNotice(text))
+                        .send(gocode_core::AppEvent::AgentListAvailable(records))
                         .await;
                 }
                 AppCommand::AgentStatus(id) => {
@@ -2421,13 +2486,29 @@ async fn run_application() -> Result<(), AppError> {
                     {
                         let branch = record.branch.clone().unwrap_or_default();
                         let runner = TokioProcessRunner;
-                        let notice =
-                            apply_subagent_branch(&runner, &project_root, &record.id, &branch)
-                                .await;
-                        let _ = driver
-                            .event_tx
-                            .send(gocode_core::AppEvent::AgentNotice(notice))
-                            .await;
+                        match attempt_merge(&runner, &project_root, &record.id, &branch).await {
+                            MergeAttempt::Applied(notice) => {
+                                let _ = driver
+                                    .event_tx
+                                    .send(gocode_core::AppEvent::AgentNotice(notice))
+                                    .await;
+                            }
+                            MergeAttempt::Conflict(files) => {
+                                let _ = driver
+                                    .event_tx
+                                    .send(gocode_core::AppEvent::AgentMergeConflict {
+                                        id: record.id,
+                                        files,
+                                    })
+                                    .await;
+                            }
+                            MergeAttempt::Error(message) => {
+                                let _ = driver
+                                    .event_tx
+                                    .send(gocode_core::AppEvent::AgentNotice(message))
+                                    .await;
+                            }
+                        }
                     }
                     Some(_) => {
                         let _ = driver
@@ -2448,6 +2529,51 @@ async fn run_application() -> Result<(), AppError> {
                             .await;
                     }
                 },
+                AppCommand::AgentResolveConflict { id, file, ours } => {
+                    let runner = TokioProcessRunner;
+                    if resolve_conflict_file(&runner, &project_root, &file, ours).await {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentConflictFileResolved {
+                                id,
+                                file,
+                                ours,
+                            })
+                            .await;
+                    } else {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(format!(
+                                "Could not resolve '{file}'; try again or press Esc to abort the \
+                                 merge."
+                            )))
+                            .await;
+                    }
+                }
+                AppCommand::AgentFinishMerge(id) => {
+                    let runner = TokioProcessRunner;
+                    let (applied, message) = finish_merge(&runner, &project_root, &id).await;
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::AgentMergeFinished {
+                            id,
+                            applied,
+                            message,
+                        })
+                        .await;
+                }
+                AppCommand::AgentAbortMerge(id) => {
+                    let runner = TokioProcessRunner;
+                    let message = abort_merge(&runner, &project_root).await;
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::AgentMergeFinished {
+                            id,
+                            applied: false,
+                            message,
+                        })
+                        .await;
+                }
                 AppCommand::AgentCleanupRequest(id) => match subagent_manager.find(&id).await {
                     Some(record) if !record.status.is_terminal() => {
                         let _ = driver
@@ -2759,9 +2885,10 @@ mod tests {
     use gocode_core::{EnvironmentPaths, Platform};
 
     use super::{
-        AgentDiffOutcome, application_paths, apply_subagent_branch, cleanup_subagent,
-        cleanup_warning, compute_subagent_diff, format_subagent_list, format_subagent_result,
-        format_subagent_status, parse_conflicting_files,
+        AgentDiffOutcome, MergeAttempt, abort_merge, application_paths, attempt_merge,
+        cleanup_subagent, cleanup_warning, compute_subagent_diff, finish_merge,
+        format_subagent_result, format_subagent_status, parse_conflicting_files,
+        resolve_conflict_file,
     };
 
     #[test]
@@ -2787,22 +2914,6 @@ mod tests {
             !mode.allows_writes(),
             gocode_core::PermissionMode::Auto,
         )
-    }
-
-    #[test]
-    fn empty_subagent_list_prompts_to_spawn_one() {
-        assert!(format_subagent_list(&[]).contains("/agent spawn"));
-    }
-
-    #[test]
-    fn subagent_list_shows_id_mode_status_and_worktree() {
-        let mut record = sample_record(gocode_core::SubagentMode::Implement);
-        record.worktree_path = Some(PathBuf::from("/tmp/repo-worktrees/subagent-abc"));
-        let text = format_subagent_list(std::slice::from_ref(&record));
-        assert!(text.contains(&record.id[..8]));
-        assert!(text.contains("implement"));
-        assert!(text.contains("queued"));
-        assert!(text.contains("subagent-abc"));
     }
 
     #[test]
@@ -2934,41 +3045,96 @@ mod tests {
         let root = fixture_repo_with_a_feature_branch("apply-clean");
         let runner = gocode_tools::process::TokioProcessRunner;
 
-        let notice = apply_subagent_branch(&runner, &root, "sub1", "feature").await;
+        let outcome = attempt_merge(&runner, &root, "sub1", "feature").await;
+        let MergeAttempt::Applied(notice) = outcome else {
+            panic!("expected the merge to apply cleanly");
+        };
         assert!(notice.contains("Applied"), "unexpected notice: {notice}");
         assert!(root.join("feature.txt").exists());
 
         std::fs::remove_dir_all(&root).ok();
     }
 
-    #[tokio::test]
-    async fn a_conflicting_merge_is_aborted_instead_of_left_half_applied() {
-        let root = fixture_repo_with_a_feature_branch("apply-conflict");
-        // Diverge `main` so merging `feature` conflicts on the same file.
+    /// Diverges `main` so merging `feature` conflicts on `feature.txt`, then attempts the merge.
+    /// Returns the repo root and the reported conflicting files.
+    async fn conflicted_merge_fixture(
+        name: &str,
+        runner: &gocode_tools::process::TokioProcessRunner,
+    ) -> (PathBuf, Vec<String>) {
+        let root = fixture_repo_with_a_feature_branch(name);
         std::fs::write(root.join("feature.txt"), "conflicting content\n").unwrap();
         run_git(&root, &["add", "."]);
         run_git(&root, &["commit", "-q", "-m", "conflicting change on main"]);
-        let runner = gocode_tools::process::TokioProcessRunner;
 
-        let notice = apply_subagent_branch(&runner, &root, "sub1", "feature").await;
-        assert!(
-            notice.contains("Could not apply"),
-            "unexpected notice: {notice}"
-        );
-        assert!(
-            notice.contains("Conflicting files:") && notice.contains("feature.txt"),
-            "expected a structured conflict list, got: {notice}"
-        );
+        let outcome = attempt_merge(runner, &root, "sub1", "feature").await;
+        let MergeAttempt::Conflict(files) = outcome else {
+            panic!("expected a conflict");
+        };
+        (root, files)
+    }
 
-        // The abort must leave no merge in progress and no conflict markers on disk.
+    fn git_status_is_clean(root: &Path) -> bool {
         let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
-            .current_dir(&root)
+            .current_dir(root)
             .output()
             .expect("git status should run");
-        assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
-        let content = std::fs::read_to_string(root.join("feature.txt")).unwrap();
-        assert_eq!(content, "conflicting content\n");
+        String::from_utf8_lossy(&status.stdout).trim().is_empty()
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_merge_is_left_in_progress_for_the_guided_resolver() {
+        let runner = gocode_tools::process::TokioProcessRunner;
+        let (root, files) = conflicted_merge_fixture("apply-conflict", &runner).await;
+        assert_eq!(files, vec!["feature.txt".to_string()]);
+
+        // Left in progress (not aborted), unlike the old behavior: the guided resolver needs the
+        // conflict markers and index state still present to work through.
+        assert!(
+            !git_status_is_clean(&root),
+            "expected the conflict to still be in progress"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn resolving_every_file_and_finishing_completes_the_merge_keeping_the_chosen_side() {
+        let runner = gocode_tools::process::TokioProcessRunner;
+        let (root, files) = conflicted_merge_fixture("apply-resolve", &runner).await;
+
+        for file in &files {
+            assert!(
+                resolve_conflict_file(&runner, &root, file, false).await,
+                "keeping theirs should resolve {file}"
+            );
+        }
+
+        let (applied, message) = finish_merge(&runner, &root, "sub1").await;
+        assert!(applied, "unexpected message: {message}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("feature.txt")).unwrap(),
+            "new file\n",
+            "keeping theirs should have kept the feature branch's content"
+        );
+        assert!(git_status_is_clean(&root));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn aborting_a_conflicted_merge_leaves_the_workspace_clean() {
+        let runner = gocode_tools::process::TokioProcessRunner;
+        let (root, _files) = conflicted_merge_fixture("apply-abort", &runner).await;
+
+        let message = abort_merge(&runner, &root).await;
+        assert!(message.contains("aborted"), "unexpected message: {message}");
+
+        assert!(git_status_is_clean(&root));
+        assert_eq!(
+            std::fs::read_to_string(root.join("feature.txt")).unwrap(),
+            "conflicting content\n"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

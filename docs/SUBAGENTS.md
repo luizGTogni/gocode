@@ -108,9 +108,14 @@ Only `--mode implement` may write files, and only inside a worktree:
    the same one.
 4. Changes only reach the main workspace through `/agent apply <id> confirm`, which runs
    `git diff base...branch` for review, then `git merge --no-ff` from the main workspace root (a
-   linked worktree shares branches with the main one, so no directory change is needed). On
-   conflict, `git merge --abort` runs immediately and the conflict is reported — nothing is ever
-   left half-merged.
+   linked worktree shares branches with the main one, so no directory change is needed). On a
+   clean merge, that's it. On conflict, the merge is deliberately left in progress and a guided
+   resolver popup opens (`AppState::pending_agent_conflict`, `handle_agent_conflict_event`,
+   `render_agent_conflict_modal`): `o`/`t` per file calls `git checkout --ours`/`--theirs` then
+   `git add`, and only once every file is resolved does `[Enter]` run `git commit --no-edit` to
+   finish it — `[Esc]` aborts the merge at any point via `git merge --abort`, discarding every
+   resolution made so far. Either way, the main workspace never sits in an *unexplained*
+   half-merged state — it's either clean, or visibly mid-resolution with the popup open.
 5. `/agent cleanup <id> confirm` only runs for a terminal-status subagent; it removes the worktree
    via `git worktree remove` (never `--force`) before deleting the persisted record, so a failed
    removal never leaves an orphaned worktree with no record pointing at it.
@@ -149,12 +154,12 @@ user reviews via `/agents` and discards via `/agent cleanup <id>`.
 | Command | Effect |
 |---|---|
 | `/agent spawn <task> [--mode research\|plan\|implement\|review] [--model <id>] [--worktree]` | Creates a subagent; prints id/mode/permissions/location once it starts. |
-| `/agents` | Lists id, task, status, elapsed time, model, worktree. |
+| `/agents` | Opens a scrollable popup listing id, mode, task, status, elapsed time, model, and worktree; Enter opens a subagent's full detail (status, messages, result), `r` refreshes, Esc closes/backs out. |
 | `/agent status <id>` | Current status plus the last few messages. |
 | `/agent message <id> <text>` | Queues a follow-up. If the subagent is `WaitingInput` (it asked a `NEEDS_INPUT:` question), this resumes it immediately; otherwise it's delivered at the next `Agent::run` step boundary (see §11.1). |
 | `/agent stop <id>` | Cooperative stop; preserves partial result; never touches the worktree. |
 | `/agent result <id>` | The structured `SubagentResult`. |
-| `/agent apply <id>` | Requests the diff. When it arrives, a modal shows it with `[y] Apply [n] Cancel`; `/agent apply <id> confirm` is an equivalent typed shortcut. |
+| `/agent apply <id>` | Requests the diff. When it arrives, a modal shows it with `[y] Apply [n] Cancel`; `/agent apply <id> confirm` is an equivalent typed shortcut. On confirm, a clean merge applies immediately; a conflicting one opens the guided resolver (`o`/`t` per file, `[Enter]` to finish, `[Esc]` to abort — see §7). |
 | `/agent cleanup <id>` | Requests the warning. When it arrives, a modal shows it with `[y] Remove [n] Cancel`; `/agent cleanup <id> confirm` is an equivalent typed shortcut. |
 
 `<id>` accepts either the full UUID or the 8-character prefix `/agents` displays;
@@ -165,6 +170,15 @@ uses (`AppState::pending_agent_confirm`, `handle_agent_confirm_event`,
 `render_agent_confirm_modal`): the modal blocks composer input and every other pending prompt
 gate in the TUI until the user presses `y`/Enter or `n`/Esc, so nothing is ever applied or removed
 without an explicit keypress.
+
+The `/agents` popup itself reuses the `/mcp`/`/skills` list-then-detail pattern
+(`AppState::agents`/`agents_visible`/`agents_view`/`agents_selected`, `handle_agents_event`,
+`render_agents_modal`): `handle_agents_event` is checked ahead of `handle_chat_event` in the
+terminal loop's dispatch order, so composer input is implicitly blocked while the popup is open —
+the same trick `/skills` and `/mcp` already rely on, no new gating conditions needed. Data comes
+from `gocode_core::AppEvent::AgentListAvailable(Vec<SubagentRecord>)`, sent whenever `/agents`
+opens or `r` is pressed inside it; `SubagentManager::list()` (disk-backed, see §9) is the source,
+so the popup shows subagents from earlier sessions too.
 
 # 11. Known MVP limitations and recommended next increments
 
@@ -177,14 +191,17 @@ without an explicit keypress.
    still only sees a queued message after its current run completes. A future increment could add
    a cancellable "check for new input" point inside `Agent::drive` itself for the fully general
    case.
-2. **Apply-time conflict resolution is still manual.** `/agent apply` now parses git's own
-   `CONFLICT (...): Merge conflict in <path>` lines into an explicit "Conflicting files:" list
-   (`parse_conflicting_files` in `crates/gocode/src/main.rs`) rather than dumping raw stdout/stderr,
-   but there is still no guided in-TUI resolver — the user resolves manually in the worktree and
-   re-runs `/agent apply`.
-3. **No dedicated popup/list view.** Every `/agent ...` response (other than the apply/cleanup
-   confirm modal) renders as a chat-log `Info`/`Warning` entry, consistent with how `/debug`
-   already works, rather than a scrollable popup like `/mcp` or `/skills`.
+2. **The guided conflict resolver is ours/theirs only.** On a merge conflict, `/agent apply` now
+   leaves the merge in progress (instead of aborting) and opens a popup listing every conflicting
+   file; the user picks a whole side per file (`o` keeps the main workspace's version, `t` keeps
+   the subagent's) until every file is resolved, then finishes or aborts the merge (see §10). There
+   is still no hunk-level or line-level editor — a file that needs pieces of both sides has to be
+   finished by hand outside the TUI before `git add`-ing it and returning to finish the merge (or
+   the user aborts and starts over).
+3. **`/agent status`/`result`/`message`/`stop` still reply inline.** `/agents` now opens a
+   scrollable popup (see §10), but the single-subagent commands render as chat-log `Info`/
+   `Warning` entries, consistent with how `/debug` already works, rather than deep-linking into
+   the popup's detail view.
 4. **No nested subagents**, by construction (see §2) — not a limitation to lift casually, since the
    spec explicitly requires it stay out of the MVP.
 
@@ -224,9 +241,18 @@ Removed subagent e5f6a7b8.
   permission denial, structured-result parsing (with and without a valid block), a subagent that
   asks `NEEDS_INPUT:` pausing at `WaitingInput` and resuming once `/agent message` answers it.
 - `crates/gocode-tui/src/lib.rs` — `/agent`/`/agents` parsing (spawn flags in any order, apply
-  confirm/no-confirm, message text joining, worktree-outside-implement-mode rejection), and the
+  confirm/no-confirm, message text joining, worktree-outside-implement-mode rejection), the
   apply/cleanup confirm modal (opens on `AgentDiffReady`/`AgentCleanupWarning`, resolves on y/n,
-  blocks chat input while pending).
-- `crates/gocode/src/main.rs` — diff computation, a clean merge applying successfully, a
-  conflicting merge aborting without leaving the workspace half-merged and reporting a structured
-  conflicting-files list, and cleanup removing both the worktree and the persisted record.
+  blocks chat input while pending), the `/agents` popup (`AgentListAvailable` populates and
+  clamps selection, list navigation stays in bounds, Enter/Esc move between list and detail, Esc
+  on the list closes the popup, `r` requests a refresh from either view), and the guided conflict
+  resolver (`AgentMergeConflict` opens it, `AgentConflictFileResolved` records the chosen side,
+  `AgentMergeFinished` closes it and logs the outcome, navigation stays in bounds, `o`/`t` request
+  resolving the selected file, Enter is a no-op until every file is resolved then requests
+  finishing, Esc requests aborting even with unresolved files, and it blocks chat input while
+  pending).
+- `crates/gocode/src/main.rs` — diff computation; a clean merge applying immediately; a
+  conflicting merge left in progress (not aborted) reporting a structured conflicting-files list;
+  resolving every file and finishing completes the merge keeping the chosen side, verified against
+  a real git repository fixture; aborting a conflicted merge leaves the workspace clean; and
+  cleanup removing both the worktree and the persisted record.

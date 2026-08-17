@@ -301,6 +301,35 @@ pub enum PendingAgentConfirm {
     Cleanup { id: String, message: String },
 }
 
+/// Which side of a merge conflict to keep for one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    /// Keep the main workspace's version.
+    Ours,
+    /// Keep the subagent's version.
+    Theirs,
+}
+
+/// One conflicting file in an in-progress `/agent apply` merge, and its resolution so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictFileState {
+    /// Path relative to the repository root.
+    pub path: String,
+    /// `None` until the user picks a side for this file.
+    pub resolution: Option<ConflictResolution>,
+}
+
+/// An in-progress `/agent apply` merge conflict, driving the guided resolver popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAgentConflict {
+    /// The subagent whose merge is in progress.
+    pub id: String,
+    /// Every conflicting file and its resolution so far.
+    pub files: Vec<ConflictFileState>,
+    /// Selected row in the file list.
+    pub selected: usize,
+}
+
 /// Which screen the update popup is currently showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateStage {
@@ -415,6 +444,16 @@ enum McpView {
     ServerDetail,
     /// The guided "Add server" wizard.
     AddServer,
+}
+
+/// Which screen the `/agents` popup is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AgentsView {
+    /// Every known subagent, most recently updated first.
+    #[default]
+    List,
+    /// One subagent's full status, messages, and result.
+    Detail,
 }
 
 /// One step of the `/mcp` "Add server" wizard, in order.
@@ -737,6 +776,9 @@ pub struct AppState {
     pending_worktree_removal: Option<String>,
     /// An `/agent apply` or `/agent cleanup` awaiting explicit Y/N confirmation before it is sent.
     pending_agent_confirm: Option<PendingAgentConfirm>,
+    /// An `/agent apply` that hit a merge conflict, awaiting the user's per-file ours/theirs
+    /// choices before the merge can be finished or aborted.
+    pending_agent_conflict: Option<PendingAgentConflict>,
     /// An `/undo` or `/redo` that stopped on a conflicting file, awaiting the user's choice to
     /// cancel, view a diff, or force it through.
     pending_undo_conflict: Option<PendingUndoConflict>,
@@ -791,6 +833,17 @@ pub struct AppState {
     mcp_add_api_key_auth: bool,
     /// Wizard draft: the API key itself, shown masked.
     mcp_add_api_key: String,
+    /// Whether the `/agents` popup is currently shown over the chat screen.
+    agents_visible: bool,
+    /// Which screen of the `/agents` popup is currently shown.
+    agents_view: AgentsView,
+    /// Selected row within the `/agents` list screen.
+    agents_selected: usize,
+    /// Every subagent this session knows about, refreshed each time the popup opens or `r` is
+    /// pressed inside it.
+    agents: Vec<gocode_core::SubagentRecord>,
+    /// Lines scrolled down from the top of the `/agents` detail screen.
+    agents_detail_scroll: u16,
     /// Display form of the detected project root, shown by `/status`.
     working_directory: String,
     /// The active session's id, shown by `/status`.
@@ -910,6 +963,7 @@ impl AppState {
                     && self.pending_permission.is_none()
                     && self.pending_worktree_removal.is_none()
                     && self.pending_agent_confirm.is_none()
+                    && self.pending_agent_conflict.is_none()
                     && self.pending_undo_conflict.is_none()
                 {
                     self.pending_update = Some(prompt);
@@ -969,6 +1023,55 @@ impl AppState {
                 self.pending_agent_confirm = Some(PendingAgentConfirm::Cleanup {
                     id: id.clone(),
                     message: message.clone(),
+                });
+            }
+            AppEvent::AgentListAvailable(records) => {
+                self.agents.clone_from(records);
+                if self.agents_selected >= self.agents.len() {
+                    self.agents_selected = self.agents.len().saturating_sub(1);
+                }
+            }
+            AppEvent::AgentMergeConflict { id, files } => {
+                self.pending_agent_conflict = Some(PendingAgentConflict {
+                    id: id.clone(),
+                    files: files
+                        .iter()
+                        .map(|path| ConflictFileState {
+                            path: path.clone(),
+                            resolution: None,
+                        })
+                        .collect(),
+                    selected: 0,
+                });
+            }
+            AppEvent::AgentConflictFileResolved { id, file, ours } => {
+                if let Some(conflict) = &mut self.pending_agent_conflict
+                    && conflict.id == *id
+                    && let Some(entry) = conflict.files.iter_mut().find(|entry| entry.path == *file)
+                {
+                    entry.resolution = Some(if *ours {
+                        ConflictResolution::Ours
+                    } else {
+                        ConflictResolution::Theirs
+                    });
+                }
+            }
+            AppEvent::AgentMergeFinished {
+                id,
+                applied,
+                message,
+            } => {
+                if self
+                    .pending_agent_conflict
+                    .as_ref()
+                    .is_some_and(|conflict| conflict.id == *id)
+                {
+                    self.pending_agent_conflict = None;
+                }
+                self.entries.push(if *applied {
+                    ChatEntry::Info(message.clone())
+                } else {
+                    ChatEntry::Warning(message.clone())
                 });
             }
             AppEvent::PermissionRequested {
@@ -1198,6 +1301,7 @@ impl AppState {
             && self.pending_permission.is_none()
             && self.pending_worktree_removal.is_none()
             && self.pending_agent_confirm.is_none()
+            && self.pending_agent_conflict.is_none()
             && self.pending_undo_conflict.is_none()
             && self.pending_update.is_none()
             && self.queued_update.is_some()
@@ -2197,6 +2301,8 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
         render_worktree_removal_modal(frame, target, area);
     } else if let Some(prompt) = &state.pending_agent_confirm {
         render_agent_confirm_modal(frame, prompt, area);
+    } else if let Some(prompt) = &state.pending_agent_conflict {
+        render_agent_conflict_modal(frame, prompt, area);
     } else if let Some(prompt) = &state.pending_undo_conflict {
         render_undo_conflict_modal(frame, prompt, area);
     } else if let Some(prompt) = &state.pending_update {
@@ -2209,6 +2315,8 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
         render_skills_modal(frame, state, area);
     } else if state.mcp_visible {
         render_mcp_modal(frame, state, area);
+    } else if state.agents_visible {
+        render_agents_modal(frame, state, area);
     }
 }
 
@@ -2514,6 +2622,13 @@ fn render_mcp_modal(frame: &mut Frame, state: &AppState, area: Rect) {
     }
 }
 
+fn render_agents_modal(frame: &mut Frame, state: &AppState, area: Rect) {
+    match state.agents_view {
+        AgentsView::List => render_agents_list(frame, state, area),
+        AgentsView::Detail => render_agents_detail(frame, state, area),
+    }
+}
+
 fn render_mcp_menu(frame: &mut Frame, state: &AppState, area: Rect) {
     let modal = centered(area, 76, 10);
     let mut content = String::from("Choose an action\n\n");
@@ -2532,6 +2647,175 @@ fn render_mcp_menu(frame: &mut Frame, state: &AppState, area: Rect) {
             .wrap(Wrap { trim: false })
             .block(Block::default().title("Gocode · MCP").borders(Borders::ALL)),
         modal,
+    );
+}
+
+/// One row of the `/agents` list: cursor, id, mode, task, status, elapsed time, model, worktree.
+fn agent_row(record: &gocode_core::SubagentRecord, selected: bool) -> String {
+    let cursor = if selected { ">" } else { " " };
+    let id = record.id.get(..8).unwrap_or(&record.id);
+    let worktree = record
+        .worktree_path
+        .as_ref()
+        .map(|path| format!(", worktree {}", path.display()))
+        .unwrap_or_default();
+    format!(
+        "{cursor} {id} [{}] {} — {} ({}s, model {}{worktree})",
+        record.mode.label(),
+        record.task_summary,
+        record.status.label(),
+        record.elapsed_seconds(),
+        record.model,
+    )
+}
+
+fn render_agents_list(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 88, 24);
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title("Gocode · Subagents")
+        .borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new("Active and recent subagents\n"), chunks[0]);
+
+    if state.agents.is_empty() {
+        frame.render_widget(
+            Paragraph::new("None yet. Use `/agent spawn <task>` to create one.")
+                .wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    } else {
+        let visible_rows = usize::from(chunks[1].height).max(1);
+        let first_visible = state
+            .agents_selected
+            .saturating_sub(visible_rows.saturating_sub(1));
+        let content = state.agents[first_visible..]
+            .iter()
+            .enumerate()
+            .take(visible_rows)
+            .map(|(offset, record)| {
+                let index = first_visible + offset;
+                agent_row(record, index == state.agents_selected)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        frame.render_widget(
+            Paragraph::new(content).wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new("Enter to view details · r to refresh · Esc to close")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn render_agents_detail(frame: &mut Frame, state: &AppState, area: Rect) {
+    let modal = centered(area, 88, 24);
+    frame.render_widget(Clear, modal);
+    let record = state.agents.get(state.agents_selected);
+    let title = record.map_or_else(
+        || "Gocode · Subagent".to_string(),
+        |record| {
+            format!(
+                "Gocode · Subagent · {}",
+                record.id.get(..8).unwrap_or(&record.id)
+            )
+        },
+    );
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut content = String::new();
+    match record {
+        None => content.push_str("This subagent is no longer listed."),
+        Some(record) => {
+            let _ = writeln!(content, "Task: {}", record.task_summary);
+            let _ = writeln!(
+                content,
+                "Mode: {}   Status: {}   Elapsed: {}s",
+                record.mode.label(),
+                record.status.label(),
+                record.elapsed_seconds()
+            );
+            let _ = writeln!(content, "Model: {}", record.model);
+            if let Some(path) = &record.worktree_path {
+                let _ = writeln!(
+                    content,
+                    "Worktree: {} (branch {})",
+                    path.display(),
+                    record.branch.as_deref().unwrap_or("?")
+                );
+            }
+            if !record.messages.is_empty() {
+                content.push_str("\nMessages:\n");
+                for message in &record.messages {
+                    let role = match message.role {
+                        gocode_core::SubagentMessageRole::Supervisor => "you",
+                        gocode_core::SubagentMessageRole::Subagent => "subagent",
+                    };
+                    let _ = writeln!(content, "  [{role}] {}", message.text);
+                }
+            }
+            match &record.result {
+                Some(result) => {
+                    content.push_str("\nResult:\n");
+                    let _ = writeln!(content, "  {}", result.summary);
+                    let mut section = |title: &str, items: &[String]| {
+                        if !items.is_empty() {
+                            let _ = writeln!(content, "  {title}: {}", items.join("; "));
+                        }
+                    };
+                    section("Findings", &result.findings);
+                    section("Files changed", &result.files_changed);
+                    section("Risks", &result.risks);
+                    section("Next steps", &result.next_steps);
+                    if let Some(error) = &result.error {
+                        let _ = writeln!(content, "  Error: {error}");
+                    }
+                }
+                None => content.push_str("\nNo result yet."),
+            }
+        }
+    }
+
+    let content_lines = content.lines().count();
+    let visible_rows = usize::from(chunks[0].height).max(1);
+    let max_scroll = u16::try_from(content_lines.saturating_sub(visible_rows)).unwrap_or(u16::MAX);
+    let scroll = state.agents_detail_scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        chunks[0],
+    );
+
+    let footer = if max_scroll > 0 {
+        "Up/Down to scroll · r to refresh · Esc to go back"
+    } else {
+        "r to refresh · Esc to go back"
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
     );
 }
 
@@ -3135,6 +3419,7 @@ fn render_composer(
     let editing = state.pending_permission.is_none()
         && state.pending_worktree_removal.is_none()
         && state.pending_agent_confirm.is_none()
+        && state.pending_agent_conflict.is_none()
         && state.pending_undo_conflict.is_none()
         && state.pending_update.is_none()
         && state.blocking_error.is_none();
@@ -3213,6 +3498,69 @@ fn render_agent_confirm_modal(frame: &mut Frame, prompt: &PendingAgentConfirm, a
             .wrap(Wrap { trim: false })
             .block(Block::default().title(title).borders(Borders::ALL)),
         modal,
+    );
+}
+
+/// One row of the guided conflict resolver's file list: cursor, resolution checkbox, path.
+fn conflict_file_row(file: &ConflictFileState, selected: bool) -> String {
+    let cursor = if selected { ">" } else { " " };
+    let status = match file.resolution {
+        None => "[ ]",
+        Some(ConflictResolution::Ours) => "[ours]",
+        Some(ConflictResolution::Theirs) => "[theirs]",
+    };
+    format!("{cursor} {status} {}", file.path)
+}
+
+fn render_agent_conflict_modal(frame: &mut Frame, prompt: &PendingAgentConflict, area: Rect) {
+    let height = u16::try_from(prompt.files.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(9);
+    let modal = centered(area, 76, height);
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title("Merge conflict")
+        .borders(Borders::ALL);
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Subagent {}'s branch conflicts with the current branch on {} file(s).\nPick a side \
+             for each, then finish once every file is resolved.",
+            prompt.id.get(..8).unwrap_or(&prompt.id),
+            prompt.files.len(),
+        ))
+        .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+
+    let content = prompt
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| conflict_file_row(file, index == prompt.selected))
+        .collect::<Vec<_>>()
+        .join("\n");
+    frame.render_widget(Paragraph::new(content), chunks[1]);
+
+    let all_resolved = prompt.files.iter().all(|file| file.resolution.is_some());
+    let footer = if all_resolved {
+        "[o] Keep ours   [t] Keep theirs   [Enter] Finish merge   [Esc] Abort merge"
+    } else {
+        "[o] Keep ours   [t] Keep theirs   [Esc] Abort merge (resolve every file to finish)"
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
     );
 }
 
@@ -3483,6 +3831,26 @@ fn run_terminal(
             continue;
         }
 
+        match handle_agent_conflict_event(&mut state, &terminal_event) {
+            AgentConflictEventOutcome::NotHandled => {}
+            AgentConflictEventOutcome::Handled => continue,
+            AgentConflictEventOutcome::Resolve { id, file, ours } => {
+                send_command(
+                    &command_tx,
+                    AppCommand::AgentResolveConflict { id, file, ours },
+                )?;
+                continue;
+            }
+            AgentConflictEventOutcome::Finish(id) => {
+                send_command(&command_tx, AppCommand::AgentFinishMerge(id))?;
+                continue;
+            }
+            AgentConflictEventOutcome::Abort(id) => {
+                send_command(&command_tx, AppCommand::AgentAbortMerge(id))?;
+                continue;
+            }
+        }
+
         match handle_undo_conflict_event(&mut state, &terminal_event) {
             Some(UndoConflictOutcome::Forced { direction, count }) => {
                 if direction == "redo" {
@@ -3589,6 +3957,15 @@ fn run_terminal(
             }
             McpEventOutcome::Authorize(name) => {
                 send_command(&command_tx, AppCommand::McpAuthorize(name))?;
+                continue;
+            }
+        }
+
+        match handle_agents_event(&mut state, &terminal_event) {
+            AgentsEventOutcome::NotHandled => {}
+            AgentsEventOutcome::Handled => continue,
+            AgentsEventOutcome::Refresh => {
+                send_command(&command_tx, AppCommand::AgentList)?;
                 continue;
             }
         }
@@ -4063,6 +4440,9 @@ fn run_terminal(
                     }
                 }
                 ChatSubmission::Command(SlashCommand::Agents) => {
+                    state.agents_visible = true;
+                    state.agents_view = AgentsView::List;
+                    state.agents_selected = 0;
                     send_command(&command_tx, AppCommand::AgentList)?;
                 }
                 ChatSubmission::DebugAnswer(answer) => {
@@ -4089,6 +4469,7 @@ fn run_terminal(
             && state.pending_permission.is_none()
             && state.pending_worktree_removal.is_none()
             && state.pending_agent_confirm.is_none()
+            && state.pending_agent_conflict.is_none()
             && state.pending_undo_conflict.is_none()
             && matches!(
                 terminal_event,
@@ -4377,6 +4758,7 @@ pub fn handle_permission_mode_event(state: &mut AppState, event: &Event) -> Opti
         || state.pending_permission.is_some()
         || state.pending_worktree_removal.is_some()
         || state.pending_agent_confirm.is_some()
+        || state.pending_agent_conflict.is_some()
         || state.pending_undo_conflict.is_some()
         || state.pending_update.is_some()
     {
@@ -4705,6 +5087,105 @@ pub fn handle_agent_confirm_event(
     }
 }
 
+/// Outcome of dispatching a terminal event to the guided `/agent apply` conflict resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentConflictEventOutcome {
+    /// The resolver isn't shown, or the event isn't one it cares about.
+    NotHandled,
+    /// The event was consumed by the resolver with no further side effect (navigation, or a key
+    /// that's a no-op right now, e.g. Enter before every file is resolved).
+    Handled,
+    /// Keep one side of the conflict for `file` and stage it.
+    Resolve {
+        id: String,
+        file: String,
+        ours: bool,
+    },
+    /// Every file is resolved; complete the merge.
+    Finish(String),
+    /// Abort the in-progress merge, discarding every resolution made so far.
+    Abort(String),
+}
+
+/// Applies navigation and resolution keys to the guided `/agent apply` conflict resolver:
+/// Up/Down to move the selection, `o`/`t` to keep our/their side of the selected file, Enter to
+/// finish once every file is resolved, Esc/`c` to abort the merge entirely.
+///
+/// Never mutates `resolution` itself — the caller sends the corresponding `AppCommand` and the
+/// resolution is only recorded once the backend confirms the file was actually staged (see
+/// [`AppEvent::AgentConflictFileResolved`][gocode_core::AppEvent::AgentConflictFileResolved]), so
+/// the popup never shows a file as resolved when the underlying `git checkout`/`add` failed.
+///
+/// Returns [`AgentConflictEventOutcome::NotHandled`] when the resolver isn't shown or the event
+/// isn't a key press.
+#[must_use]
+pub fn handle_agent_conflict_event(
+    state: &mut AppState,
+    event: &Event,
+) -> AgentConflictEventOutcome {
+    let Some(pending) = state.pending_agent_conflict.clone() else {
+        return AgentConflictEventOutcome::NotHandled;
+    };
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return AgentConflictEventOutcome::NotHandled;
+    };
+
+    match code {
+        KeyCode::Up => {
+            if let Some(conflict) = &mut state.pending_agent_conflict {
+                conflict.selected = conflict.selected.saturating_sub(1);
+            }
+            AgentConflictEventOutcome::Handled
+        }
+        KeyCode::Down => {
+            if let Some(conflict) = &mut state.pending_agent_conflict
+                && !conflict.files.is_empty()
+            {
+                conflict.selected = (conflict.selected + 1).min(conflict.files.len() - 1);
+            }
+            AgentConflictEventOutcome::Handled
+        }
+        KeyCode::Char('o' | 'O') => {
+            pending
+                .files
+                .get(pending.selected)
+                .map_or(AgentConflictEventOutcome::Handled, |file| {
+                    AgentConflictEventOutcome::Resolve {
+                        id: pending.id.clone(),
+                        file: file.path.clone(),
+                        ours: true,
+                    }
+                })
+        }
+        KeyCode::Char('t' | 'T') => {
+            pending
+                .files
+                .get(pending.selected)
+                .map_or(AgentConflictEventOutcome::Handled, |file| {
+                    AgentConflictEventOutcome::Resolve {
+                        id: pending.id.clone(),
+                        file: file.path.clone(),
+                        ours: false,
+                    }
+                })
+        }
+        KeyCode::Enter => {
+            if pending.files.iter().all(|file| file.resolution.is_some()) {
+                AgentConflictEventOutcome::Finish(pending.id)
+            } else {
+                AgentConflictEventOutcome::Handled
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('c' | 'C') => AgentConflictEventOutcome::Abort(pending.id),
+        _ => AgentConflictEventOutcome::Handled,
+    }
+}
+
 /// Outcome of dispatching a terminal event to a pending `/undo`/`/redo` conflict prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoConflictOutcome {
@@ -4976,6 +5457,84 @@ pub fn handle_skills_event(state: &mut AppState, event: &Event) -> SkillsEventOu
                 SkillsEventOutcome::Handled
             }
             _ => SkillsEventOutcome::Handled,
+        },
+    }
+}
+
+/// Outcome of dispatching a terminal event to the `/agents` popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentsEventOutcome {
+    /// The popup is not shown, or the event isn't one it cares about.
+    NotHandled,
+    /// The event was consumed by the popup with no further side effect.
+    Handled,
+    /// `r` was pressed: re-request the current list from the runtime.
+    Refresh,
+}
+
+/// Applies navigation and view-switching keys to the `/agents` popup: Up/Down to move the
+/// selection, Enter/Right to open a subagent's detail, Esc/Left to go back or close, `r` to
+/// refresh. Never sends a command itself — the caller sends [`gocode_core::AppCommand::AgentList`]
+/// on [`AgentsEventOutcome::Refresh`] (including the one implied by opening the popup).
+///
+/// Returns [`AgentsEventOutcome::NotHandled`] when the popup isn't shown or the event isn't a key
+/// press.
+#[must_use]
+pub fn handle_agents_event(state: &mut AppState, event: &Event) -> AgentsEventOutcome {
+    if !state.agents_visible {
+        return AgentsEventOutcome::NotHandled;
+    }
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return AgentsEventOutcome::NotHandled;
+    };
+
+    match state.agents_view {
+        AgentsView::List => match code {
+            KeyCode::Up => {
+                state.agents_selected = state.agents_selected.saturating_sub(1);
+                AgentsEventOutcome::Handled
+            }
+            KeyCode::Down => {
+                if !state.agents.is_empty() {
+                    state.agents_selected = (state.agents_selected + 1).min(state.agents.len() - 1);
+                }
+                AgentsEventOutcome::Handled
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                if state.agents.get(state.agents_selected).is_some() {
+                    state.agents_view = AgentsView::Detail;
+                    state.agents_detail_scroll = 0;
+                }
+                AgentsEventOutcome::Handled
+            }
+            KeyCode::Char('r') => AgentsEventOutcome::Refresh,
+            KeyCode::Esc => {
+                state.agents_visible = false;
+                AgentsEventOutcome::Handled
+            }
+            _ => AgentsEventOutcome::Handled,
+        },
+        AgentsView::Detail => match code {
+            KeyCode::Esc | KeyCode::Left => {
+                state.agents_view = AgentsView::List;
+                state.agents_detail_scroll = 0;
+                AgentsEventOutcome::Handled
+            }
+            KeyCode::Up => {
+                state.agents_detail_scroll = state.agents_detail_scroll.saturating_sub(1);
+                AgentsEventOutcome::Handled
+            }
+            KeyCode::Down => {
+                state.agents_detail_scroll = state.agents_detail_scroll.saturating_add(1);
+                AgentsEventOutcome::Handled
+            }
+            KeyCode::Char('r') => AgentsEventOutcome::Refresh,
+            _ => AgentsEventOutcome::Handled,
         },
     }
 }
@@ -5301,6 +5860,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         || state.pending_permission.is_some()
         || state.pending_worktree_removal.is_some()
         || state.pending_agent_confirm.is_some()
+        || state.pending_agent_conflict.is_some()
         || state.pending_undo_conflict.is_some()
         || state.pending_update.is_some()
     {
@@ -5583,15 +6143,17 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
-        AgentConfirmAction, AgentInvocation, AppState, ChatEntry, ChatSubmission, HelpTab,
-        InputAction, MAX_VISIBLE_SUGGESTIONS, McpAddStep, McpEventOutcome, McpView,
-        PendingAgentConfirm, Screen, SkillsEventOutcome, SkillsView, SlashCommand,
-        UpdateEventOutcome, UpdateStage, WorktreeInvocation, classify_event,
-        handle_agent_confirm_event, handle_chat_event, handle_effort_picker_event,
-        handle_help_event, handle_mcp_event, handle_model_picker_event, handle_onboarding_event,
-        handle_permission_event, handle_session_picker_event, handle_skills_event,
-        handle_update_event, handle_worktree_removal_event, parse_agent_command,
-        parse_worktree_command, render, run_with_event_source, slash_suggestions,
+        AgentConfirmAction, AgentConflictEventOutcome, AgentInvocation, AgentsEventOutcome,
+        AgentsView, AppState, ChatEntry, ChatSubmission, ConflictFileState, ConflictResolution,
+        HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS, McpAddStep, McpEventOutcome, McpView,
+        PendingAgentConfirm, PendingAgentConflict, Screen, SkillsEventOutcome, SkillsView,
+        SlashCommand, UpdateEventOutcome, UpdateStage, WorktreeInvocation, classify_event,
+        handle_agent_confirm_event, handle_agent_conflict_event, handle_agents_event,
+        handle_chat_event, handle_effort_picker_event, handle_help_event, handle_mcp_event,
+        handle_model_picker_event, handle_onboarding_event, handle_permission_event,
+        handle_session_picker_event, handle_skills_event, handle_update_event,
+        handle_worktree_removal_event, parse_agent_command, parse_worktree_command, render,
+        run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -6408,6 +6970,127 @@ mod tests {
         );
     }
 
+    fn sample_agent_records() -> Vec<gocode_core::SubagentRecord> {
+        vec![
+            gocode_core::SubagentRecord::new(
+                "session-1".into(),
+                "investigate flaky login test".into(),
+                gocode_core::SubagentMode::Research,
+                "test-model".into(),
+                true,
+                gocode_core::PermissionMode::Auto,
+            ),
+            gocode_core::SubagentRecord::new(
+                "session-1".into(),
+                "add a doc comment".into(),
+                gocode_core::SubagentMode::Implement,
+                "test-model".into(),
+                false,
+                gocode_core::PermissionMode::Auto,
+            ),
+        ]
+    }
+
+    #[test]
+    fn agent_list_available_event_populates_the_popup_and_clamps_selection() {
+        let mut state = AppState {
+            agents_selected: 5,
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::AgentListAvailable(sample_agent_records()));
+        assert_eq!(state.agents.len(), 2);
+        assert_eq!(state.agents_selected, 1);
+    }
+
+    #[test]
+    fn agents_list_navigation_stays_within_bounds() {
+        let mut state = AppState {
+            agents_visible: true,
+            agents_view: AgentsView::List,
+            agents: sample_agent_records(),
+            agents_selected: 0,
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Up)),
+            AgentsEventOutcome::Handled
+        );
+        assert_eq!(state.agents_selected, 0);
+
+        let _ = handle_agents_event(&mut state, &press(KeyCode::Down));
+        let _ = handle_agents_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(state.agents_selected, 1);
+    }
+
+    #[test]
+    fn enter_opens_agent_detail_then_esc_returns_to_the_list() {
+        let mut state = AppState {
+            agents_visible: true,
+            agents_view: AgentsView::List,
+            agents: sample_agent_records(),
+            agents_selected: 0,
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Enter)),
+            AgentsEventOutcome::Handled
+        );
+        assert_eq!(state.agents_view, AgentsView::Detail);
+
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Esc)),
+            AgentsEventOutcome::Handled
+        );
+        assert_eq!(state.agents_view, AgentsView::List);
+    }
+
+    #[test]
+    fn esc_on_the_agents_list_closes_the_whole_popup() {
+        let mut state = AppState {
+            agents_visible: true,
+            agents_view: AgentsView::List,
+            agents: sample_agent_records(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Esc)),
+            AgentsEventOutcome::Handled
+        );
+        assert!(!state.agents_visible);
+    }
+
+    #[test]
+    fn pressing_r_requests_a_refresh_from_either_view() {
+        let mut state = AppState {
+            agents_visible: true,
+            agents_view: AgentsView::List,
+            agents: sample_agent_records(),
+            ..AppState::default()
+        };
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Char('r'))),
+            AgentsEventOutcome::Refresh
+        );
+
+        state.agents_view = AgentsView::Detail;
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Char('r'))),
+            AgentsEventOutcome::Refresh
+        );
+    }
+
+    #[test]
+    fn agents_popup_is_not_handled_when_closed() {
+        let mut state = AppState::default();
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Down)),
+            AgentsEventOutcome::NotHandled
+        );
+    }
+
     #[test]
     fn worktree_with_no_argument_suggests_a_name_from_the_session() {
         let state = AppState {
@@ -6603,6 +7286,175 @@ mod tests {
                 id: "a1b2c3d4".into(),
                 message: "This removes the worktree...".into(),
             }),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Char('x'))),
+            None
+        );
+    }
+
+    fn sample_conflict() -> PendingAgentConflict {
+        PendingAgentConflict {
+            id: "a1b2c3d4".into(),
+            files: vec![
+                ConflictFileState {
+                    path: "src/foo.rs".into(),
+                    resolution: None,
+                },
+                ConflictFileState {
+                    path: "src/bar.rs".into(),
+                    resolution: None,
+                },
+            ],
+            selected: 0,
+        }
+    }
+
+    #[test]
+    fn agent_merge_conflict_event_opens_the_guided_resolver() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::AgentMergeConflict {
+            id: "a1b2c3d4".into(),
+            files: vec!["src/foo.rs".into(), "src/bar.rs".into()],
+        });
+        let conflict = state
+            .pending_agent_conflict
+            .expect("conflict resolver should be open");
+        assert_eq!(conflict.id, "a1b2c3d4");
+        assert_eq!(conflict.files.len(), 2);
+        assert!(conflict.files.iter().all(|file| file.resolution.is_none()));
+    }
+
+    #[test]
+    fn conflict_file_resolved_event_records_the_chosen_side() {
+        let mut state = AppState {
+            pending_agent_conflict: Some(sample_conflict()),
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::AgentConflictFileResolved {
+            id: "a1b2c3d4".into(),
+            file: "src/bar.rs".into(),
+            ours: false,
+        });
+        let conflict = state.pending_agent_conflict.expect("still open");
+        assert_eq!(conflict.files[0].resolution, None);
+        assert_eq!(
+            conflict.files[1].resolution,
+            Some(ConflictResolution::Theirs)
+        );
+    }
+
+    #[test]
+    fn merge_finished_event_closes_the_resolver_and_logs_the_outcome() {
+        let mut state = AppState {
+            pending_agent_conflict: Some(sample_conflict()),
+            ..AppState::default()
+        };
+        state.apply(&AppEvent::AgentMergeFinished {
+            id: "a1b2c3d4".into(),
+            applied: true,
+            message: "Applied subagent a1b2c3d4's changes.".into(),
+        });
+        assert!(state.pending_agent_conflict.is_none());
+        assert!(matches!(state.entries.last(), Some(ChatEntry::Info(_))));
+    }
+
+    #[test]
+    fn conflict_navigation_stays_within_bounds() {
+        let mut state = AppState {
+            pending_agent_conflict: Some(sample_conflict()),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agent_conflict_event(&mut state, &press(KeyCode::Up)),
+            AgentConflictEventOutcome::Handled
+        );
+        assert_eq!(state.pending_agent_conflict.as_ref().unwrap().selected, 0);
+
+        assert_eq!(
+            handle_agent_conflict_event(&mut state, &press(KeyCode::Down)),
+            AgentConflictEventOutcome::Handled
+        );
+        assert_eq!(state.pending_agent_conflict.as_ref().unwrap().selected, 1);
+
+        assert_eq!(
+            handle_agent_conflict_event(&mut state, &press(KeyCode::Down)),
+            AgentConflictEventOutcome::Handled
+        );
+        assert_eq!(state.pending_agent_conflict.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn pressing_o_and_t_request_resolving_the_selected_file() {
+        let mut state = AppState {
+            pending_agent_conflict: Some(sample_conflict()),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agent_conflict_event(&mut state, &press(KeyCode::Char('o'))),
+            AgentConflictEventOutcome::Resolve {
+                id: "a1b2c3d4".into(),
+                file: "src/foo.rs".into(),
+                ours: true,
+            }
+        );
+
+        let _ = handle_agent_conflict_event(&mut state, &press(KeyCode::Down));
+        assert_eq!(
+            handle_agent_conflict_event(&mut state, &press(KeyCode::Char('t'))),
+            AgentConflictEventOutcome::Resolve {
+                id: "a1b2c3d4".into(),
+                file: "src/bar.rs".into(),
+                ours: false,
+            }
+        );
+    }
+
+    #[test]
+    fn enter_is_a_no_op_until_every_file_is_resolved_then_finishes() {
+        let mut conflict = sample_conflict();
+        let mut state = AppState {
+            pending_agent_conflict: Some(conflict.clone()),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agent_conflict_event(&mut state, &press(KeyCode::Enter)),
+            AgentConflictEventOutcome::Handled
+        );
+
+        conflict.files[0].resolution = Some(ConflictResolution::Ours);
+        conflict.files[1].resolution = Some(ConflictResolution::Theirs);
+        state.pending_agent_conflict = Some(conflict);
+
+        assert_eq!(
+            handle_agent_conflict_event(&mut state, &press(KeyCode::Enter)),
+            AgentConflictEventOutcome::Finish("a1b2c3d4".into())
+        );
+    }
+
+    #[test]
+    fn esc_aborts_the_merge_even_with_unresolved_files() {
+        let mut state = AppState {
+            pending_agent_conflict: Some(sample_conflict()),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agent_conflict_event(&mut state, &press(KeyCode::Esc)),
+            AgentConflictEventOutcome::Abort("a1b2c3d4".into())
+        );
+    }
+
+    #[test]
+    fn conflict_resolver_blocks_chat_input_while_pending() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            pending_agent_conflict: Some(sample_conflict()),
             ..AppState::default()
         };
 

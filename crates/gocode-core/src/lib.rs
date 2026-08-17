@@ -160,6 +160,24 @@ pub enum AppCommand {
     AgentCleanupRequest(String),
     /// Remove a completed subagent's worktree and metadata, already confirmed by the interface.
     AgentCleanupConfirm(String),
+    /// Resolve one conflicting file from an in-progress `/agent apply` merge by keeping either
+    /// side, then stage it. Part of the guided conflict resolver; the merge itself is left
+    /// in-progress in the main workspace until every file is resolved and
+    /// [`AppCommand::AgentFinishMerge`] completes it.
+    AgentResolveConflict {
+        /// The subagent whose merge is in progress.
+        id: String,
+        /// Path of the conflicting file, relative to the repository root.
+        file: String,
+        /// `true` keeps the main workspace's version; `false` keeps the subagent's.
+        ours: bool,
+    },
+    /// Completes an in-progress merge once every conflicting file has been resolved, already
+    /// confirmed by the interface.
+    AgentFinishMerge(String),
+    /// Aborts an in-progress merge, discarding every resolution made so far, already confirmed by
+    /// the interface.
+    AgentAbortMerge(String),
 }
 
 /// Where a new worktree's branch comes from, mirroring [`gocode_tools`]'s `BranchSource` at the
@@ -426,6 +444,25 @@ pub enum AppEvent {
     AgentDiffReady { id: String, diff: String },
     /// The warning shown before `/agent cleanup <id> confirm` removes a subagent's worktree.
     AgentCleanupWarning { id: String, message: String },
+    /// Every subagent this session knows about, most recently updated first, for the `/agents`
+    /// popup.
+    AgentListAvailable(Vec<SubagentRecord>),
+    /// `/agent apply` hit a merge conflict; the merge is left in progress in the main workspace
+    /// and the interface should open the guided conflict resolver listing `files`.
+    AgentMergeConflict { id: String, files: Vec<String> },
+    /// One conflicting file was resolved and staged, keeping either side.
+    AgentConflictFileResolved {
+        id: String,
+        file: String,
+        ours: bool,
+    },
+    /// An in-progress merge was completed or aborted, ending the guided conflict resolver.
+    AgentMergeFinished {
+        id: String,
+        /// `true` when the subagent's changes were actually applied.
+        applied: bool,
+        message: String,
+    },
 }
 
 /// One transaction's file outcomes, for `AppEvent::UndoApplied`/`UndoConflict`.

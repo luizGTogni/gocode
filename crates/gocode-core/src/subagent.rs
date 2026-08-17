@@ -165,7 +165,7 @@ pub struct SubagentResult {
 
 /// A persisted subagent: metadata, message history, and result. Mirrors
 /// [`crate::session::SessionRecord`]'s persistence shape and schema-tolerance conventions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentRecord {
     /// Stable identifier, also the filename stem on disk.
     pub id: String,
