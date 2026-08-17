@@ -267,10 +267,31 @@ pub fn build_chat_body(request: &ChatRequest) -> serde_json::Value {
     }
 
     if let Some(effort) = &request.reasoning_effort {
+        // `reasoning_effort` is the OpenAI-style convenience field some NIM-hosted models accept
+        // directly; it's sent as a harmless extra field for those that don't. Nemotron's own
+        // reasoning models (e.g. nemotron-3-ultra) instead document `chat_template_kwargs.
+        // enable_thinking` plus a token `reasoning_budget` as the actual control — without it,
+        // effort selection silently does nothing on those models and reasoning/tool-call
+        // decoding can interact badly (observed as tool calls leaking into `content` as raw
+        // text instead of structured `tool_calls`). Sending both covers each family correctly.
         body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+        body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": true });
+        body["reasoning_budget"] = serde_json::Value::Number(reasoning_budget_for(effort).into());
     }
 
     body
+}
+
+/// Maps a `reasoning_effort` level to a thinking-token budget for NIM's `reasoning_budget`
+/// field. Values follow NVIDIA's own documented example (16384 for a mid-range budget);
+/// unrecognized levels fall back to that same mid-range value rather than guessing higher or
+/// lower.
+fn reasoning_budget_for(effort: &str) -> u32 {
+    match effort {
+        "low" => 4_096,
+        "high" => 32_768,
+        _ => 16_384,
+    }
 }
 
 fn build_message(message: &ChatMessage) -> serde_json::Value {
@@ -594,6 +615,29 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Olá");
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_sends_both_the_convenience_field_and_nemotrons_documented_fields() {
+        let mut request = gocode_core::ChatRequest::single_user("nvidia/model", "Olá");
+        request.reasoning_effort = Some("high".into());
+
+        let body = super::build_chat_body(&request);
+
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["reasoning_budget"], 32_768);
+    }
+
+    #[test]
+    fn no_reasoning_effort_omits_every_reasoning_field() {
+        let request = gocode_core::ChatRequest::single_user("nvidia/model", "Olá");
+
+        let body = super::build_chat_body(&request);
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("reasoning_budget").is_none());
     }
 
     #[test]
