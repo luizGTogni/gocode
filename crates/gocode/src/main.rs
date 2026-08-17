@@ -1080,11 +1080,17 @@ async fn run_application() -> Result<(), AppError> {
         let sessions_dir = gocode_core::sessions_dir(&paths.state_dir);
         let subagents_dir = gocode_core::subagents_dir(&paths.state_dir);
         let (subagent_event_tx, subagent_event_rx) = mpsc::channel::<SubagentEvent>(128);
-        let subagent_manager = Arc::new(SubagentManager::new(
-            subagents_dir.clone(),
-            gocode_agent::SubagentLimits::default(),
-            subagent_event_tx,
-        ));
+        let lsp_manager = Arc::new(build_lsp_manager(&paths, &bootstrap.project));
+        let file_change_observer: Arc<dyn gocode_tools::contract::FileChangeObserver> =
+            Arc::new(gocode_lsp::ArcLspManagerObserver(Arc::clone(&lsp_manager)));
+        let subagent_manager = Arc::new(
+            SubagentManager::new(
+                subagents_dir.clone(),
+                gocode_agent::SubagentLimits::default(),
+                subagent_event_tx,
+            )
+            .with_file_change_observer(Arc::clone(&file_change_observer)),
+        );
         match gocode_core::recover_interrupted(&subagents_dir) {
             Ok(recovered) if !recovered.is_empty() => {
                 driver
@@ -1120,9 +1126,6 @@ async fn run_application() -> Result<(), AppError> {
         let mut active_personality = loaded_preferences.preferences.personality;
         let config_path = paths.config_dir.join("config.toml");
         let mut mcp_runtime = McpRuntime::bootstrap(&paths, &bootstrap.project).await;
-        let lsp_manager = Arc::new(build_lsp_manager(&paths, &bootstrap.project));
-        let file_change_observer: Arc<dyn gocode_tools::contract::FileChangeObserver> =
-            Arc::new(gocode_lsp::ArcLspManagerObserver(Arc::clone(&lsp_manager)));
         let mut tool_registry: Arc<ToolRegistry> =
             Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
         driver

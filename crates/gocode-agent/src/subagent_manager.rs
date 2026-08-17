@@ -25,7 +25,7 @@ use gocode_core::{
     SubagentMode, SubagentRecord, SubagentResult, SubagentStatus,
 };
 use gocode_tools::{
-    ToolRegistry,
+    FileChangeObserver, ToolRegistry,
     permissions::{
         AlwaysDenyResolver, DefaultPermissionPolicy, PermissionContext, PermissionPolicy,
     },
@@ -191,6 +191,9 @@ pub struct SubagentManager {
     concurrency: Arc<Semaphore>,
     limits: SubagentLimits,
     event_tx: mpsc::Sender<SubagentEvent>,
+    /// Observer notified after a subagent's tool call writes a file (e.g. an LSP client keeping
+    /// open documents in sync). `None` by default; see [`Self::with_file_change_observer`].
+    file_change_observer: Option<Arc<dyn FileChangeObserver>>,
 }
 
 impl SubagentManager {
@@ -212,7 +215,17 @@ impl SubagentManager {
             concurrency: Arc::new(Semaphore::new(limits.max_concurrent.max(1))),
             limits,
             event_tx,
+            file_change_observer: None,
         }
+    }
+
+    /// Attaches an observer every subagent's [`Agent`] will notify after a tool call writes a
+    /// file, same as [`Agent::with_file_change_observer`] on the top-level agent. Optional: a
+    /// subagent run works identically without one.
+    #[must_use]
+    pub fn with_file_change_observer(mut self, observer: Arc<dyn FileChangeObserver>) -> Self {
+        self.file_change_observer = Some(observer);
+        self
     }
 
     /// Validates and starts one subagent, returning its id immediately. The actual run happens on
@@ -309,6 +322,7 @@ impl SubagentManager {
             instructions: request.instructions,
             manager: Arc::new(self.clone()),
             worktree_runner: request.worktree_runner,
+            file_change_observer: self.file_change_observer.clone(),
         };
         tokio::spawn(worker.run(record, request.provider, request.tools, cancellation));
 
@@ -472,6 +486,8 @@ struct SubagentWorker {
     manager: Arc<SubagentManager>,
     /// Forwarded to a nested spawn's `agent_spawn` tool for its own worktree creation.
     worktree_runner: Arc<dyn ProcessRunner>,
+    /// Mirrors [`SubagentManager::file_change_observer`]; applied to this worker's own [`Agent`].
+    file_change_observer: Option<Arc<dyn FileChangeObserver>>,
 }
 
 impl SubagentWorker {
@@ -497,7 +513,7 @@ impl SubagentWorker {
         let policy = Self::policy_for(record.mode, record.worktree_path.as_ref());
         let permissions = PermissionContext::new(policy, Arc::new(AlwaysDenyResolver));
         let tools = self.tools_for(&record, &provider, &tools);
-        let agent = Agent::new(
+        let mut agent = Agent::new(
             provider,
             tools,
             permissions,
@@ -507,6 +523,9 @@ impl SubagentWorker {
                 ..AgentLimits::default()
             },
         );
+        if let Some(observer) = &self.file_change_observer {
+            agent = agent.with_file_change_observer(Arc::clone(observer));
+        }
 
         let project_root = record
             .worktree_path
@@ -1258,6 +1277,7 @@ mod tests {
             instructions: None,
             manager,
             worktree_runner: Arc::new(TokioProcessRunner),
+            file_change_observer: None,
         }
     }
 
