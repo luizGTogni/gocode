@@ -295,6 +295,7 @@ impl Agent {
         let mut text = String::new();
         let mut assembler = ToolCallAssembler::default();
         let mut input_tokens = None;
+        let mut finish_reason = None;
 
         loop {
             tokio::select! {
@@ -325,18 +326,25 @@ impl Agent {
                     Some(Ok(ChatStreamEvent::Usage(usage))) => {
                         input_tokens = usage.input_tokens;
                     }
-                    Some(Ok(
-                        ChatStreamEvent::Finished(_)
-                        | ChatStreamEvent::RequestId(_),
-                    )) => {}
+                    Some(Ok(ChatStreamEvent::Finished(reason))) => {
+                        finish_reason = Some(reason);
+                    }
+                    Some(Ok(ChatStreamEvent::RequestId(_))) => {}
                     Some(Err(error)) => return Err(AgentError::Provider(error)),
                     None => break,
                 },
             }
         }
 
+        let tool_calls = assembler.finish();
+        if matches!(finish_reason, Some(FinishReason::Length)) && text.is_empty() && tool_calls.is_empty() {
+            let _ = events
+                .send(AgentEvent::Warning(AgentWarning::TruncatedBeforeContent))
+                .await;
+        }
+
         let text = (!text.is_empty()).then_some(text);
-        Ok((text, assembler.finish(), input_tokens))
+        Ok((text, tool_calls, input_tokens))
     }
 
     async fn execute_tool(

@@ -695,6 +695,12 @@ fn describe_warning(warning: &gocode_agent::AgentWarning) -> String {
         gocode_agent::AgentWarning::LoopDetected(name) => {
             format!("Stopped a repeating tool call: {name}")
         }
+        gocode_agent::AgentWarning::TruncatedBeforeContent => {
+            "The model ran out of output tokens before producing any answer or tool call \
+             (often happens on reasoning models whose thinking alone fills the budget). Try \
+             again, or lower the reasoning effort."
+                .to_string()
+        }
     }
 }
 

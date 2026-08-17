@@ -56,6 +56,11 @@ pub enum AgentWarning {
     UnknownTool(String),
     /// The same tool call repeated with the same arguments and was stopped.
     LoopDetected(String),
+    /// The provider cut the turn off at its output token limit (`finish_reason: "length"`)
+    /// before the model produced any visible text or tool call. Common with large reasoning
+    /// models whose chain-of-thought alone can consume the entire budget, leaving nothing for
+    /// the actual answer — without this warning that turn looks like a silent no-op.
+    TruncatedBeforeContent,
 }
 
 /// Counters describing one run's shape, useful for diagnostics and the final response.

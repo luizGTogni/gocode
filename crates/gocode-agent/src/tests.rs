@@ -173,6 +173,75 @@ async fn reasoning_delta_is_forwarded_but_not_added_to_final_text() {
 }
 
 #[tokio::test]
+async fn a_turn_that_runs_out_of_tokens_mid_reasoning_warns_instead_of_completing_silently() {
+    let root = fixture("truncated-mid-reasoning");
+    // A large reasoning model can burn its entire output budget on reasoning_content before
+    // producing any visible text or tool call; the provider reports this as finish_reason
+    // "length" with nothing else in the turn.
+    let provider = FakeProvider::script(vec![vec![
+        Ok(ChatStreamEvent::ReasoningDelta("thinking forever...".into())),
+        Ok(ChatStreamEvent::Finished(FinishReason::Length)),
+    ]]);
+    let (tx, rx) = mpsc::channel(32);
+
+    let outcome = agent(
+        provider,
+        ToolRegistry::new(),
+        PermissionContext::read_only_default(),
+    )
+    .run(request(&root, "understand this project"), tx, CancellationToken::new())
+    .await
+    .expect("a truncated turn with no tool calls still completes the run");
+
+    assert_eq!(outcome.final_text, "");
+    assert_eq!(outcome.stats.tool_calls, 0);
+
+    let events = drain(rx).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Warning(crate::AgentWarning::TruncatedBeforeContent)
+        )),
+        "expected a TruncatedBeforeContent warning, got: {events:?}"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn a_truncated_turn_that_still_produced_text_does_not_warn() {
+    let root = fixture("truncated-with-text");
+    // finish_reason "length" mid-answer is a real, separate concern (cut-off text) but not the
+    // "produced literally nothing" case this warning targets; don't double-warn on top of the
+    // already-visible truncated text.
+    let provider = FakeProvider::script(vec![vec![
+        Ok(ChatStreamEvent::TextDelta("Here is what I found so far".into())),
+        Ok(ChatStreamEvent::Finished(FinishReason::Length)),
+    ]]);
+    let (tx, rx) = mpsc::channel(32);
+
+    agent(
+        provider,
+        ToolRegistry::new(),
+        PermissionContext::read_only_default(),
+    )
+    .run(request(&root, "hi"), tx, CancellationToken::new())
+    .await
+    .expect("a truncated turn with partial text still completes the run");
+
+    let events = drain(rx).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Warning(crate::AgentWarning::TruncatedBeforeContent)
+        )),
+        "should not warn when the turn produced visible text: {events:?}"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn seeded_history_is_preserved_and_extended_with_this_run_and_reported_usage() {
     let root = fixture("seeded-history");
     let mut script = text_turn("Sure, continuing from before.");
