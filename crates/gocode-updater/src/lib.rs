@@ -316,7 +316,10 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<(), UpdateError> {
         .ok_or(UpdateError::ChecksumMismatch)
 }
 
-/// Extracts the two exact executable names only; every archive path must be a root-level file.
+/// Extracts `gocode.exe` and `gocode-updater.exe` from a root-level `.zip` release archive.
+/// Every entry must be a root-level file; other root-level files (`LICENSE`, `INSTALL.md`,
+/// `install-windows.ps1`, …) are skipped, and anything nested in a subdirectory or resolving
+/// outside the archive root (e.g. a path-traversal entry) is rejected as unsafe.
 ///
 /// # Errors
 ///
@@ -342,11 +345,15 @@ pub fn extract_windows_archive(
         if entry.enclosed_name() != Some(Path::new(&name).to_path_buf())
             || name.contains('/')
             || name.contains('\\')
-            || (name != "gocode.exe" && name != "gocode-updater.exe")
         {
             return Err(UpdateError::UnsafeArchive(format!(
                 "unexpected archive entry: {name}"
             )));
+        }
+        if name != "gocode.exe" && name != "gocode-updater.exe" {
+            // Root-level extras such as LICENSE, INSTALL.md, and install-windows.ps1 matter only
+            // for a fresh manual install; the updater just skips them (see docs/UPDATER.md §65).
+            continue;
         }
         let destination = staging.join(&name);
         let mut output = fs::File::create(&destination)?;
@@ -619,6 +626,33 @@ mod tests {
             extract_windows_archive(&archive, &dir.path().join("staging")),
             Err(UpdateError::UnsafeArchive(_))
         ));
+    }
+    #[test]
+    fn windows_archive_skips_non_essential_root_level_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("release.zip");
+        let file = fs::File::create(&archive).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, contents) in [
+            ("gocode.exe", "app".as_bytes()),
+            ("gocode-updater.exe", "updater".as_bytes()),
+            ("LICENSE", "license".as_bytes()),
+            ("INSTALL.md", "install".as_bytes()),
+            ("install-windows.ps1", "script".as_bytes()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let staging = dir.path().join("staging");
+        let (app, updater) = extract_windows_archive(&archive, &staging).unwrap();
+        assert_eq!(fs::read_to_string(app).unwrap(), "app");
+        assert_eq!(fs::read_to_string(updater).unwrap(), "updater");
+        assert!(!staging.join("LICENSE").exists());
+        assert!(!staging.join("install-windows.ps1").exists());
     }
     #[test]
     fn linux_archive_extracts_only_the_gocode_binary() {

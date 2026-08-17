@@ -1117,7 +1117,7 @@ Never extract directly over the live installation on either platform.
 
 Extraction must prevent path traversal on both formats.
 
-Windows ZIP entries are rejected unless they are a root-level `gocode.exe` or `gocode-updater.exe` (no `/`, no `\`, no enclosed-path mismatch).
+Windows ZIP entries must be root-level files (no `/`, no `\`, no enclosed-path mismatch) or the archive is rejected as unsafe. Among root-level entries, only `gocode.exe` and `gocode-updater.exe` are extracted; other root-level files (`LICENSE`, `INSTALL.md`, `install-windows.ps1`, …) are simply skipped, not rejected — mirroring how Linux treats non-`gocode` files inside its one wrapping directory.
 
 Linux tar entries are rejected unless they resolve to exactly `<one-directory>/<file>` — anything with `..`, more path segments, or no wrapping directory is treated as unsafe. Non-`gocode` files inside that one directory (`LICENSE`, install scripts, …) are simply skipped, not rejected.
 
