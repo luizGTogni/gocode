@@ -369,6 +369,8 @@ pub enum SlashCommand {
     Personality(String),
     /// Reopen the model picker.
     Model,
+    /// Reopen the reasoning-effort picker directly, without going through the model picker.
+    Effort,
     /// Open the settings menu to change the API key, model, or reasoning effort.
     Settings,
     /// Show the active provider.
@@ -526,6 +528,11 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         SlashCommand::Personality(String::new()),
     ),
     ("/model", "Switch the active model", SlashCommand::Model),
+    (
+        "/effort",
+        "Change the reasoning effort level",
+        SlashCommand::Effort,
+    ),
     (
         "/settings",
         "Change API key, model, or reasoning effort",
@@ -4289,6 +4296,15 @@ fn run_terminal(
                     state.screen = Screen::ModelPicker;
                     state.selected_model = 0;
                     state.model_flow_pending_effort = true;
+                }
+                ChatSubmission::Command(SlashCommand::Effort) => {
+                    state.screen = Screen::EffortPicker;
+                    state.model_flow_pending_effort = false;
+                    state.pending_model = None;
+                    state.selected_effort = EFFORT_OPTIONS
+                        .iter()
+                        .position(|(_, value)| *value == state.current_effort.as_deref())
+                        .unwrap_or(0);
                 }
                 ChatSubmission::Command(SlashCommand::Settings) => {
                     state.screen = Screen::Settings;
@@ -8226,6 +8242,32 @@ mod tests {
             .expect("screen should render");
 
         assert!(buffer_text(&terminal).contains("thinking"));
+    }
+
+    #[test]
+    fn the_effort_slash_command_resolves_and_skips_the_model_picker() {
+        use super::{handle_effort_picker_event, resolve_slash_command, EFFORT_OPTIONS};
+
+        assert_eq!(resolve_slash_command("/effort"), Some(SlashCommand::Effort));
+
+        let mut state = AppState {
+            screen: Screen::EffortPicker,
+            model_flow_pending_effort: false,
+            pending_model: None,
+            current_effort: Some("high".into()),
+            selected_effort: EFFORT_OPTIONS
+                .iter()
+                .position(|(_, value)| *value == Some("high"))
+                .unwrap_or(0),
+            ..AppState::default()
+        };
+
+        assert_eq!(state.selected_effort, 3);
+        assert_eq!(
+            handle_effort_picker_event(&mut state, &press(KeyCode::Enter)),
+            Some(Some("high".to_string()))
+        );
+        assert!(state.pending_model.is_none());
     }
 
     #[test]
