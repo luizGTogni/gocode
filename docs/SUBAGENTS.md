@@ -155,10 +155,9 @@ user reviews via `/agents` and discards via `/agent cleanup <id>`.
 |---|---|
 | `/agent spawn <task> [--mode research\|plan\|implement\|review] [--model <id>] [--worktree]` | Creates a subagent; prints id/mode/permissions/location once it starts. |
 | `/agents` | Opens a scrollable popup listing id, mode, task, status, elapsed time, model, and worktree; Enter opens a subagent's full detail (status, messages, result), `r` refreshes, Esc closes/backs out. |
-| `/agent status <id>` | Current status plus the last few messages. |
+| `/agent status <id>` / `/agent result <id>` | Deep-links straight into the `/agents` popup's detail view for that subagent (status, messages, and structured result together) — no need to open `/agents` and navigate to it first. |
 | `/agent message <id> <text>` | Queues a follow-up. If the subagent is `WaitingInput` (it asked a `NEEDS_INPUT:` question), this resumes it immediately; otherwise it's delivered at the next `Agent::run` step boundary (see §11.1). |
 | `/agent stop <id>` | Cooperative stop; preserves partial result; never touches the worktree. |
-| `/agent result <id>` | The structured `SubagentResult`. |
 | `/agent apply <id>` | Requests the diff. When it arrives, a modal shows it with `[y] Apply [n] Cancel`; `/agent apply <id> confirm` is an equivalent typed shortcut. On confirm, a clean merge applies immediately; a conflicting one opens the guided resolver (`o`/`t` per file, `[Enter]` to finish, `[Esc]` to abort — see §7). |
 | `/agent cleanup <id>` | Requests the warning. When it arrives, a modal shows it with `[y] Remove [n] Cancel`; `/agent cleanup <id> confirm` is an equivalent typed shortcut. |
 
@@ -180,6 +179,17 @@ from `gocode_core::AppEvent::AgentListAvailable(Vec<SubagentRecord>)`, sent when
 opens or `r` is pressed inside it; `SubagentManager::list()` (disk-backed, see §9) is the source,
 so the popup shows subagents from earlier sessions too.
 
+`/agent status <id>`/`/agent result <id>` deep-link into the same popup's detail view rather than
+answering inline: the runtime resolves `id` once (`SubagentManager::find`) and replies with
+`AppEvent::AgentDetailAvailable { id, record }`, which the interface renders into
+`AppState::agent_detail` (boxed — `SubagentRecord` is too large to keep unboxed in `AppEvent`
+without bloating every other variant) and opens the popup straight to `AgentsView::Detail`. A
+`None` record instead pushes a chat warning and leaves the popup closed. `agent_detail` is
+decoupled from `agents`/`agents_selected` — it can hold a subagent that was never listed, e.g. a
+prefix nobody has browsed to yet — but stays in sync with it: every `AgentListAvailable` refresh
+re-matches by id and updates `agent_detail` if that subagent is still present, so pressing `r`
+from either list or detail keeps both views current.
+
 # 11. Known MVP limitations and recommended next increments
 
 1. **Mid-run messaging is still not mid-turn.** `Agent::run` is one bounded prompt-to-completion
@@ -198,10 +208,11 @@ so the popup shows subagents from earlier sessions too.
    is still no hunk-level or line-level editor — a file that needs pieces of both sides has to be
    finished by hand outside the TUI before `git add`-ing it and returning to finish the merge (or
    the user aborts and starts over).
-3. **`/agent status`/`result`/`message`/`stop` still reply inline.** `/agents` now opens a
-   scrollable popup (see §10), but the single-subagent commands render as chat-log `Info`/
-   `Warning` entries, consistent with how `/debug` already works, rather than deep-linking into
-   the popup's detail view.
+3. **`/agent message`/`stop` still reply inline.** `/agent status`/`result` now deep-link into the
+   `/agents` popup's detail view (see §10), but `message` and `stop` are fire-and-forget mutations
+   and stay as chat-log `Info`/`Warning` acknowledgements, consistent with how `/debug` already
+   works — arguably the right call for a transient action rather than something to "view", but
+   worth revisiting if usage shows otherwise.
 4. **No nested subagents**, by construction (see §2) — not a limitation to lift casually, since the
    spec explicitly requires it stay out of the MVP.
 
@@ -250,7 +261,10 @@ Removed subagent e5f6a7b8.
   `AgentMergeFinished` closes it and logs the outcome, navigation stays in bounds, `o`/`t` request
   resolving the selected file, Enter is a no-op until every file is resolved then requests
   finishing, Esc requests aborting even with unresolved files, and it blocks chat input while
-  pending).
+  pending), and the `/agent status`/`result` deep link (`AgentDetailAvailable` opens the popup
+  straight to detail with the matched record, a `None` match warns without opening it, entering
+  detail from the list snapshots the selected record, and an `AgentListAvailable` refresh keeps an
+  already-open detail in sync by id).
 - `crates/gocode/src/main.rs` — diff computation; a clean merge applying immediately; a
   conflicting merge left in progress (not aborted) reporting a structured conflicting-files list;
   resolving every file and finishing completes the merge keeping the chosen side, verified against

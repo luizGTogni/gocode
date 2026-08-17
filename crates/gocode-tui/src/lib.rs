@@ -844,6 +844,10 @@ pub struct AppState {
     agents: Vec<gocode_core::SubagentRecord>,
     /// Lines scrolled down from the top of the `/agents` detail screen.
     agents_detail_scroll: u16,
+    /// The subagent shown by the `/agents` detail screen. Set by entering detail from the list
+    /// (a snapshot of `agents[agents_selected]`) or by `/agent status <id>`/`/agent result <id>`
+    /// deep-linking straight to it; kept in sync with `agents` by id whenever the list refreshes.
+    agent_detail: Option<gocode_core::SubagentRecord>,
     /// Display form of the detected project root, shown by `/status`.
     working_directory: String,
     /// The active session's id, shown by `/status`.
@@ -1029,6 +1033,25 @@ impl AppState {
                 self.agents.clone_from(records);
                 if self.agents_selected >= self.agents.len() {
                     self.agents_selected = self.agents.len().saturating_sub(1);
+                }
+                if let Some(current) = &self.agent_detail
+                    && let Some(refreshed) =
+                        self.agents.iter().find(|record| record.id == current.id)
+                {
+                    self.agent_detail = Some(refreshed.clone());
+                }
+            }
+            AppEvent::AgentDetailAvailable { id, record } => {
+                self.agents_visible = true;
+                self.agents_view = AgentsView::Detail;
+                self.agents_detail_scroll = 0;
+                if let Some(record) = record {
+                    self.agent_detail = Some((**record).clone());
+                } else {
+                    self.agent_detail = None;
+                    self.agents_visible = false;
+                    self.entries
+                        .push(ChatEntry::Warning(format!("No subagent matches '{id}'.")));
                 }
             }
             AppEvent::AgentMergeConflict { id, files } => {
@@ -2725,7 +2748,7 @@ fn render_agents_list(frame: &mut Frame, state: &AppState, area: Rect) {
 fn render_agents_detail(frame: &mut Frame, state: &AppState, area: Rect) {
     let modal = centered(area, 88, 24);
     frame.render_widget(Clear, modal);
-    let record = state.agents.get(state.agents_selected);
+    let record = state.agent_detail.as_ref();
     let title = record.map_or_else(
         || "Gocode · Subagent".to_string(),
         |record| {
@@ -5506,7 +5529,8 @@ pub fn handle_agents_event(state: &mut AppState, event: &Event) -> AgentsEventOu
                 AgentsEventOutcome::Handled
             }
             KeyCode::Enter | KeyCode::Right => {
-                if state.agents.get(state.agents_selected).is_some() {
+                if let Some(record) = state.agents.get(state.agents_selected) {
+                    state.agent_detail = Some(record.clone());
                     state.agents_view = AgentsView::Detail;
                     state.agents_detail_scroll = 0;
                 }
@@ -7000,6 +7024,74 @@ mod tests {
         state.apply(&AppEvent::AgentListAvailable(sample_agent_records()));
         assert_eq!(state.agents.len(), 2);
         assert_eq!(state.agents_selected, 1);
+    }
+
+    #[test]
+    fn agent_detail_available_opens_the_popup_directly_to_detail() {
+        let mut state = AppState::default();
+        let record = sample_agent_records().remove(0);
+        state.apply(&AppEvent::AgentDetailAvailable {
+            id: record.id.clone(),
+            record: Some(Box::new(record.clone())),
+        });
+        assert!(state.agents_visible);
+        assert_eq!(state.agents_view, AgentsView::Detail);
+        assert_eq!(state.agent_detail, Some(record));
+    }
+
+    #[test]
+    fn agent_detail_available_with_no_match_warns_and_does_not_open_the_popup() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::AgentDetailAvailable {
+            id: "deadbeef".into(),
+            record: None,
+        });
+        assert!(!state.agents_visible);
+        assert!(state.agent_detail.is_none());
+        assert!(
+            matches!(state.entries.last(), Some(ChatEntry::Warning(message)) if message.contains("deadbeef"))
+        );
+    }
+
+    #[test]
+    fn agent_list_refresh_keeps_the_open_detail_in_sync_by_id() {
+        let mut records = sample_agent_records();
+        let target = records[0].clone();
+        let mut state = AppState {
+            agent_detail: Some(target.clone()),
+            ..AppState::default()
+        };
+
+        records[0].status = gocode_core::SubagentStatus::Completed;
+        state.apply(&AppEvent::AgentListAvailable(records.clone()));
+
+        assert_eq!(
+            state.agent_detail.as_ref().map(|record| record.status),
+            Some(gocode_core::SubagentStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn entering_detail_from_the_list_snapshots_the_selected_record() {
+        let mut state = AppState {
+            agents_visible: true,
+            agents_view: AgentsView::List,
+            agents: sample_agent_records(),
+            agents_selected: 1,
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Enter)),
+            AgentsEventOutcome::Handled
+        );
+        assert_eq!(
+            state
+                .agent_detail
+                .as_ref()
+                .map(|record| record.task_summary.clone()),
+            Some("add a doc comment".to_string())
+        );
     }
 
     #[test]

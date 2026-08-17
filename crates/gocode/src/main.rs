@@ -115,65 +115,6 @@ async fn bridge_subagent_events(
     }
 }
 
-/// Renders `/agent status <id>`: current state plus the last few messages.
-fn format_subagent_status(record: &gocode_core::SubagentRecord) -> String {
-    let recent = record
-        .messages
-        .iter()
-        .rev()
-        .take(5)
-        .map(|message| {
-            let role = match message.role {
-                gocode_core::SubagentMessageRole::Supervisor => "you",
-                gocode_core::SubagentMessageRole::Subagent => "subagent",
-            };
-            format!("- {role}: {}", message.text)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "Subagent {} — status: {}\nTask: {}\nElapsed: {}s{}",
-        short_id(&record.id),
-        record.status.label(),
-        record.task_summary,
-        record.elapsed_seconds(),
-        if recent.is_empty() {
-            String::new()
-        } else {
-            format!("\nRecent messages:\n{recent}")
-        },
-    )
-}
-
-/// Renders `/agent result <id>`: the structured [`gocode_core::SubagentResult`], when there is one.
-fn format_subagent_result(record: &gocode_core::SubagentRecord) -> String {
-    use std::fmt::Write as _;
-    let Some(result) = &record.result else {
-        return format!(
-            "Subagent {} has no result yet (status: {}).",
-            short_id(&record.id),
-            record.status.label()
-        );
-    };
-    let mut text = format!("Subagent {} — {}", short_id(&record.id), result.summary);
-    let mut section = |title: &str, items: &[String]| {
-        if !items.is_empty() {
-            let _ = write!(text, "\n\n{title}:\n{}", items.join("\n"));
-        }
-    };
-    section("Findings", &result.findings);
-    section("Files read", &result.files_read);
-    section("Files changed", &result.files_changed);
-    section("Commands run", &result.commands_run);
-    section("Tests run", &result.tests_run);
-    section("Risks", &result.risks);
-    section("Next steps", &result.next_steps);
-    if let Some(error) = &result.error {
-        let _ = write!(text, "\n\nError: {error}");
-    }
-    text
-}
-
 /// Either a ready-to-show diff or a plain notice explaining why there isn't one.
 enum AgentDiffOutcome {
     Diff(String),
@@ -2365,14 +2306,11 @@ async fn run_application() -> Result<(), AppError> {
                         .send(gocode_core::AppEvent::AgentListAvailable(records))
                         .await;
                 }
-                AppCommand::AgentStatus(id) => {
-                    let text = match subagent_manager.find(&id).await {
-                        Some(record) => format_subagent_status(&record),
-                        None => format!("No subagent matches '{id}'."),
-                    };
+                AppCommand::AgentStatus(id) | AppCommand::AgentResult(id) => {
+                    let record = subagent_manager.find(&id).await.map(Box::new);
                     let _ = driver
                         .event_tx
-                        .send(gocode_core::AppEvent::AgentNotice(text))
+                        .send(gocode_core::AppEvent::AgentDetailAvailable { id, record })
                         .await;
                 }
                 AppCommand::AgentMessage { id, text } => {
@@ -2408,16 +2346,6 @@ async fn run_application() -> Result<(), AppError> {
                     let _ = driver
                         .event_tx
                         .send(gocode_core::AppEvent::AgentNotice(notice))
-                        .await;
-                }
-                AppCommand::AgentResult(id) => {
-                    let text = match subagent_manager.find(&id).await {
-                        Some(record) => format_subagent_result(&record),
-                        None => format!("No subagent matches '{id}'."),
-                    };
-                    let _ = driver
-                        .event_tx
-                        .send(gocode_core::AppEvent::AgentNotice(text))
                         .await;
                 }
                 AppCommand::AgentApplyRequest(id) => match subagent_manager.find(&id).await {
@@ -2887,8 +2815,7 @@ mod tests {
     use super::{
         AgentDiffOutcome, MergeAttempt, abort_merge, application_paths, attempt_merge,
         cleanup_subagent, cleanup_warning, compute_subagent_diff, finish_merge,
-        format_subagent_result, format_subagent_status, parse_conflicting_files,
-        resolve_conflict_file,
+        parse_conflicting_files, resolve_conflict_file,
     };
 
     #[test]
@@ -2917,18 +2844,6 @@ mod tests {
     }
 
     #[test]
-    fn subagent_status_includes_recent_messages() {
-        let mut record = sample_record(gocode_core::SubagentMode::Research);
-        record.push_message(
-            gocode_core::SubagentMessageRole::Supervisor,
-            "focus on the retry path".into(),
-        );
-        let text = format_subagent_status(&record);
-        assert!(text.contains("Recent messages"));
-        assert!(text.contains("focus on the retry path"));
-    }
-
-    #[test]
     fn parses_conflicting_files_from_git_merge_output() {
         let stdout = "Auto-merging src/lib.rs\n\
                        CONFLICT (content): Merge conflict in src/lib.rs\n\
@@ -2943,29 +2858,6 @@ mod tests {
     #[test]
     fn parsing_conflicting_files_from_unexpected_output_is_an_empty_list_not_an_error() {
         assert!(parse_conflicting_files("some unrelated git output\n").is_empty());
-    }
-
-    #[test]
-    fn subagent_result_reports_no_result_yet_before_completion() {
-        let record = sample_record(gocode_core::SubagentMode::Research);
-        assert!(format_subagent_result(&record).contains("no result yet"));
-    }
-
-    #[test]
-    fn subagent_result_renders_findings_and_risks_once_set() {
-        let mut record = sample_record(gocode_core::SubagentMode::Research);
-        record.status = gocode_core::SubagentStatus::Completed;
-        record.result = Some(gocode_core::SubagentResult {
-            summary: "found the race condition".into(),
-            findings: vec!["login handler drops the lock early".into()],
-            risks: vec!["fix is untested under load".into()],
-            ..gocode_core::SubagentResult::default()
-        });
-        let text = format_subagent_result(&record);
-        assert!(text.contains("found the race condition"));
-        assert!(text.contains("Findings"));
-        assert!(text.contains("login handler drops the lock early"));
-        assert!(text.contains("Risks"));
     }
 
     #[test]

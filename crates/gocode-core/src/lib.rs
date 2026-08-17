@@ -447,6 +447,12 @@ pub enum AppEvent {
     /// Every subagent this session knows about, most recently updated first, for the `/agents`
     /// popup.
     AgentListAvailable(Vec<SubagentRecord>),
+    /// Answers `/agent status <id>` or `/agent result <id>`: the interface opens the `/agents`
+    /// popup directly to this subagent's detail view. `None` means no subagent matched `id`.
+    AgentDetailAvailable {
+        id: String,
+        record: Option<Box<SubagentRecord>>,
+    },
     /// `/agent apply` hit a merge conflict; the merge is left in progress in the main workspace
     /// and the interface should open the guided conflict resolver listing `files`.
     AgentMergeConflict { id: String, files: Vec<String> },
