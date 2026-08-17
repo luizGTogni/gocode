@@ -975,7 +975,42 @@ async fn compact_and_report(
     }
 }
 
-/// Asks the model to summarize `history`, replacing it with a single condensed message.
+/// Number of most-recent user turns compaction always keeps verbatim. Summarizing the *entire*
+/// history (the previous behavior) loses exact recent tool outputs and decisions right when
+/// they matter most — mid-task, on a long refactor. Only the older portion gets condensed; the
+/// tail survives untouched so the agent doesn't lose track of what it was just doing.
+const COMPACT_KEEP_RECENT_TURNS: usize = 2;
+
+/// Splits `history` at a `User`-message boundary so the most recent `keep_recent_turns` user
+/// turns — and everything that belongs to them (assistant replies, tool calls, tool results) —
+/// are kept intact, separate from everything older. Splitting only ever happens right before a
+/// `User` message because a fresh user turn never continues a pending tool-call sequence, so
+/// this boundary is always safe to cut at regardless of provider.
+///
+/// Returns `(older, recent)`. `older` is empty when `history` has at most `keep_recent_turns`
+/// user turns total, meaning there is nothing old enough to summarize.
+fn split_for_compaction(
+    history: &[gocode_core::ChatMessage],
+    keep_recent_turns: usize,
+) -> (Vec<gocode_core::ChatMessage>, Vec<gocode_core::ChatMessage>) {
+    let user_indices: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| matches!(message, gocode_core::ChatMessage::User(_)))
+        .map(|(index, _)| index)
+        .collect();
+
+    if user_indices.len() <= keep_recent_turns {
+        return (Vec::new(), history.to_vec());
+    }
+
+    let split_at = user_indices[user_indices.len() - keep_recent_turns];
+    (history[..split_at].to_vec(), history[split_at..].to_vec())
+}
+
+/// Asks the model to summarize the older portion of `history`, replacing it with a single
+/// condensed message while keeping the most recent [`COMPACT_KEEP_RECENT_TURNS`] user turns
+/// verbatim. Returns `history` unchanged if there's nothing old enough to summarize.
 ///
 /// # Errors
 ///
@@ -985,10 +1020,17 @@ async fn compact_conversation(
     model: &str,
     history: Vec<gocode_core::ChatMessage>,
 ) -> Result<Vec<gocode_core::ChatMessage>, gocode_core::ProviderError> {
-    let mut messages = history;
+    let (older, recent) = split_for_compaction(&history, COMPACT_KEEP_RECENT_TURNS);
+    if older.is_empty() {
+        return Ok(history);
+    }
+
+    let mut messages = older;
     messages.push(gocode_core::ChatMessage::User(
-        "Summarize this conversation so far in a concise paragraph, preserving important facts, \
-         decisions, and any unfinished tasks. Respond with only the summary, no preamble."
+        "Summarize the conversation so far in a concise paragraph, preserving important facts, \
+         decisions, and any unfinished tasks. This summary will be prepended to the most recent \
+         messages, which are kept in full and shown separately \u{2014} do not restate them, \
+         focus on what happened before them. Respond with only the summary, no preamble."
             .into(),
     ));
     let request = gocode_core::ChatRequest {
@@ -1013,10 +1055,12 @@ async fn compact_conversation(
         summary
     };
 
-    Ok(vec![gocode_core::ChatMessage::User(format!(
-        "(Earlier conversation was compacted to save context. Summary of what happened so far:)\n\
-         {summary}"
-    ))])
+    let mut compacted = vec![gocode_core::ChatMessage::User(format!(
+        "(Earlier conversation was compacted to save context. Summary of what happened before \
+         the messages below:)\n{summary}"
+    ))];
+    compacted.extend(recent);
+    Ok(compacted)
 }
 
 #[tokio::main]
@@ -2917,7 +2961,7 @@ mod tests {
     use super::{
         AgentDiffOutcome, MergeAttempt, abort_merge, application_paths, attempt_merge,
         cleanup_subagent, cleanup_warning, compute_subagent_diff, finish_merge,
-        parse_conflicting_files, resolve_conflict_file,
+        parse_conflicting_files, resolve_conflict_file, split_for_compaction,
     };
 
     #[test]
@@ -2932,6 +2976,89 @@ mod tests {
         .expect("paths should resolve");
 
         assert_eq!(paths.config_dir, Path::new("/home/alice/.config/gocode"));
+    }
+
+    fn user(text: &str) -> gocode_core::ChatMessage {
+        gocode_core::ChatMessage::User(text.into())
+    }
+
+    fn assistant(text: &str) -> gocode_core::ChatMessage {
+        gocode_core::ChatMessage::assistant_text(text)
+    }
+
+    fn tool_result(call_id: &str, content: &str) -> gocode_core::ChatMessage {
+        gocode_core::ChatMessage::Tool {
+            tool_call_id: call_id.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn split_for_compaction_keeps_the_last_n_user_turns_intact() {
+        let history = vec![
+            user("turn 1"),
+            assistant("reply 1"),
+            user("turn 2"),
+            assistant("reply 2"),
+            user("turn 3"),
+            assistant("reply 3"),
+        ];
+
+        let (older, recent) = split_for_compaction(&history, 2);
+
+        assert_eq!(older, vec![user("turn 1"), assistant("reply 1")]);
+        assert_eq!(
+            recent,
+            vec![
+                user("turn 2"),
+                assistant("reply 2"),
+                user("turn 3"),
+                assistant("reply 3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_for_compaction_never_cuts_a_tool_call_sequence() {
+        let history = vec![
+            user("turn 1"),
+            gocode_core::ChatMessage::Assistant {
+                text: None,
+                tool_calls: vec![gocode_core::ProviderToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            },
+            tool_result("call-1", "file contents"),
+            assistant("reply 1"),
+            user("turn 2"),
+            assistant("reply 2"),
+        ];
+
+        let (older, recent) = split_for_compaction(&history, 1);
+
+        // The split lands right before "turn 2"; the tool-call/tool-result pair from turn 1
+        // stays fully inside `older`, never straddling the boundary.
+        assert_eq!(older.len(), 4);
+        assert_eq!(recent, vec![user("turn 2"), assistant("reply 2")]);
+    }
+
+    #[test]
+    fn split_for_compaction_keeps_everything_when_there_are_too_few_turns() {
+        let history = vec![user("only turn"), assistant("only reply")];
+
+        let (older, recent) = split_for_compaction(&history, 2);
+
+        assert!(older.is_empty());
+        assert_eq!(recent, history);
+    }
+
+    #[test]
+    fn split_for_compaction_treats_an_empty_history_as_nothing_to_compact() {
+        let (older, recent) = split_for_compaction(&[], 2);
+        assert!(older.is_empty());
+        assert!(recent.is_empty());
     }
 
     fn sample_record(mode: gocode_core::SubagentMode) -> gocode_core::SubagentRecord {
