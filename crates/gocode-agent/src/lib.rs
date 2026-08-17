@@ -7,6 +7,7 @@
 //! [`gocode_tools::Tool`].
 
 mod agent;
+mod agent_spawn_tool;
 mod context;
 mod error;
 mod events;
@@ -17,14 +18,15 @@ mod subagent_manager;
 mod toolcalls;
 
 pub use agent::{Agent, AgentRequest};
+pub use agent_spawn_tool::AgentSpawnTool;
 pub use error::AgentError;
 pub use events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning};
 pub use ids::AgentRunId;
 pub use limits::{AgentLimit, AgentLimits};
 pub use state::AgentState;
 pub use subagent_manager::{
-    SpawnRequest, SubagentError, SubagentEvent, SubagentLimits, SubagentManager,
-    effective_subagent_mode, parse_result,
+    MAX_SUBAGENT_DEPTH, SpawnRequest, SubagentError, SubagentEvent, SubagentLimits,
+    SubagentManager, effective_subagent_mode, parse_result,
 };
 
 #[cfg(test)]

@@ -199,9 +199,22 @@ pub struct SubagentRecord {
     /// The final structured result, once the run reaches a terminal status.
     #[serde(default)]
     pub result: Option<SubagentResult>,
+    /// How many spawn-hops this subagent is from the top-level supervisor: `1` for a subagent
+    /// spawned directly by the main session, `2` for one spawned by an `agent_spawn` tool call
+    /// from a depth-`1` subagent. Bounded by `gocode_agent::MAX_SUBAGENT_DEPTH`.
+    #[serde(default = "default_depth")]
+    pub depth: usize,
+    /// The subagent that spawned this one via `agent_spawn`, when there is one. `None` for a
+    /// top-level subagent spawned directly by the main session.
+    #[serde(default)]
+    pub parent_subagent_id: Option<String>,
     /// Schema version this record was written with.
     #[serde(default)]
     pub schema_version: u32,
+}
+
+fn default_depth() -> usize {
+    1
 }
 
 impl SubagentRecord {
@@ -231,6 +244,8 @@ impl SubagentRecord {
             permission_mode,
             messages: Vec::new(),
             result: None,
+            depth: default_depth(),
+            parent_subagent_id: None,
             schema_version: SUBAGENT_SCHEMA_VERSION,
         }
     }

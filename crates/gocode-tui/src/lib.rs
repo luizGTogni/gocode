@@ -848,6 +848,9 @@ pub struct AppState {
     /// (a snapshot of `agents[agents_selected]`) or by `/agent status <id>`/`/agent result <id>`
     /// deep-linking straight to it; kept in sync with `agents` by id whenever the list refreshes.
     agent_detail: Option<gocode_core::SubagentRecord>,
+    /// Which of `agent_detail`'s `result.next_steps` entries `n` prefills next; cycles, and
+    /// resets to `0` each time a (possibly different) subagent's detail is opened.
+    agents_next_step_cursor: usize,
     /// Display form of the detected project root, shown by `/status`.
     working_directory: String,
     /// The active session's id, shown by `/status`.
@@ -1045,6 +1048,7 @@ impl AppState {
                 self.agents_visible = true;
                 self.agents_view = AgentsView::Detail;
                 self.agents_detail_scroll = 0;
+                self.agents_next_step_cursor = 0;
                 if let Some(record) = record {
                     self.agent_detail = Some((**record).clone());
                 } else {
@@ -2676,6 +2680,11 @@ fn render_mcp_menu(frame: &mut Frame, state: &AppState, area: Rect) {
 /// One row of the `/agents` list: cursor, id, mode, task, status, elapsed time, model, worktree.
 fn agent_row(record: &gocode_core::SubagentRecord, selected: bool) -> String {
     let cursor = if selected { ">" } else { " " };
+    let nesting = if record.parent_subagent_id.is_some() {
+        "↳ "
+    } else {
+        ""
+    };
     let id = record.id.get(..8).unwrap_or(&record.id);
     let worktree = record
         .worktree_path
@@ -2683,7 +2692,7 @@ fn agent_row(record: &gocode_core::SubagentRecord, selected: bool) -> String {
         .map(|path| format!(", worktree {}", path.display()))
         .unwrap_or_default();
     format!(
-        "{cursor} {id} [{}] {} — {} ({}s, model {}{worktree})",
+        "{cursor} {nesting}{id} [{}] {} — {} ({}s, model {}{worktree})",
         record.mode.label(),
         record.task_summary,
         record.status.label(),
@@ -2745,6 +2754,19 @@ fn render_agents_list(frame: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
+/// The `/agents` detail screen's footer hint, varying with whether there's anything to scroll
+/// and whether `result.next_steps` has anything `n` could act on.
+fn agents_detail_footer(scrollable: bool, has_next_steps: bool) -> &'static str {
+    match (scrollable, has_next_steps) {
+        (true, true) => {
+            "Up/Down to scroll · n to spawn a next step · r to refresh · Esc to go back"
+        }
+        (true, false) => "Up/Down to scroll · r to refresh · Esc to go back",
+        (false, true) => "n to spawn a next step · r to refresh · Esc to go back",
+        (false, false) => "r to refresh · Esc to go back",
+    }
+}
+
 fn render_agents_detail(frame: &mut Frame, state: &AppState, area: Rect) {
     let modal = centered(area, 88, 24);
     frame.render_widget(Clear, modal);
@@ -2780,6 +2802,14 @@ fn render_agents_detail(frame: &mut Frame, state: &AppState, area: Rect) {
                 record.elapsed_seconds()
             );
             let _ = writeln!(content, "Model: {}", record.model);
+            if let Some(parent_id) = &record.parent_subagent_id {
+                let _ = writeln!(
+                    content,
+                    "Depth: {} (spawned by {})",
+                    record.depth,
+                    parent_id.get(..8).unwrap_or(parent_id)
+                );
+            }
             if let Some(path) = &record.worktree_path {
                 let _ = writeln!(
                     content,
@@ -2831,11 +2861,10 @@ fn render_agents_detail(frame: &mut Frame, state: &AppState, area: Rect) {
         chunks[0],
     );
 
-    let footer = if max_scroll > 0 {
-        "Up/Down to scroll · r to refresh · Esc to go back"
-    } else {
-        "r to refresh · Esc to go back"
-    };
+    let has_next_steps = record
+        .and_then(|record| record.result.as_ref())
+        .is_some_and(|result| !result.next_steps.is_empty());
+    let footer = agents_detail_footer(max_scroll > 0, has_next_steps);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         chunks[1],
@@ -5533,6 +5562,7 @@ pub fn handle_agents_event(state: &mut AppState, event: &Event) -> AgentsEventOu
                     state.agent_detail = Some(record.clone());
                     state.agents_view = AgentsView::Detail;
                     state.agents_detail_scroll = 0;
+                    state.agents_next_step_cursor = 0;
                 }
                 AgentsEventOutcome::Handled
             }
@@ -5558,9 +5588,39 @@ pub fn handle_agents_event(state: &mut AppState, event: &Event) -> AgentsEventOu
                 AgentsEventOutcome::Handled
             }
             KeyCode::Char('r') => AgentsEventOutcome::Refresh,
+            KeyCode::Char('n' | 'N') => {
+                prefill_next_step_spawn(state);
+                AgentsEventOutcome::Handled
+            }
             _ => AgentsEventOutcome::Handled,
         },
     }
+}
+
+/// Turns the `n`th (cycling) suggestion in `agent_detail`'s `result.next_steps` into a ready-to-
+/// edit `/agent spawn "<step>"` in the composer, closing the popup so the user lands on it. A
+/// no-op when there is no detail open or its result has no next steps to act on.
+fn prefill_next_step_spawn(state: &mut AppState) {
+    let next_steps_len = state
+        .agent_detail
+        .as_ref()
+        .and_then(|record| record.result.as_ref())
+        .map_or(0, |result| result.next_steps.len());
+    if next_steps_len == 0 {
+        return;
+    }
+    let index = state.agents_next_step_cursor % next_steps_len;
+    state.agents_next_step_cursor += 1;
+    let Some(step) = state
+        .agent_detail
+        .as_ref()
+        .and_then(|record| record.result.as_ref())
+        .and_then(|result| result.next_steps.get(index).cloned())
+    else {
+        return;
+    };
+    state.set_chat_input(format!("/agent spawn \"{step}\""));
+    state.agents_visible = false;
 }
 
 /// Outcome of dispatching a terminal event to the `/mcp` popup.
@@ -7092,6 +7152,91 @@ mod tests {
                 .map(|record| record.task_summary.clone()),
             Some("add a doc comment".to_string())
         );
+    }
+
+    fn agent_with_next_steps(steps: &[&str]) -> gocode_core::SubagentRecord {
+        let mut record = sample_agent_records().remove(0);
+        record.status = gocode_core::SubagentStatus::Completed;
+        record.result = Some(gocode_core::SubagentResult {
+            summary: "investigated the login flow".into(),
+            next_steps: steps.iter().map(|step| (*step).to_string()).collect(),
+            ..gocode_core::SubagentResult::default()
+        });
+        record
+    }
+
+    #[test]
+    fn pressing_n_prefills_agent_spawn_with_the_first_next_step_and_closes_the_popup() {
+        let mut state = AppState {
+            agents_visible: true,
+            agents_view: AgentsView::Detail,
+            agent_detail: Some(agent_with_next_steps(&["investigate the signup flow too"])),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Char('n'))),
+            AgentsEventOutcome::Handled
+        );
+
+        assert_eq!(
+            state.chat_input,
+            "/agent spawn \"investigate the signup flow too\""
+        );
+        assert!(!state.agents_visible);
+    }
+
+    #[test]
+    fn pressing_n_repeatedly_cycles_through_every_next_step() {
+        let mut state = AppState {
+            agents_visible: true,
+            agents_view: AgentsView::Detail,
+            agent_detail: Some(agent_with_next_steps(&["step one", "step two"])),
+            ..AppState::default()
+        };
+
+        let _ = handle_agents_event(&mut state, &press(KeyCode::Char('n')));
+        assert_eq!(state.chat_input, "/agent spawn \"step one\"");
+
+        // Re-open the popup (as if the user reconsidered) and press n again.
+        state.agents_visible = true;
+        let _ = handle_agents_event(&mut state, &press(KeyCode::Char('n')));
+        assert_eq!(state.chat_input, "/agent spawn \"step two\"");
+
+        state.agents_visible = true;
+        let _ = handle_agents_event(&mut state, &press(KeyCode::Char('n')));
+        assert_eq!(state.chat_input, "/agent spawn \"step one\"");
+    }
+
+    #[test]
+    fn pressing_n_with_no_next_steps_is_a_no_op() {
+        let mut state = AppState {
+            agents_visible: true,
+            agents_view: AgentsView::Detail,
+            agent_detail: Some(agent_with_next_steps(&[])),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agents_event(&mut state, &press(KeyCode::Char('n'))),
+            AgentsEventOutcome::Handled
+        );
+        assert!(state.chat_input.is_empty());
+        assert!(state.agents_visible);
+    }
+
+    #[test]
+    fn agent_detail_available_resets_the_next_step_cursor() {
+        let mut state = AppState {
+            agents_next_step_cursor: 7,
+            ..AppState::default()
+        };
+        let record = agent_with_next_steps(&["a", "b"]);
+        state.apply(&AppEvent::AgentDetailAvailable {
+            id: record.id.clone(),
+            record: Some(Box::new(record)),
+        });
+        assert_eq!(state.agents_next_step_cursor, 0);
     }
 
     #[test]

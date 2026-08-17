@@ -3,9 +3,15 @@
 //! module owns spawning, concurrency, timeouts, cooperative stop, message delivery, and mapping
 //! a finished run onto a [`gocode_core::SubagentResult`].
 //!
-//! Subagents never spawn other subagents (no nesting in the MVP) and never run with permissions
-//! more permissive than the parent session that spawned them (`spawn` computes the effective
-//! mode itself; see [`effective_permission_mode`]).
+//! Subagents never run with permissions more permissive than the parent session that spawned
+//! them (`spawn` computes the effective mode itself; see [`effective_subagent_mode`]).
+//!
+//! Nesting is allowed but strictly bounded: a subagent at depth `1` (spawned directly by the
+//! main session) gets an `agent_spawn` tool (see [`crate::agent_spawn_tool::AgentSpawnTool`]) it
+//! can call to delegate a bounded subtask to a depth-`2` child and wait for its result. A depth-2
+//! subagent does **not** get that tool — [`MAX_SUBAGENT_DEPTH`] caps nesting at one level, so
+//! there is never an unbounded delegation chain. Every nested spawn still goes through the same
+//! `spawn()` validation (permission inheritance, worktree rules, depth check) as a top-level one.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -89,6 +95,8 @@ pub enum SubagentError {
     },
     /// The record could not be persisted.
     Persistence(String),
+    /// The requested nesting depth exceeds [`MAX_SUBAGENT_DEPTH`].
+    MaxDepthExceeded { depth: usize, max: usize },
 }
 
 impl std::fmt::Display for SubagentError {
@@ -107,11 +115,29 @@ impl std::fmt::Display for SubagentError {
                 write!(f, "cannot {action} a subagent that is {status}")
             }
             Self::Persistence(message) => write!(f, "could not persist subagent: {message}"),
+            Self::MaxDepthExceeded { depth, max } => write!(
+                f,
+                "subagent nesting depth {depth} exceeds the maximum of {max}"
+            ),
         }
     }
 }
 
 impl std::error::Error for SubagentError {}
+
+/// Maximum subagent nesting depth: `1` is a subagent spawned directly by the main session, `2`
+/// is one spawned by that subagent's own `agent_spawn` tool call. A depth-2 subagent never gets
+/// the `agent_spawn` tool, so nesting cannot go deeper than this.
+pub const MAX_SUBAGENT_DEPTH: usize = 2;
+
+/// A depth-1 subagent's `agent_spawn` call blocks holding its own concurrency slot while it
+/// waits for its child, so nesting needs at least 2 slots to make progress — with only 1, the
+/// parent would permanently hold the only slot its own child needs. Rather than silently
+/// deadlocking (bounded only by `per_task_timeout`) or forcing a floor that would change the
+/// behavior of an explicit `max_concurrent: 1` configuration, the `agent_spawn` tool is simply
+/// never registered when `SubagentLimits::max_concurrent` is below this — a subagent then has no
+/// way to attempt a nested spawn in the first place.
+const MIN_CONCURRENCY_FOR_NESTING: usize = 2;
 
 /// Everything needed to spawn one subagent.
 pub struct SpawnRequest {
@@ -130,8 +156,9 @@ pub struct SpawnRequest {
     pub parent_permission_mode: PermissionMode,
     /// Provider used to drive the subagent's own [`Agent`].
     pub provider: Arc<dyn Provider>,
-    /// Tool registry the subagent's [`Agent`] executes against. Never includes a tool capable of
-    /// spawning further subagents (no nesting in the MVP).
+    /// Tool registry the subagent's [`Agent`] executes against. `spawn` adds an `agent_spawn`
+    /// tool on top of this when `depth < MAX_SUBAGENT_DEPTH`; this registry itself should never
+    /// already contain one (each spawn — top-level or nested — starts from the same plain base).
     pub tools: Arc<ToolRegistry>,
     /// Repository root the main session is working in.
     pub project_root: PathBuf,
@@ -139,10 +166,22 @@ pub struct SpawnRequest {
     pub worktree_runner: Arc<dyn ProcessRunner>,
     /// Parsed `AGENTS.md` / project instructions, forwarded to the subagent as-is.
     pub instructions: Option<String>,
+    /// Nesting depth this subagent will run at: `1` for a top-level spawn from the main session,
+    /// `2` for one spawned by a depth-1 subagent's `agent_spawn` call. Rejected above
+    /// [`MAX_SUBAGENT_DEPTH`].
+    pub depth: usize,
+    /// The subagent that spawned this one via `agent_spawn`, when this is a nested spawn.
+    pub parent_subagent_id: Option<String>,
 }
 
 /// Supervisor-side execution engine: owns every subagent's record, concurrency slot, and
 /// cancellation handle.
+///
+/// Cheaply [`Clone`]: every field is already `Arc`/`Mutex`-wrapped or `Copy`, so a clone is a
+/// shared handle onto the same state, not an independent manager. `spawn` uses this to hand a
+/// depth-1 subagent's `agent_spawn` tool a handle back onto itself, so a nested spawn goes
+/// through the exact same validation and concurrency pool as a top-level one.
+#[derive(Clone)]
 pub struct SubagentManager {
     dir: PathBuf,
     records: Arc<Mutex<HashMap<String, SubagentRecord>>>,
@@ -185,6 +224,12 @@ impl SubagentManager {
     /// worktree outside implement mode, targets an already-claimed worktree, or worktree creation
     /// fails.
     pub async fn spawn(&self, request: SpawnRequest) -> Result<String, SubagentError> {
+        if request.depth > MAX_SUBAGENT_DEPTH {
+            return Err(SubagentError::MaxDepthExceeded {
+                depth: request.depth,
+                max: MAX_SUBAGENT_DEPTH,
+            });
+        }
         if request.worktree_requested && request.mode != SubagentMode::Implement {
             return Err(SubagentError::WorktreeRequiresImplementMode);
         }
@@ -205,6 +250,10 @@ impl SubagentManager {
             read_only,
             request.parent_permission_mode,
         );
+        record.depth = request.depth;
+        record
+            .parent_subagent_id
+            .clone_from(&request.parent_subagent_id);
 
         if effective_mode.allows_writes() {
             let name = format!("subagent-{}", short_id(&record.id));
@@ -258,6 +307,8 @@ impl SubagentManager {
             event_tx: self.event_tx.clone(),
             project_root: request.project_root,
             instructions: request.instructions,
+            manager: Arc::new(self.clone()),
+            worktree_runner: request.worktree_runner,
         };
         tokio::spawn(worker.run(record, request.provider, request.tools, cancellation));
 
@@ -416,6 +467,11 @@ struct SubagentWorker {
     event_tx: mpsc::Sender<SubagentEvent>,
     project_root: PathBuf,
     instructions: Option<String>,
+    /// Handle back onto the owning manager, given to a depth-eligible subagent's `agent_spawn`
+    /// tool so a nested spawn goes through the exact same validation and concurrency pool.
+    manager: Arc<SubagentManager>,
+    /// Forwarded to a nested spawn's `agent_spawn` tool for its own worktree creation.
+    worktree_runner: Arc<dyn ProcessRunner>,
 }
 
 impl SubagentWorker {
@@ -440,6 +496,7 @@ impl SubagentWorker {
 
         let policy = Self::policy_for(record.mode, record.worktree_path.as_ref());
         let permissions = PermissionContext::new(policy, Arc::new(AlwaysDenyResolver));
+        let tools = self.tools_for(&record, &provider, &tools);
         let agent = Agent::new(
             provider,
             tools,
@@ -480,6 +537,38 @@ impl SubagentWorker {
         } else {
             Arc::new(DefaultPermissionPolicy::read_only())
         }
+    }
+
+    /// Adds the `agent_spawn` tool on top of `base` when `record` is allowed to nest a child:
+    /// below [`MAX_SUBAGENT_DEPTH`] and the concurrency pool has room for a blocked parent plus
+    /// at least one child (see [`MIN_CONCURRENCY_FOR_NESTING`]). Otherwise returns `base`
+    /// unchanged, so the model never even sees a capability it cannot use.
+    fn tools_for(
+        &self,
+        record: &SubagentRecord,
+        provider: &Arc<dyn Provider>,
+        base: &Arc<ToolRegistry>,
+    ) -> Arc<ToolRegistry> {
+        if record.depth >= MAX_SUBAGENT_DEPTH
+            || self.limits.max_concurrent < MIN_CONCURRENCY_FOR_NESTING
+        {
+            return base.clone();
+        }
+        let mut extended = (**base).clone();
+        extended.register(Arc::new(crate::agent_spawn_tool::AgentSpawnTool {
+            manager: self.manager.clone(),
+            parent_session_id: record.parent_session_id.clone(),
+            parent_subagent_id: record.id.clone(),
+            depth: record.depth,
+            model: record.model.clone(),
+            provider: provider.clone(),
+            tools: base.clone(),
+            project_root: self.project_root.clone(),
+            parent_permission_mode: record.permission_mode,
+            worktree_runner: self.worktree_runner.clone(),
+            instructions: self.instructions.clone(),
+        }));
+        Arc::new(extended)
     }
 
     /// Drives the subagent's work as a sequence of bounded [`Agent::run`] calls: the first call's
@@ -701,12 +790,12 @@ fn progress_line(event: &crate::AgentEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SpawnRequest, SubagentEvent, SubagentLimits, SubagentManager, effective_subagent_mode,
-        parse_result,
+        MAX_SUBAGENT_DEPTH, SpawnRequest, SubagentEvent, SubagentLimits, SubagentManager,
+        effective_subagent_mode, parse_result,
     };
     use gocode_core::{
         CancellationToken, ChatStreamEvent, FinishReason, ModelId, PermissionMode, ProviderError,
-        ProviderFuture, SubagentMode, SubagentStatus, testing::FakeProvider,
+        ProviderFuture, SubagentMode, SubagentStatus, ToolCallDelta, testing::FakeProvider,
     };
     use gocode_tools::{builtin_registry, process::TokioProcessRunner};
     use std::{
@@ -780,6 +869,22 @@ mod tests {
         ]
     }
 
+    fn tool_call_turn(
+        id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Vec<Result<ChatStreamEvent, ProviderError>> {
+        vec![
+            Ok(ChatStreamEvent::ToolCallDelta(ToolCallDelta {
+                index: 0,
+                id: Some(id.into()),
+                name_delta: Some(name.into()),
+                arguments_delta: Some(arguments.to_string()),
+            })),
+            Ok(ChatStreamEvent::Finished(FinishReason::ToolCalls)),
+        ]
+    }
+
     fn base_request(
         dir: &Path,
         task: &str,
@@ -798,6 +903,8 @@ mod tests {
             project_root: dir.to_path_buf(),
             worktree_runner: Arc::new(TokioProcessRunner),
             instructions: None,
+            depth: 1,
+            parent_subagent_id: None,
         }
     }
 
@@ -1023,6 +1130,193 @@ mod tests {
         let error = manager.spawn(request).await.unwrap_err();
         assert_eq!(error, super::SubagentError::ImplementDeniedInPlanMode);
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_depth_one_subagent_can_spawn_and_wait_for_a_child_via_agent_spawn() {
+        let dir = fixture("nested-spawn");
+        let (tx, _rx) = mpsc::channel(64);
+        let manager = SubagentManager::new(dir.clone(), SubagentLimits::default(), tx);
+
+        // The parent and child share one FakeProvider instance (as they would share one real
+        // provider in production); this is deterministic because the parent's agent_spawn tool
+        // call fully blocks on the child's own run before the parent's next turn happens, so the
+        // three scripted turns are consumed in this exact order: parent's tool call, the child's
+        // only turn, then the parent's final turn.
+        let provider: Arc<dyn gocode_core::Provider> = Arc::new(FakeProvider::script(vec![
+            tool_call_turn(
+                "call1",
+                "agent_spawn",
+                &serde_json::json!({"task": "investigate the login flow", "mode": "research"}),
+            ),
+            text_turn("child investigated the login flow"),
+            text_turn(
+                "Delegated it out. ```json\n{\"summary\": \"delegated investigation \
+                 complete\"}\n```",
+            ),
+        ]));
+
+        let id = manager
+            .spawn(base_request(
+                &dir,
+                "coordinate an investigation",
+                SubagentMode::Research,
+                provider,
+            ))
+            .await
+            .unwrap();
+
+        let record = wait_for_terminal(&manager, &id).await;
+        assert_eq!(record.status, SubagentStatus::Completed);
+        assert_eq!(
+            record.result.expect("result should be set").summary,
+            "delegated investigation complete"
+        );
+
+        let child = manager
+            .list()
+            .await
+            .into_iter()
+            .find(|candidate| candidate.parent_subagent_id.as_deref() == Some(id.as_str()))
+            .expect("the child subagent should be recorded");
+        assert_eq!(child.depth, 2);
+        assert_eq!(child.task_summary, "investigate the login flow");
+        assert_eq!(child.status, SubagentStatus::Completed);
+        assert_eq!(
+            child.result.expect("child result should be set").summary,
+            "child investigated the login flow"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_depth_two_subagent_has_no_agent_spawn_tool_and_cannot_nest_further() {
+        let dir = fixture("nesting-cap");
+        let (tx, _rx) = mpsc::channel(64);
+        let manager = SubagentManager::new(dir.clone(), SubagentLimits::default(), tx);
+        let mut request = base_request(
+            &dir,
+            "already a child",
+            SubagentMode::Research,
+            Arc::new(FakeProvider::script(vec![text_turn(
+                "done, no tools offered",
+            )])),
+        );
+        request.depth = MAX_SUBAGENT_DEPTH;
+
+        let id = manager.spawn(request).await.unwrap();
+        let record = wait_for_terminal(&manager, &id).await;
+        assert_eq!(record.status, SubagentStatus::Completed);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn spawning_beyond_the_max_depth_is_rejected() {
+        let dir = fixture("nesting-rejected");
+        let (tx, _rx) = mpsc::channel(64);
+        let manager = SubagentManager::new(dir.clone(), SubagentLimits::default(), tx);
+        let mut request = base_request(
+            &dir,
+            "too deep",
+            SubagentMode::Research,
+            Arc::new(FakeProvider::script(vec![])),
+        );
+        request.depth = MAX_SUBAGENT_DEPTH + 1;
+
+        let error = manager.spawn(request).await.unwrap_err();
+        assert_eq!(
+            error,
+            super::SubagentError::MaxDepthExceeded {
+                depth: MAX_SUBAGENT_DEPTH + 1,
+                max: MAX_SUBAGENT_DEPTH,
+            }
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Builds a minimal [`super::SubagentWorker`] for directly unit-testing `tools_for`, without
+    /// going through a full spawn.
+    fn test_worker(dir: &Path, limits: SubagentLimits) -> super::SubagentWorker {
+        let (event_tx, _rx) = mpsc::channel(64);
+        let manager = Arc::new(SubagentManager::new(
+            dir.to_path_buf(),
+            limits,
+            event_tx.clone(),
+        ));
+        super::SubagentWorker {
+            dir: dir.to_path_buf(),
+            records: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            concurrency: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent.max(1))),
+            limits,
+            event_tx,
+            project_root: dir.to_path_buf(),
+            instructions: None,
+            manager,
+            worktree_runner: Arc::new(TokioProcessRunner),
+        }
+    }
+
+    fn test_record(mode: SubagentMode, depth: usize) -> gocode_core::SubagentRecord {
+        let mut record = gocode_core::SubagentRecord::new(
+            "session-1".into(),
+            "task".into(),
+            mode,
+            "test-model".into(),
+            !mode.allows_writes(),
+            PermissionMode::Auto,
+        );
+        record.depth = depth;
+        record
+    }
+
+    #[test]
+    fn agent_spawn_tool_is_registered_for_a_depth_one_subagent_with_room_to_nest() {
+        let dir = fixture("tools-for-eligible");
+        let worker = test_worker(&dir, SubagentLimits::default());
+        let record = test_record(SubagentMode::Research, 1);
+        let base = Arc::new(builtin_registry());
+        let provider: Arc<dyn gocode_core::Provider> = Arc::new(FakeProvider::script(vec![]));
+
+        let tools = worker.tools_for(&record, &provider, &base);
+
+        assert!(tools.contains(&gocode_tools::ToolName::new("agent_spawn")));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_spawn_tool_is_absent_at_the_max_depth() {
+        let dir = fixture("tools-for-max-depth");
+        let worker = test_worker(&dir, SubagentLimits::default());
+        let record = test_record(SubagentMode::Research, MAX_SUBAGENT_DEPTH);
+        let base = Arc::new(builtin_registry());
+        let provider: Arc<dyn gocode_core::Provider> = Arc::new(FakeProvider::script(vec![]));
+
+        let tools = worker.tools_for(&record, &provider, &base);
+
+        assert!(!tools.contains(&gocode_tools::ToolName::new("agent_spawn")));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_spawn_tool_is_absent_when_the_concurrency_pool_is_too_small_for_it() {
+        let dir = fixture("tools-for-min-concurrency");
+        let limits = SubagentLimits {
+            max_concurrent: 1,
+            ..SubagentLimits::default()
+        };
+        let worker = test_worker(&dir, limits);
+        let record = test_record(SubagentMode::Research, 1);
+        let base = Arc::new(builtin_registry());
+        let provider: Arc<dyn gocode_core::Provider> = Arc::new(FakeProvider::script(vec![]));
+
+        let tools = worker.tools_for(&record, &provider, &base);
+
+        assert!(!tools.contains(&gocode_tools::ToolName::new("agent_spawn")));
         fs::remove_dir_all(&dir).ok();
     }
 

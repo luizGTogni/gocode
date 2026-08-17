@@ -73,6 +73,7 @@ async fn bridge_subagent_events(
     mut events: mpsc::Receiver<SubagentEvent>,
     event_tx: mpsc::Sender<gocode_core::AppEvent>,
 ) {
+    use std::fmt::Write as _;
     while let Some(event) = events.recv().await {
         let notice = match event {
             SubagentEvent::Spawned(record) => Some(format!(
@@ -96,16 +97,31 @@ async fn bridge_subagent_events(
                     .await;
                 None
             }
-            SubagentEvent::Finished(record) => Some(format!(
-                "Subagent {} finished: {}.{}",
-                short_id(&record.id),
-                record.status.label(),
-                record
+            SubagentEvent::Finished(record) => {
+                let mut notice = format!(
+                    "Subagent {} finished: {}.{}",
+                    short_id(&record.id),
+                    record.status.label(),
+                    record
+                        .result
+                        .as_ref()
+                        .map(|result| format!(" {}", result.summary))
+                        .unwrap_or_default(),
+                );
+                if let Some(next_steps) = record
                     .result
                     .as_ref()
-                    .map(|result| format!(" {}", result.summary))
-                    .unwrap_or_default(),
-            )),
+                    .map(|result| result.next_steps.len())
+                    .filter(|count| *count > 0)
+                {
+                    let _ = write!(
+                        notice,
+                        " Suggests {next_steps} next step(s) — open /agents to review and spawn \
+                         any of them."
+                    );
+                }
+                Some(notice)
+            }
         };
         if let Some(notice) = notice {
             let _ = event_tx
@@ -2289,6 +2305,8 @@ async fn run_application() -> Result<(), AppError> {
                         project_root: project_root.clone(),
                         worktree_runner: Arc::new(TokioProcessRunner),
                         instructions: instructions.clone(),
+                        depth: 1,
+                        parent_subagent_id: None,
                     };
                     if let Err(error) = subagent_manager.spawn(request).await {
                         let _ = driver

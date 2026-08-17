@@ -27,9 +27,45 @@ Supervisor + isolated workers, entirely in-process:
 - **Subagent** — a short-lived `gocode_agent::Agent` instance driven by `SubagentManager`, given a
   minimal, explicit context (not the supervisor's full conversation), that runs to completion (or
   timeout/stop) and returns a structured result.
-- **No nesting in the MVP.** Spawning a subagent is a supervisor-side operation triggered by a
-  slash command; it is never exposed as an LLM-callable tool, so a subagent's own tool registry has
-  no way to spawn another subagent.
+- **Nesting is allowed, but capped at one level.** Spawning is normally a supervisor-side
+  operation triggered by a slash command; additionally, a depth-1 subagent (one the supervisor
+  spawned directly) is given an `agent_spawn` tool it can call to delegate a bounded subtask to a
+  depth-2 child and block until that child finishes. A depth-2 subagent never receives that tool,
+  so there is no unbounded delegation chain — see §2.1.
+
+## 2.1. Nesting
+
+`MAX_SUBAGENT_DEPTH = 2` (`crates/gocode-agent/src/subagent_manager.rs`): depth `1` is a subagent
+the supervisor spawned directly; depth `2` is one spawned by a depth-1 subagent's own
+`agent_spawn` tool call. `SubagentManager::spawn` rejects any request above this
+(`SubagentError::MaxDepthExceeded`), and a depth-2 subagent's own tool registry simply never gets
+`agent_spawn` added to it (`SubagentWorker::tools_for`), so the limit isn't just a runtime check —
+the model at max depth cannot even see the capability to try.
+
+`agent_spawn` (`crates/gocode-agent/src/agent_spawn_tool.rs`, `AgentSpawnTool`) takes
+`{task, mode, worktree?}` — the same shape as `/agent spawn`'s arguments — and **blocks** until the
+child reaches a terminal status, returning its result summary as the tool's output. This is
+deliberate: a tool call needs a result the model can act on, so `agent_spawn` is "delegate and
+wait," not "fire and forget." The child's model, provider, project root, and worktree runner are
+all inherited from the parent (not chosen by the model), and its permission mode is clamped to the
+parent's own effective mode — so nesting cannot escalate permissions, matching the invariant every
+top-level spawn already respects (§8).
+
+Nested subagents draw from the **same** `SubagentManager` and the same concurrency pool as
+top-level ones (`SubagentManager: Clone` — cloning shares the same `Arc`/`Mutex`-wrapped state,
+so a clone is a handle, not an independent manager; `spawn` hands `Arc::new(self.clone())` to the
+worker for exactly this purpose). Because a blocked parent still holds its own concurrency slot
+while waiting on its child, nesting needs at least 2 slots to make progress — with `max_concurrent
+= 1`, a parent holding the only slot would permanently block its own child from ever acquiring
+one. Rather than silently deadlocking (bounded only by `per_task_timeout`) or quietly raising an
+explicit `max_concurrent: 1` to 2, `agent_spawn` is simply not registered when the configured pool
+is smaller than `MIN_CONCURRENCY_FOR_NESTING = 2` — a subagent then has no way to attempt a nested
+spawn at all, and `/agent spawn`'s own top-level behavior with `max_concurrent: 1` is completely
+unaffected (still genuinely serial, as configured).
+
+The child's `SubagentRecord` carries `depth` and `parent_subagent_id` (both persisted,
+schema-tolerant via `#[serde(default)]`), so `/agents` can show lineage and a restart can still
+tell a nested subagent apart from a top-level one.
 
 # 3. Crates involved
 
@@ -190,6 +226,18 @@ prefix nobody has browsed to yet — but stays in sync with it: every `AgentList
 re-matches by id and updates `agent_detail` if that subagent is still present, so pressing `r`
 from either list or detail keeps both views current.
 
+**Acting on `next_steps`.** A finished subagent's `SubagentResult::next_steps` are suggestions,
+not automatic follow-up work — the supervisor (the user) always decides whether to act on them.
+Two places surface that decision point instead of leaving the suggestions buried in a result blob:
+the completion notice from `bridge_subagent_events` (`crates/gocode/src/main.rs`) appends "Suggests
+N next step(s) — open /agents to review and spawn any of them." when `next_steps` is non-empty; and
+inside the `/agents` detail view, pressing `n` prefills the composer with
+`/agent spawn "<next step>"` for the current suggestion and closes the popup, ready for the user to
+edit and submit (or discard). Repeated `n` presses cycle through every suggestion in order
+(`AppState::agents_next_step_cursor`, reset to `0` each time a — possibly different — subagent's
+detail is opened, so it never carries over between subagents). Nothing is ever spawned without the
+user pressing Enter on the prefilled command themselves.
+
 # 11. Known MVP limitations and recommended next increments
 
 1. **Mid-run messaging is still not mid-turn.** `Agent::run` is one bounded prompt-to-completion
@@ -213,8 +261,19 @@ from either list or detail keeps both views current.
    and stay as chat-log `Info`/`Warning` acknowledgements, consistent with how `/debug` already
    works — arguably the right call for a transient action rather than something to "view", but
    worth revisiting if usage shows otherwise.
-4. **No nested subagents**, by construction (see §2) — not a limitation to lift casually, since the
-   spec explicitly requires it stay out of the MVP.
+4. **Nesting is capped at exactly one level, not configurable.** `MAX_SUBAGENT_DEPTH = 2` is a
+   `const`, not a `SubagentLimits` field — deepening or disabling it means editing
+   `subagent_manager.rs`, not a runtime setting. This was a deliberate choice to keep the first
+   nesting increment small and easy to reason about; a configurable depth is a plausible follow-up
+   once real usage shows whether one level is actually enough.
+5. **`agent_spawn` has no per-parent fan-out limit.** A depth-1 subagent can call it repeatedly in
+   sequence (each call blocks until that child finishes, so calls can't overlap from one parent),
+   bounded only by the subagent's own `max_total_tool_calls` budget — there's no dedicated "at most
+   N children" cap independent of that.
+6. **Lineage is a marker, not a tree.** The `/agents` list prefixes a nested subagent's row with
+   "↳" and its detail view shows "Depth: N (spawned by &lt;id&gt;)", but there's no indentation, no
+   grouping of a parent with its children, and no way to jump from a child's detail straight to
+   its parent's.
 
 # 12. Example session
 
@@ -250,7 +309,10 @@ Removed subagent e5f6a7b8.
 - `crates/gocode-agent/src/subagent_manager.rs` — read-only lifecycle, two subagents running
   concurrently, concurrency-cap queueing, timeout, stop-preserves-partial-result, Plan-mode
   permission denial, structured-result parsing (with and without a valid block), a subagent that
-  asks `NEEDS_INPUT:` pausing at `WaitingInput` and resuming once `/agent message` answers it.
+  asks `NEEDS_INPUT:` pausing at `WaitingInput` and resuming once `/agent message` answers it, and
+  nesting (a depth-1 subagent spawning and blocking on a depth-2 child via `agent_spawn` end to
+  end, `agent_spawn` present/absent from `tools_for` by depth and by concurrency-pool size,
+  spawning beyond `MAX_SUBAGENT_DEPTH` rejected).
 - `crates/gocode-tui/src/lib.rs` — `/agent`/`/agents` parsing (spawn flags in any order, apply
   confirm/no-confirm, message text joining, worktree-outside-implement-mode rejection), the
   apply/cleanup confirm modal (opens on `AgentDiffReady`/`AgentCleanupWarning`, resolves on y/n,
@@ -264,7 +326,10 @@ Removed subagent e5f6a7b8.
   pending), and the `/agent status`/`result` deep link (`AgentDetailAvailable` opens the popup
   straight to detail with the matched record, a `None` match warns without opening it, entering
   detail from the list snapshots the selected record, and an `AgentListAvailable` refresh keeps an
-  already-open detail in sync by id).
+  already-open detail in sync by id), and the `next_steps` prefill (`n` fills the composer with
+  the current suggestion and closes the popup, repeated presses cycle through every suggestion in
+  order, a result with no `next_steps` makes `n` a no-op, and opening a detail — including via the
+  deep link — resets the cursor).
 - `crates/gocode/src/main.rs` — diff computation; a clean merge applying immediately; a
   conflicting merge left in progress (not aborted) reporting a structured conflicting-files list;
   resolving every file and finishing completes the merge keeping the chosen side, verified against
