@@ -258,6 +258,12 @@ pub fn build_chat_body(request: &ChatRequest) -> serde_json::Value {
                 })
                 .collect(),
         );
+        // Some OpenAI-compatible backends (NIM's vLLM-hosted models in particular) only engage
+        // their structured tool-call decoder when `tool_choice` is explicit; without it, a model
+        // that sees `tools` in the prompt may still attempt a call using its own chat-template
+        // syntax, which the server then passes through as plain assistant text instead of
+        // parsing it into `tool_calls`.
+        body["tool_choice"] = serde_json::Value::String("auto".into());
     }
 
     if let Some(effort) = &request.reasoning_effort {
@@ -559,6 +565,7 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Olá");
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]
@@ -585,6 +592,7 @@ mod tests {
         let body = super::build_chat_body(&request);
 
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(body["tool_choice"], "auto");
         assert_eq!(
             body["messages"][1]["tool_calls"][0]["function"]["name"],
             "read_file"
