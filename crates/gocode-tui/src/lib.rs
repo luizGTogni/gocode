@@ -370,6 +370,12 @@ pub enum SlashCommand {
     Redo(String),
     /// Start, resume, inspect, stop, or summarize a guided bug investigation.
     Debug(String),
+    /// Spawn, message, stop, or apply a subagent. The `String` is the raw text typed after
+    /// `/agent` (e.g. `spawn investigate flaky login test --mode research`, `status a1b2c3d4`,
+    /// `message a1b2c3d4 focus on the retry path`, `apply a1b2c3d4`, `apply a1b2c3d4 confirm`).
+    Agent(String),
+    /// List active and recent subagents.
+    Agents,
     /// Exit Gocode.
     Exit,
 }
@@ -558,6 +564,17 @@ const SLASH_COMMANDS: &[(&str, &str, SlashCommand)] = &[
         "/debug",
         "Investigate a bug safely (`status`, `stop`, or `summary`)",
         SlashCommand::Debug(String::new()),
+    ),
+    (
+        "/agent",
+        "Spawn, message, stop, or apply a subagent (`spawn`, `status`, `message`, `stop`, \
+         `result`, `apply`, `cleanup`)",
+        SlashCommand::Agent(String::new()),
+    ),
+    (
+        "/agents",
+        "List active and recent subagents",
+        SlashCommand::Agents,
     ),
     ("/exit", "Exit Gocode", SlashCommand::Exit),
     ("/quit", "Exit Gocode", SlashCommand::Exit),
@@ -919,8 +936,17 @@ impl AppState {
             } => self.apply_tool_activity(id, name, *status, detail),
             AppEvent::ToolOutputChunk { id, chunk } => self.append_tool_output(id, chunk),
             AppEvent::FileChanged { path, .. } => self.file_change_buffer.push(path.clone()),
-            AppEvent::AgentWarning(message) => {
+            AppEvent::AgentWarning(message) | AppEvent::AgentCleanupWarning { message, .. } => {
                 self.entries.push(ChatEntry::Warning(message.clone()));
+            }
+            AppEvent::AgentNotice(message) => {
+                self.entries.push(ChatEntry::Info(message.clone()));
+            }
+            AppEvent::AgentProgress { line, .. } => {
+                self.entries.push(ChatEntry::Info(line.clone()));
+            }
+            AppEvent::AgentDiffReady { diff, .. } => {
+                self.entries.push(ChatEntry::Info(diff.clone()));
             }
             AppEvent::PermissionRequested {
                 summary,
@@ -1808,6 +1834,158 @@ fn parse_worktree_command(raw: &str, state: &AppState) -> WorktreeInvocation {
                 branch,
             }
         }
+    }
+}
+
+/// One parsed `/agent <subcommand> ...` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentInvocation {
+    Spawn {
+        task: String,
+        mode: gocode_core::SubagentMode,
+        model: Option<String>,
+        worktree: bool,
+    },
+    Status(String),
+    Message {
+        id: String,
+        text: String,
+    },
+    Stop(String),
+    Result(String),
+    /// `apply <id>`: request the diff. `apply <id> confirm`: merge it in.
+    Apply {
+        id: String,
+        confirm: bool,
+    },
+    /// `cleanup <id>`: request the warning. `cleanup <id> confirm`: remove it.
+    Cleanup {
+        id: String,
+        confirm: bool,
+    },
+    /// Malformed subcommand usage, reported inline without contacting the runtime.
+    Invalid(String),
+}
+
+/// Parses the raw text typed after `/agent` into a concrete action.
+fn parse_agent_command(raw: &str) -> AgentInvocation {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return AgentInvocation::Invalid(
+            "Usage: /agent spawn|status|message|stop|result|apply|cleanup ...".into(),
+        );
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let subcommand = tokens.next().unwrap_or_default();
+    let rest: Vec<&str> = tokens.collect();
+
+    match subcommand {
+        "spawn" => parse_agent_spawn(&rest),
+        "status" => id_argument(&rest, "status").map_or_else(
+            || AgentInvocation::Invalid("Usage: /agent status <id>".into()),
+            AgentInvocation::Status,
+        ),
+        "stop" => id_argument(&rest, "stop").map_or_else(
+            || AgentInvocation::Invalid("Usage: /agent stop <id>".into()),
+            AgentInvocation::Stop,
+        ),
+        "result" => id_argument(&rest, "result").map_or_else(
+            || AgentInvocation::Invalid("Usage: /agent result <id>".into()),
+            AgentInvocation::Result,
+        ),
+        "message" => {
+            let Some((&id, text_tokens)) = rest.split_first() else {
+                return AgentInvocation::Invalid("Usage: /agent message <id> <text>".into());
+            };
+            let text = text_tokens.join(" ");
+            if text.is_empty() {
+                return AgentInvocation::Invalid("Usage: /agent message <id> <text>".into());
+            }
+            AgentInvocation::Message {
+                id: id.to_string(),
+                text,
+            }
+        }
+        "apply" => match rest.as_slice() {
+            [id] => AgentInvocation::Apply {
+                id: (*id).to_string(),
+                confirm: false,
+            },
+            [id, "confirm"] => AgentInvocation::Apply {
+                id: (*id).to_string(),
+                confirm: true,
+            },
+            _ => AgentInvocation::Invalid("Usage: /agent apply <id> [confirm]".into()),
+        },
+        "cleanup" => match rest.as_slice() {
+            [id] => AgentInvocation::Cleanup {
+                id: (*id).to_string(),
+                confirm: false,
+            },
+            [id, "confirm"] => AgentInvocation::Cleanup {
+                id: (*id).to_string(),
+                confirm: true,
+            },
+            _ => AgentInvocation::Invalid("Usage: /agent cleanup <id> [confirm]".into()),
+        },
+        other => AgentInvocation::Invalid(format!(
+            "Unknown /agent subcommand '{other}'. Use spawn, status, message, stop, result, \
+             apply, or cleanup."
+        )),
+    }
+}
+
+fn id_argument(rest: &[&str], _subcommand: &str) -> Option<String> {
+    match rest {
+        [id] => Some((*id).to_string()),
+        _ => None,
+    }
+}
+
+/// Parses `/agent spawn <task...> [--mode research|plan|implement|review] [--model <id>]
+/// [--worktree]`. Flags may appear anywhere after `spawn`; everything else is joined back into
+/// the task description in its original order.
+fn parse_agent_spawn(rest: &[&str]) -> AgentInvocation {
+    let mut mode = gocode_core::SubagentMode::Research;
+    let mut model = None;
+    let mut worktree = false;
+    let mut task_words = Vec::new();
+
+    let mut tokens = rest.iter().copied();
+    while let Some(token) = tokens.next() {
+        match token {
+            "--mode" => match tokens.next().and_then(gocode_core::SubagentMode::parse) {
+                Some(parsed) => mode = parsed,
+                None => {
+                    return AgentInvocation::Invalid(
+                        "Usage: --mode research|plan|implement|review".into(),
+                    );
+                }
+            },
+            "--model" => match tokens.next() {
+                Some(value) => model = Some(value.to_string()),
+                None => return AgentInvocation::Invalid("Usage: --model <id>".into()),
+            },
+            "--worktree" => worktree = true,
+            "--read-only" => {}
+            word => task_words.push(word),
+        }
+    }
+
+    let task = task_words.join(" ");
+    if task.is_empty() {
+        return AgentInvocation::Invalid(
+            "Usage: /agent spawn <task> [--mode M] [--model X] [--worktree]".into(),
+        );
+    }
+    if worktree && mode != gocode_core::SubagentMode::Implement {
+        return AgentInvocation::Invalid("--worktree is only valid with --mode implement.".into());
+    }
+    AgentInvocation::Spawn {
+        task,
+        mode,
+        model,
+        worktree,
     }
 }
 
@@ -3764,6 +3942,54 @@ fn run_terminal(
                         )?,
                     }
                 }
+                ChatSubmission::Command(SlashCommand::Agent(raw)) => {
+                    match parse_agent_command(&raw) {
+                        AgentInvocation::Spawn {
+                            task,
+                            mode,
+                            model,
+                            worktree,
+                        } => send_command(
+                            &command_tx,
+                            AppCommand::AgentSpawn {
+                                task,
+                                mode,
+                                model,
+                                worktree,
+                            },
+                        )?,
+                        AgentInvocation::Status(id) => {
+                            send_command(&command_tx, AppCommand::AgentStatus(id))?;
+                        }
+                        AgentInvocation::Message { id, text } => {
+                            send_command(&command_tx, AppCommand::AgentMessage { id, text })?;
+                        }
+                        AgentInvocation::Stop(id) => {
+                            send_command(&command_tx, AppCommand::AgentStop(id))?;
+                        }
+                        AgentInvocation::Result(id) => {
+                            send_command(&command_tx, AppCommand::AgentResult(id))?;
+                        }
+                        AgentInvocation::Apply { id, confirm: false } => {
+                            send_command(&command_tx, AppCommand::AgentApplyRequest(id))?;
+                        }
+                        AgentInvocation::Apply { id, confirm: true } => {
+                            send_command(&command_tx, AppCommand::AgentApplyConfirm(id))?;
+                        }
+                        AgentInvocation::Cleanup { id, confirm: false } => {
+                            send_command(&command_tx, AppCommand::AgentCleanupRequest(id))?;
+                        }
+                        AgentInvocation::Cleanup { id, confirm: true } => {
+                            send_command(&command_tx, AppCommand::AgentCleanupConfirm(id))?;
+                        }
+                        AgentInvocation::Invalid(message) => {
+                            state.entries.push(ChatEntry::Error(message));
+                        }
+                    }
+                }
+                ChatSubmission::Command(SlashCommand::Agents) => {
+                    send_command(&command_tx, AppCommand::AgentList)?;
+                }
                 ChatSubmission::DebugAnswer(answer) => {
                     send_command(&command_tx, AppCommand::DebugAnswer(answer))?;
                 }
@@ -5128,6 +5354,11 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
                     state.clear_chat_input();
                     return Some(ChatSubmission::Command(SlashCommand::Debug(argument)));
                 }
+                if name == "/agent" {
+                    let argument = arguments.trim().to_string();
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Command(SlashCommand::Agent(argument)));
+                }
                 if name == "/keymap" {
                     let arguments = arguments.trim().to_string();
                     state.clear_chat_input();
@@ -5228,12 +5459,13 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
-        AppState, ChatEntry, ChatSubmission, HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS,
-        McpAddStep, McpEventOutcome, McpView, Screen, SkillsEventOutcome, SkillsView, SlashCommand,
-        UpdateEventOutcome, UpdateStage, WorktreeInvocation, classify_event, handle_chat_event,
-        handle_effort_picker_event, handle_help_event, handle_mcp_event, handle_model_picker_event,
-        handle_onboarding_event, handle_permission_event, handle_session_picker_event,
-        handle_skills_event, handle_update_event, handle_worktree_removal_event,
+        AgentInvocation, AppState, ChatEntry, ChatSubmission, HelpTab, InputAction,
+        MAX_VISIBLE_SUGGESTIONS, McpAddStep, McpEventOutcome, McpView, Screen, SkillsEventOutcome,
+        SkillsView, SlashCommand, UpdateEventOutcome, UpdateStage, WorktreeInvocation,
+        classify_event, handle_chat_event, handle_effort_picker_event, handle_help_event,
+        handle_mcp_event, handle_model_picker_event, handle_onboarding_event,
+        handle_permission_event, handle_session_picker_event, handle_skills_event,
+        handle_update_event, handle_worktree_removal_event, parse_agent_command,
         parse_worktree_command, render, run_with_event_source, slash_suggestions,
     };
 
@@ -5959,6 +6191,95 @@ mod tests {
             Some(ChatSubmission::Command(SlashCommand::Worktree(
                 "list".into()
             )))
+        );
+    }
+
+    #[test]
+    fn agent_spawn_parses_task_and_flags_in_any_order() {
+        assert_eq!(
+            parse_agent_command("spawn investigate flaky login test --mode research"),
+            AgentInvocation::Spawn {
+                task: "investigate flaky login test".into(),
+                mode: gocode_core::SubagentMode::Research,
+                model: None,
+                worktree: false,
+            }
+        );
+        assert_eq!(
+            parse_agent_command("spawn --mode implement --worktree add a doc comment"),
+            AgentInvocation::Spawn {
+                task: "add a doc comment".into(),
+                mode: gocode_core::SubagentMode::Implement,
+                model: None,
+                worktree: true,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_worktree_flag_is_rejected_outside_implement_mode() {
+        assert_eq!(
+            parse_agent_command("spawn --worktree --mode research look around"),
+            AgentInvocation::Invalid("--worktree is only valid with --mode implement.".into())
+        );
+    }
+
+    #[test]
+    fn agent_apply_without_confirm_requests_the_diff_and_with_confirm_merges() {
+        assert_eq!(
+            parse_agent_command("apply a1b2c3d4"),
+            AgentInvocation::Apply {
+                id: "a1b2c3d4".into(),
+                confirm: false,
+            }
+        );
+        assert_eq!(
+            parse_agent_command("apply a1b2c3d4 confirm"),
+            AgentInvocation::Apply {
+                id: "a1b2c3d4".into(),
+                confirm: true,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_message_joins_the_remaining_words_into_the_text() {
+        assert_eq!(
+            parse_agent_command("message a1b2c3d4 focus on the retry path"),
+            AgentInvocation::Message {
+                id: "a1b2c3d4".into(),
+                text: "focus on the retry path".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn agent_slash_command_dispatches_to_the_matching_app_command() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/agent stop a1b2c3d4".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Agent(
+                "stop a1b2c3d4".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn bare_agents_command_is_recognized() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "/agents".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Command(SlashCommand::Agents))
         );
     }
 

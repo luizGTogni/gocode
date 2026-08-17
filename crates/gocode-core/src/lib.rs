@@ -21,8 +21,8 @@ pub use session::{
 };
 pub use subagent::{
     SUBAGENT_SCHEMA_VERSION, SubagentMessage, SubagentMessageRole, SubagentMode, SubagentRecord,
-    SubagentResult, SubagentStatus, list_subagents, load_subagent, recover_interrupted,
-    save_subagent, subagents_dir,
+    SubagentResult, SubagentStatus, delete_subagent, list_subagents, load_subagent,
+    recover_interrupted, save_subagent, subagents_dir,
 };
 
 /// Conservative trigger for automatic compaction: the provider's reported input-token count for
@@ -123,6 +123,43 @@ pub enum AppCommand {
     /// Same as [`AppCommand::Redo`], but overwrites conflicting files anyway (already confirmed
     /// by the interface).
     RedoForce(usize),
+    /// Delegate a bounded subtask to a new subagent.
+    AgentSpawn {
+        /// The objective, in the user's own words.
+        task: String,
+        /// Requested work mode; the runtime narrows this to a read-only mode under Plan mode.
+        mode: SubagentMode,
+        /// Model override, or `None` to use the session's current model.
+        model: Option<String>,
+        /// Whether `--worktree` was explicitly requested (only valid for `Implement`).
+        worktree: bool,
+    },
+    /// List every subagent this session knows about, most recently updated first.
+    AgentList,
+    /// Show one subagent's current status and progress.
+    AgentStatus(String),
+    /// Append a follow-up instruction for a subagent, delivered once its current turn finishes.
+    AgentMessage {
+        /// The subagent's id.
+        id: String,
+        /// The follow-up text.
+        text: String,
+    },
+    /// Cooperatively stop a running subagent, preserving its partial result.
+    AgentStop(String),
+    /// Show one subagent's final structured result.
+    AgentResult(String),
+    /// Request the diff between an implement-mode subagent's worktree and the main branch, for
+    /// review before `/agent apply <id> confirm`.
+    AgentApplyRequest(String),
+    /// Merge an implement-mode subagent's worktree branch into the main workspace, already
+    /// confirmed by the interface.
+    AgentApplyConfirm(String),
+    /// Request the warning shown before `/agent cleanup <id> confirm` removes a subagent's
+    /// worktree and metadata.
+    AgentCleanupRequest(String),
+    /// Remove a completed subagent's worktree and metadata, already confirmed by the interface.
+    AgentCleanupConfirm(String),
 }
 
 /// Where a new worktree's branch comes from, mirroring [`gocode_tools`]'s `BranchSource` at the
@@ -378,6 +415,17 @@ pub enum AppEvent {
     /// An undo/redo request failed for a reason other than a stack being empty or a conflict
     /// (e.g. a filesystem error while restoring an already-verified transaction).
     UndoOperationFailed { direction: String, message: String },
+    /// A short, already-redacted, human-readable result for a subagent command: spawn
+    /// confirmation, `/agent status`/`result`/`list` output, stop/message acknowledgements, or an
+    /// error (not-found, invalid state, permission denial).
+    AgentNotice(String),
+    /// A short, already-redacted progress note from a running subagent.
+    AgentProgress { id: String, line: String },
+    /// The diff between an implement-mode subagent's worktree and the main branch, ready for
+    /// review before `/agent apply <id> confirm`.
+    AgentDiffReady { id: String, diff: String },
+    /// The warning shown before `/agent cleanup <id> confirm` removes a subagent's worktree.
+    AgentCleanupWarning { id: String, message: String },
 }
 
 /// One transaction's file outcomes, for `AppEvent::UndoApplied`/`UndoConflict`.

@@ -4,9 +4,10 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
-use gocode_agent::{Agent, AgentEvent, AgentRequest};
+use gocode_agent::{Agent, AgentEvent, AgentRequest, SpawnRequest, SubagentEvent, SubagentManager};
 use gocode_core::{
     AUTO_COMPACT_TOKEN_THRESHOLD, AppCommand, AppError, EnvironmentPaths, Platform, PlatformPaths,
     ProjectContext, RuntimeChannels, bootstrap_with_paths,
@@ -19,6 +20,8 @@ use gocode_tools::{
         ApproveEverythingPolicy, DefaultPermissionPolicy, PermissionContext, PermissionPolicy,
         PermissionRequest, PermissionResolver, PlanPermissionPolicy, ResolveFuture,
     },
+    process::{CommandRequest, ProcessRunner, TokioProcessRunner},
+    worktree,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing_subscriber::prelude::*;
@@ -53,6 +56,293 @@ impl PermissionResolver for TuiPermissionResolver {
 
             response_rx.await.unwrap_or(false)
         })
+    }
+}
+
+/// Shortens a subagent id to the prefix `/agents` displays and every `/agent <cmd> <id>` accepts.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// Forwards every subagent's lifecycle facts to the interface as short, human-readable notices —
+/// spawn confirmation, status changes, progress lines, and completion — translating them to the
+/// provider-neutral [`gocode_core::AppEvent`] contract. Runs for the lifetime of the application;
+/// one task serves every subagent, since [`SubagentManager`] multiplexes their events onto a
+/// single channel.
+async fn bridge_subagent_events(
+    mut events: mpsc::Receiver<SubagentEvent>,
+    event_tx: mpsc::Sender<gocode_core::AppEvent>,
+) {
+    while let Some(event) = events.recv().await {
+        let notice = match event {
+            SubagentEvent::Spawned(record) => Some(format!(
+                "Subagent {} created — mode: {}, {}, location: {}.",
+                short_id(&record.id),
+                record.mode.label(),
+                if record.read_only {
+                    "read-only"
+                } else {
+                    "editing"
+                },
+                record.worktree_path.as_ref().map_or_else(
+                    || "main workspace (read-only)".to_string(),
+                    |path| path.display().to_string()
+                ),
+            )),
+            SubagentEvent::StatusChanged { .. } => None,
+            SubagentEvent::Progress { id, line } => {
+                let _ = event_tx
+                    .send(gocode_core::AppEvent::AgentProgress { id, line })
+                    .await;
+                None
+            }
+            SubagentEvent::Finished(record) => Some(format!(
+                "Subagent {} finished: {}.{}",
+                short_id(&record.id),
+                record.status.label(),
+                record
+                    .result
+                    .as_ref()
+                    .map(|result| format!(" {}", result.summary))
+                    .unwrap_or_default(),
+            )),
+        };
+        if let Some(notice) = notice {
+            let _ = event_tx
+                .send(gocode_core::AppEvent::AgentNotice(notice))
+                .await;
+        }
+    }
+}
+
+/// Renders `/agents`: one line per subagent, most recently updated first.
+fn format_subagent_list(records: &[gocode_core::SubagentRecord]) -> String {
+    if records.is_empty() {
+        return "No subagents yet. Use `/agent spawn <task>` to create one.".to_string();
+    }
+    records
+        .iter()
+        .map(|record| {
+            format!(
+                "{} [{}] {} — {} ({}s, model {}{})",
+                short_id(&record.id),
+                record.mode.label(),
+                record.task_summary,
+                record.status.label(),
+                record.elapsed_seconds(),
+                record.model,
+                record
+                    .worktree_path
+                    .as_ref()
+                    .map(|path| format!(", worktree {}", path.display()))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Renders `/agent status <id>`: current state plus the last few messages.
+fn format_subagent_status(record: &gocode_core::SubagentRecord) -> String {
+    let recent = record
+        .messages
+        .iter()
+        .rev()
+        .take(5)
+        .map(|message| {
+            let role = match message.role {
+                gocode_core::SubagentMessageRole::Supervisor => "you",
+                gocode_core::SubagentMessageRole::Subagent => "subagent",
+            };
+            format!("- {role}: {}", message.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Subagent {} — status: {}\nTask: {}\nElapsed: {}s{}",
+        short_id(&record.id),
+        record.status.label(),
+        record.task_summary,
+        record.elapsed_seconds(),
+        if recent.is_empty() {
+            String::new()
+        } else {
+            format!("\nRecent messages:\n{recent}")
+        },
+    )
+}
+
+/// Renders `/agent result <id>`: the structured [`gocode_core::SubagentResult`], when there is one.
+fn format_subagent_result(record: &gocode_core::SubagentRecord) -> String {
+    use std::fmt::Write as _;
+    let Some(result) = &record.result else {
+        return format!(
+            "Subagent {} has no result yet (status: {}).",
+            short_id(&record.id),
+            record.status.label()
+        );
+    };
+    let mut text = format!("Subagent {} — {}", short_id(&record.id), result.summary);
+    let mut section = |title: &str, items: &[String]| {
+        if !items.is_empty() {
+            let _ = write!(text, "\n\n{title}:\n{}", items.join("\n"));
+        }
+    };
+    section("Findings", &result.findings);
+    section("Files read", &result.files_read);
+    section("Files changed", &result.files_changed);
+    section("Commands run", &result.commands_run);
+    section("Tests run", &result.tests_run);
+    section("Risks", &result.risks);
+    section("Next steps", &result.next_steps);
+    if let Some(error) = &result.error {
+        let _ = write!(text, "\n\nError: {error}");
+    }
+    text
+}
+
+/// Either a ready-to-show diff or a plain notice explaining why there isn't one.
+enum AgentDiffOutcome {
+    Diff(String),
+    Notice(String),
+}
+
+/// Computes `git diff base...branch` for `/agent apply <id>`, from the main workspace root (a
+/// linked worktree shares its branches with the main one, so this works without changing
+/// directories into the subagent's worktree).
+async fn compute_subagent_diff(
+    runner: &TokioProcessRunner,
+    project_root: &Path,
+    id: &str,
+    base: &str,
+    branch: &str,
+) -> AgentDiffOutcome {
+    let request = CommandRequest {
+        program: "git".into(),
+        args: vec!["diff".into(), format!("{base}...{branch}")],
+        cwd: project_root.to_path_buf(),
+        shell: false,
+        timeout: Duration::from_secs(30),
+    };
+    match runner
+        .run(request, tokio_util::sync::CancellationToken::new(), None)
+        .await
+    {
+        Ok(result) if result.exit_code == Some(0) => {
+            let diff = if result.stdout.trim().is_empty() {
+                "(no changes)".to_string()
+            } else {
+                result.stdout
+            };
+            AgentDiffOutcome::Diff(format!(
+                "Diff for subagent {} (branch {branch}):\n\n{diff}\n\nRun `/agent apply {} \
+                 confirm` to merge into {base}, or ignore to cancel.",
+                short_id(id),
+                short_id(id),
+            ))
+        }
+        _ => AgentDiffOutcome::Notice("Could not compute the diff for that subagent.".into()),
+    }
+}
+
+/// Merges a subagent's worktree branch into the current branch of the main workspace for
+/// `/agent apply <id> confirm`. On conflict, aborts the merge (never leaving the workspace
+/// mid-conflict) and reports git's own conflict summary instead of applying anything.
+async fn apply_subagent_branch(
+    runner: &TokioProcessRunner,
+    project_root: &Path,
+    id: &str,
+    branch: &str,
+) -> String {
+    let merge_request = CommandRequest {
+        program: "git".into(),
+        args: vec!["merge".into(), "--no-ff".into(), branch.to_string()],
+        cwd: project_root.to_path_buf(),
+        shell: false,
+        timeout: Duration::from_secs(60),
+    };
+    match runner
+        .run(
+            merge_request,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+    {
+        Ok(result) if result.exit_code == Some(0) => {
+            format!(
+                "Applied subagent {}'s changes (merged branch {branch}).",
+                short_id(id)
+            )
+        }
+        Ok(result) => {
+            let abort_request = CommandRequest {
+                program: "git".into(),
+                args: vec!["merge".into(), "--abort".into()],
+                cwd: project_root.to_path_buf(),
+                shell: false,
+                timeout: Duration::from_secs(30),
+            };
+            let _ = runner
+                .run(
+                    abort_request,
+                    tokio_util::sync::CancellationToken::new(),
+                    None,
+                )
+                .await;
+            format!(
+                "Could not apply subagent {}'s changes; the merge was aborted so nothing was \
+                 left half-applied.\n\n{}\n{}",
+                short_id(id),
+                result.stdout.trim(),
+                result.stderr.trim(),
+            )
+        }
+        Err(gocode_tools::process::ProcessError::SpawnFailed(message)) => {
+            format!("Could not run git merge: {message}")
+        }
+    }
+}
+
+/// The warning shown before `/agent cleanup <id> confirm` removes a subagent's worktree.
+fn cleanup_warning(record: &gocode_core::SubagentRecord) -> String {
+    match &record.worktree_path {
+        Some(path) => format!(
+            "This removes the worktree at {} (branch {}). Any changes not already applied via \
+             `/agent apply {}` will be discarded. Run `/agent cleanup {} confirm` to proceed.",
+            path.display(),
+            record.branch.as_deref().unwrap_or("?"),
+            short_id(&record.id),
+            short_id(&record.id),
+        ),
+        None => format!(
+            "This removes subagent {}'s metadata. Run `/agent cleanup {} confirm` to proceed.",
+            short_id(&record.id),
+            short_id(&record.id),
+        ),
+    }
+}
+
+/// Removes a subagent's worktree (if any) and its persisted metadata for
+/// `/agent cleanup <id> confirm`. Metadata is only removed once the worktree removal (if
+/// applicable) has actually succeeded, so a failed `git worktree remove` never leaves an orphaned
+/// worktree with no record pointing at it.
+async fn cleanup_subagent(
+    manager: &SubagentManager,
+    project_root: &Path,
+    record: gocode_core::SubagentRecord,
+) -> String {
+    if let Some(path) = &record.worktree_path {
+        let runner = TokioProcessRunner;
+        if let Err(error) =
+            worktree::remove_worktree(&runner, project_root, &path.display().to_string()).await
+        {
+            return format!("Could not remove worktree: {error}");
+        }
+    }
+    match manager.delete(&record.id).await {
+        Ok(()) => format!("Removed subagent {}.", short_id(&record.id)),
+        Err(error) => format!("Could not remove subagent metadata: {error}"),
     }
 }
 
@@ -634,7 +924,7 @@ async fn compact_conversation(
 async fn main() {
     gocode_tui::install_panic_hook();
 
-    match run_application().await {
+    match Box::pin(run_application()).await {
         Ok(()) => {}
         Err(error) => {
             eprintln!("Gocode could not start: {error}");
@@ -686,6 +976,36 @@ async fn run_application() -> Result<(), AppError> {
         let mut auto_compact_enabled = true;
         let mut staged_update: Option<StagedUpdate> = None;
         let sessions_dir = gocode_core::sessions_dir(&paths.state_dir);
+        let subagents_dir = gocode_core::subagents_dir(&paths.state_dir);
+        let (subagent_event_tx, subagent_event_rx) = mpsc::channel::<SubagentEvent>(128);
+        let subagent_manager = Arc::new(SubagentManager::new(
+            subagents_dir.clone(),
+            gocode_agent::SubagentLimits::default(),
+            subagent_event_tx,
+        ));
+        match gocode_core::recover_interrupted(&subagents_dir) {
+            Ok(recovered) if !recovered.is_empty() => {
+                driver
+                    .event_tx
+                    .send(gocode_core::AppEvent::AgentNotice(format!(
+                        "{} subagent(s) were interrupted by a restart; use /agents to review \
+                         and /agent cleanup <id> to discard.",
+                        recovered.len()
+                    )))
+                    .await
+                    .map_err(|error| {
+                        AppError::Initialization(format!(
+                            "could not report interrupted subagents: {error}"
+                        ))
+                    })?;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("could not recover subagent metadata: {error}"),
+        }
+        tokio::spawn(bridge_subagent_events(
+            subagent_event_rx,
+            driver.event_tx.clone(),
+        ));
         let current_session: Arc<Mutex<gocode_core::SessionRecord>> =
             Arc::new(Mutex::new(gocode_core::SessionRecord::new()));
         // The session's active working directory. Starts at the detected project root and moves
@@ -1916,6 +2236,260 @@ async fn run_application() -> Result<(), AppError> {
                         .send(gocode_core::AppEvent::ExitForUpdate)
                         .await;
                 }
+                AppCommand::AgentSpawn {
+                    task,
+                    mode,
+                    model,
+                    worktree,
+                } => {
+                    let (Some(provider_ref), Some(session_model)) = (&provider, &selected_model)
+                    else {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(
+                                "Select a model before spawning a subagent.".into(),
+                            ))
+                            .await;
+                        continue;
+                    };
+                    let model_id = model.unwrap_or_else(|| session_model.clone());
+                    let request = SpawnRequest {
+                        parent_session_id: current_session.lock().await.id.clone(),
+                        task,
+                        mode,
+                        model: gocode_core::ModelId::new(model_id),
+                        worktree_requested: worktree,
+                        parent_permission_mode: permission_mode,
+                        provider: Arc::new(provider_ref.clone()),
+                        tools: tool_registry.clone(),
+                        project_root: project_root.clone(),
+                        worktree_runner: Arc::new(TokioProcessRunner),
+                        instructions: instructions.clone(),
+                    };
+                    if let Err(error) = subagent_manager.spawn(request).await {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(format!(
+                                "Could not spawn subagent: {error}"
+                            )))
+                            .await;
+                    }
+                }
+                AppCommand::AgentList => {
+                    let records = subagent_manager.list().await;
+                    let text = format_subagent_list(&records);
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::AgentNotice(text))
+                        .await;
+                }
+                AppCommand::AgentStatus(id) => {
+                    let text = match subagent_manager.find(&id).await {
+                        Some(record) => format_subagent_status(&record),
+                        None => format!("No subagent matches '{id}'."),
+                    };
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::AgentNotice(text))
+                        .await;
+                }
+                AppCommand::AgentMessage { id, text } => {
+                    let notice = match subagent_manager.find(&id).await {
+                        Some(record) => {
+                            match subagent_manager.send_message(&record.id, &text).await {
+                                Ok(()) => {
+                                    format!("Message queued for subagent {}.", short_id(&record.id))
+                                }
+                                Err(error) => format!(
+                                    "Could not message subagent {}: {error}",
+                                    short_id(&record.id)
+                                ),
+                            }
+                        }
+                        None => format!("No subagent matches '{id}'."),
+                    };
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::AgentNotice(notice))
+                        .await;
+                }
+                AppCommand::AgentStop(id) => {
+                    let notice = match subagent_manager.find(&id).await {
+                        Some(record) => match subagent_manager.stop(&record.id).await {
+                            Ok(()) => format!("Stopping subagent {}...", short_id(&record.id)),
+                            Err(error) => {
+                                format!("Could not stop subagent {}: {error}", short_id(&record.id))
+                            }
+                        },
+                        None => format!("No subagent matches '{id}'."),
+                    };
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::AgentNotice(notice))
+                        .await;
+                }
+                AppCommand::AgentResult(id) => {
+                    let text = match subagent_manager.find(&id).await {
+                        Some(record) => format_subagent_result(&record),
+                        None => format!("No subagent matches '{id}'."),
+                    };
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::AgentNotice(text))
+                        .await;
+                }
+                AppCommand::AgentApplyRequest(id) => match subagent_manager.find(&id).await {
+                    Some(record)
+                        if record.mode == gocode_core::SubagentMode::Implement
+                            && record.branch.is_some() =>
+                    {
+                        let branch = record.branch.clone().unwrap_or_default();
+                        let runner = TokioProcessRunner;
+                        let notice = match worktree::current_branch(&runner, &project_root).await {
+                            Ok(Some(base)) => {
+                                compute_subagent_diff(
+                                    &runner,
+                                    &project_root,
+                                    &record.id,
+                                    &base,
+                                    &branch,
+                                )
+                                .await
+                            }
+                            _ => AgentDiffOutcome::Notice(
+                                "Could not determine the current branch.".into(),
+                            ),
+                        };
+                        match notice {
+                            AgentDiffOutcome::Diff(diff) => {
+                                let _ = driver
+                                    .event_tx
+                                    .send(gocode_core::AppEvent::AgentDiffReady {
+                                        id: record.id,
+                                        diff,
+                                    })
+                                    .await;
+                            }
+                            AgentDiffOutcome::Notice(message) => {
+                                let _ = driver
+                                    .event_tx
+                                    .send(gocode_core::AppEvent::AgentNotice(message))
+                                    .await;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(
+                                "Only implement-mode subagents with a worktree can be \
+                                     applied."
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                    None => {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(format!(
+                                "No subagent matches '{id}'."
+                            )))
+                            .await;
+                    }
+                },
+                AppCommand::AgentApplyConfirm(id) => match subagent_manager.find(&id).await {
+                    Some(record)
+                        if record.mode == gocode_core::SubagentMode::Implement
+                            && record.branch.is_some() =>
+                    {
+                        let branch = record.branch.clone().unwrap_or_default();
+                        let runner = TokioProcessRunner;
+                        let notice =
+                            apply_subagent_branch(&runner, &project_root, &record.id, &branch)
+                                .await;
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(notice))
+                            .await;
+                    }
+                    Some(_) => {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(
+                                "Only implement-mode subagents with a worktree can be \
+                                     applied."
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                    None => {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(format!(
+                                "No subagent matches '{id}'."
+                            )))
+                            .await;
+                    }
+                },
+                AppCommand::AgentCleanupRequest(id) => match subagent_manager.find(&id).await {
+                    Some(record) if !record.status.is_terminal() => {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(format!(
+                                "Subagent {} is still {}; stop it first with `/agent stop {}`.",
+                                short_id(&record.id),
+                                record.status.label(),
+                                short_id(&record.id)
+                            )))
+                            .await;
+                    }
+                    Some(record) => {
+                        let message = cleanup_warning(&record);
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentCleanupWarning {
+                                id: record.id,
+                                message,
+                            })
+                            .await;
+                    }
+                    None => {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(format!(
+                                "No subagent matches '{id}'."
+                            )))
+                            .await;
+                    }
+                },
+                AppCommand::AgentCleanupConfirm(id) => match subagent_manager.find(&id).await {
+                    Some(record) if !record.status.is_terminal() => {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(format!(
+                                "Subagent {} is still {}; stop it first.",
+                                short_id(&record.id),
+                                record.status.label()
+                            )))
+                            .await;
+                    }
+                    Some(record) => {
+                        let notice =
+                            cleanup_subagent(&subagent_manager, &project_root, record).await;
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(notice))
+                            .await;
+                    }
+                    None => {
+                        let _ = driver
+                            .event_tx
+                            .send(gocode_core::AppEvent::AgentNotice(format!(
+                                "No subagent matches '{id}'."
+                            )))
+                            .await;
+                    }
+                },
             }
         }
 
@@ -2163,11 +2737,15 @@ fn process_environment() -> EnvironmentPaths {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use gocode_core::{EnvironmentPaths, Platform};
 
-    use super::application_paths;
+    use super::{
+        AgentDiffOutcome, application_paths, apply_subagent_branch, cleanup_subagent,
+        cleanup_warning, compute_subagent_diff, format_subagent_list, format_subagent_result,
+        format_subagent_status,
+    };
 
     #[test]
     fn application_paths_use_the_platform_environment_contract() {
@@ -2181,5 +2759,218 @@ mod tests {
         .expect("paths should resolve");
 
         assert_eq!(paths.config_dir, Path::new("/home/alice/.config/gocode"));
+    }
+
+    fn sample_record(mode: gocode_core::SubagentMode) -> gocode_core::SubagentRecord {
+        gocode_core::SubagentRecord::new(
+            "session-1".into(),
+            "investigate flaky login test".into(),
+            mode,
+            "test-model".into(),
+            !mode.allows_writes(),
+            gocode_core::PermissionMode::Auto,
+        )
+    }
+
+    #[test]
+    fn empty_subagent_list_prompts_to_spawn_one() {
+        assert!(format_subagent_list(&[]).contains("/agent spawn"));
+    }
+
+    #[test]
+    fn subagent_list_shows_id_mode_status_and_worktree() {
+        let mut record = sample_record(gocode_core::SubagentMode::Implement);
+        record.worktree_path = Some(PathBuf::from("/tmp/repo-worktrees/subagent-abc"));
+        let text = format_subagent_list(std::slice::from_ref(&record));
+        assert!(text.contains(&record.id[..8]));
+        assert!(text.contains("implement"));
+        assert!(text.contains("queued"));
+        assert!(text.contains("subagent-abc"));
+    }
+
+    #[test]
+    fn subagent_status_includes_recent_messages() {
+        let mut record = sample_record(gocode_core::SubagentMode::Research);
+        record.push_message(
+            gocode_core::SubagentMessageRole::Supervisor,
+            "focus on the retry path".into(),
+        );
+        let text = format_subagent_status(&record);
+        assert!(text.contains("Recent messages"));
+        assert!(text.contains("focus on the retry path"));
+    }
+
+    #[test]
+    fn subagent_result_reports_no_result_yet_before_completion() {
+        let record = sample_record(gocode_core::SubagentMode::Research);
+        assert!(format_subagent_result(&record).contains("no result yet"));
+    }
+
+    #[test]
+    fn subagent_result_renders_findings_and_risks_once_set() {
+        let mut record = sample_record(gocode_core::SubagentMode::Research);
+        record.status = gocode_core::SubagentStatus::Completed;
+        record.result = Some(gocode_core::SubagentResult {
+            summary: "found the race condition".into(),
+            findings: vec!["login handler drops the lock early".into()],
+            risks: vec!["fix is untested under load".into()],
+            ..gocode_core::SubagentResult::default()
+        });
+        let text = format_subagent_result(&record);
+        assert!(text.contains("found the race condition"));
+        assert!(text.contains("Findings"));
+        assert!(text.contains("login handler drops the lock early"));
+        assert!(text.contains("Risks"));
+    }
+
+    #[test]
+    fn cleanup_warning_mentions_the_worktree_when_there_is_one() {
+        let mut record = sample_record(gocode_core::SubagentMode::Implement);
+        record.worktree_path = Some(PathBuf::from("/tmp/repo-worktrees/subagent-abc"));
+        record.branch = Some("subagent-abc".into());
+        let message = cleanup_warning(&record);
+        assert!(message.contains("subagent-abc"));
+        assert!(message.contains("confirm"));
+    }
+
+    #[test]
+    fn cleanup_warning_without_a_worktree_only_mentions_metadata() {
+        let record = sample_record(gocode_core::SubagentMode::Research);
+        let message = cleanup_warning(&record);
+        assert!(!message.contains("worktree"));
+        assert!(message.contains("metadata"));
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git should be installed for this test");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A repo with `main` at one commit and a `feature` branch one commit ahead, isolated per
+    /// test under the OS temp dir. Mirrors the fixture pattern in `gocode-tools`' worktree tests.
+    fn fixture_repo_with_a_feature_branch(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gocode-main-subagent-tests-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        run_git(&root, &["config", "user.email", "test@example.com"]);
+        run_git(&root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "init"]);
+        run_git(&root, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(root.join("feature.txt"), "new file\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "add feature file"]);
+        run_git(&root, &["checkout", "-q", "main"]);
+        root
+    }
+
+    #[tokio::test]
+    async fn computes_a_diff_between_the_base_and_the_subagent_branch() {
+        let root = fixture_repo_with_a_feature_branch("diff");
+        let runner = gocode_tools::process::TokioProcessRunner;
+
+        let outcome = compute_subagent_diff(&runner, &root, "sub1", "main", "feature").await;
+        let AgentDiffOutcome::Diff(diff) = outcome else {
+            panic!("expected a diff, got a notice");
+        };
+        assert!(diff.contains("feature.txt"));
+        assert!(diff.contains("/agent apply sub1 confirm"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn applying_a_clean_branch_merges_it_into_the_current_branch() {
+        let root = fixture_repo_with_a_feature_branch("apply-clean");
+        let runner = gocode_tools::process::TokioProcessRunner;
+
+        let notice = apply_subagent_branch(&runner, &root, "sub1", "feature").await;
+        assert!(notice.contains("Applied"), "unexpected notice: {notice}");
+        assert!(root.join("feature.txt").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_merge_is_aborted_instead_of_left_half_applied() {
+        let root = fixture_repo_with_a_feature_branch("apply-conflict");
+        // Diverge `main` so merging `feature` conflicts on the same file.
+        std::fs::write(root.join("feature.txt"), "conflicting content\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-q", "-m", "conflicting change on main"]);
+        let runner = gocode_tools::process::TokioProcessRunner;
+
+        let notice = apply_subagent_branch(&runner, &root, "sub1", "feature").await;
+        assert!(
+            notice.contains("Could not apply"),
+            "unexpected notice: {notice}"
+        );
+
+        // The abort must leave no merge in progress and no conflict markers on disk.
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .expect("git status should run");
+        assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+        let content = std::fs::read_to_string(root.join("feature.txt")).unwrap();
+        assert_eq!(content, "conflicting content\n");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_the_worktree_and_the_record() {
+        let root = fixture_repo_with_a_feature_branch("cleanup");
+        let runner = gocode_tools::process::TokioProcessRunner;
+        let entry = gocode_tools::worktree::create_worktree(
+            &runner,
+            &root,
+            "subagent-cleanup",
+            &gocode_tools::worktree::BranchSource::New {
+                base: "main".into(),
+            },
+        )
+        .await
+        .expect("worktree should be created");
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "gocode-main-subagent-cleanup-state-{}",
+            std::process::id()
+        ));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let manager = gocode_agent::SubagentManager::new(
+            gocode_core::subagents_dir(&state_dir),
+            gocode_agent::SubagentLimits::default(),
+            event_tx,
+        );
+        let mut record = sample_record(gocode_core::SubagentMode::Implement);
+        record.worktree_path = Some(entry.path.clone());
+        record.branch = entry.branch.clone();
+        gocode_core::save_subagent(&gocode_core::subagents_dir(&state_dir), &record).unwrap();
+
+        let notice = cleanup_subagent(&manager, &root, record.clone()).await;
+        assert!(notice.contains("Removed"), "unexpected notice: {notice}");
+        assert!(!entry.path.exists());
+        assert!(manager.get(&record.id).await.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&state_dir).ok();
     }
 }

@@ -301,6 +301,26 @@ pub fn load_subagent(dir: &Path, id: &str) -> Result<SubagentRecord, AppError> {
         .map_err(|error| AppError::Configuration(format!("could not parse subagent: {error}")))
 }
 
+/// Deletes one persisted subagent record. Never touches its worktree — callers that need the
+/// worktree gone too must remove it separately (see `gocode_tools::worktree::remove_worktree`)
+/// before calling this, so a failed worktree removal never leaves the record silently orphaned.
+///
+/// # Errors
+///
+/// Returns [`AppError::Io`] when the file exists but cannot be removed. Deleting an already-absent
+/// record is not an error.
+pub fn delete_subagent(dir: &Path, id: &str) -> Result<(), AppError> {
+    let path = dir.join(format!("{id}.json"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Io(format!(
+            "could not remove {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 /// Lists every saved subagent record, most recently updated first. Returns an empty list when the
 /// subagents directory does not exist yet; individually unreadable files are skipped rather than
 /// failing the whole listing.

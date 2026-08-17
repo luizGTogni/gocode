@@ -324,16 +324,60 @@ impl SubagentManager {
         Ok(())
     }
 
-    /// Returns the current record for `id`.
+    /// Returns the current record for `id`, read from disk so it reflects subagents from earlier
+    /// sessions (including ones [`gocode_core::recover_interrupted`] marked at startup), not just
+    /// ones spawned by this [`SubagentManager`] instance.
+    #[allow(
+        clippy::unused_async,
+        reason = "kept async: every caller already awaits manager methods, and this read may \
+                  move behind spawn_blocking or true async I/O later without changing call sites"
+    )]
     pub async fn get(&self, id: &str) -> Option<SubagentRecord> {
-        self.records.lock().await.get(id).cloned()
+        gocode_core::load_subagent(&self.dir, id).ok()
     }
 
-    /// Lists every subagent this manager knows about, most recently updated first.
+    /// Lists every persisted subagent, most recently updated first. Like [`Self::get`], reads
+    /// from disk rather than this instance's own in-memory cache.
+    #[allow(
+        clippy::unused_async,
+        reason = "kept async: every caller already awaits manager methods, and this read may \
+                  move behind spawn_blocking or true async I/O later without changing call sites"
+    )]
     pub async fn list(&self) -> Vec<SubagentRecord> {
-        let mut records: Vec<_> = self.records.lock().await.values().cloned().collect();
-        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_unix));
-        records
+        gocode_core::list_subagents(&self.dir).unwrap_or_default()
+    }
+
+    /// Resolves a possibly-abbreviated id (as shown by `/agents`) to the one full record it
+    /// matches. Returns `None` when nothing matches or more than one record shares the prefix.
+    pub async fn find(&self, id_or_prefix: &str) -> Option<SubagentRecord> {
+        if let Some(record) = self.get(id_or_prefix).await {
+            return Some(record);
+        }
+        let mut matches = self
+            .list()
+            .await
+            .into_iter()
+            .filter(|record| record.id.starts_with(id_or_prefix));
+        let first = matches.next()?;
+        if matches.next().is_none() {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    /// Deletes a subagent's persisted record. Callers are responsible for removing its worktree
+    /// first, if any (see `gocode_tools::worktree::remove_worktree`), so a failed worktree
+    /// removal never leaves the record silently gone with nothing to point at the orphaned files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubagentError::Persistence`] when the record file exists but cannot be removed.
+    pub async fn delete(&self, id: &str) -> Result<(), SubagentError> {
+        self.records.lock().await.remove(id);
+        self.cancel_tokens.lock().await.remove(id);
+        gocode_core::delete_subagent(&self.dir, id)
+            .map_err(|error| SubagentError::Persistence(error.to_string()))
     }
 
     fn save_locked(&self, record: &SubagentRecord) -> Result<(), String> {
