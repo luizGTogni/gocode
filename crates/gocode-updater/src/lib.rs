@@ -459,12 +459,29 @@ pub fn replace_with_rollback(staged: &Path, installed: &Path) -> Result<(), Upda
 /// # Errors
 ///
 /// Returns an error when the replacement executable cannot be started.
+///
+/// On Unix this replaces the current process image (`exec`) instead of spawning a child and
+/// exiting, so the restarted binary keeps the same PID, session, and controlling terminal. A
+/// spawn-then-exit handoff hands the child a fresh fd table right as the parent exits, which
+/// can race the terminal driver and surface as an I/O error when the new process re-initializes
+/// the terminal.
 pub fn restart(installed: &Path, args: &[String]) -> Result<(), UpdateError> {
-    Command::new(installed)
-        .args(args)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| UpdateError::Replace(format!("could not restart Gocode: {e}")))
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = Command::new(installed).args(args).exec();
+        Err(UpdateError::Replace(format!(
+            "could not restart Gocode: {error}"
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        Command::new(installed)
+            .args(args)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| UpdateError::Replace(format!("could not restart Gocode: {e}")))
+    }
 }
 
 #[cfg(test)]
