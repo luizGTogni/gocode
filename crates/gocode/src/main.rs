@@ -1243,7 +1243,7 @@ async fn run_application() -> Result<(), AppError> {
 
         while let Some(command) = driver.command_rx.recv().await {
             match command {
-                AppCommand::Exit => return Ok(AppCommand::Exit),
+                AppCommand::Exit => return Ok(None),
                 AppCommand::Resize { columns, rows } => driver
                     .event_tx
                     .send(gocode_core::AppEvent::TerminalResized { columns, rows })
@@ -2264,17 +2264,17 @@ async fn run_application() -> Result<(), AppError> {
                             .await;
                         continue;
                     };
-                    if let Err(error) = install_and_restart(&staged) {
-                        let _ = driver
-                            .event_tx
-                            .send(gocode_core::AppEvent::UpdateFailed(error))
-                            .await;
-                        continue;
-                    }
+                    // Installing here (spawning the Windows updater helper, or replacing the
+                    // binary in place on Linux) would hand a still-alternate-screen, still-raw
+                    // console down to the child process while the TUI task keeps running
+                    // concurrently. Instead, only signal the TUI to shut down; the actual
+                    // install happens after `tokio::join!` below has observed both tasks finish,
+                    // so the terminal is guaranteed restored first (see docs/UPDATER.md §47).
                     let _ = driver
                         .event_tx
                         .send(gocode_core::AppEvent::ExitForUpdate)
                         .await;
+                    return Ok(Some(staged));
                 }
                 AppCommand::AgentSpawn {
                     task,
@@ -2588,8 +2588,17 @@ async fn run_application() -> Result<(), AppError> {
     };
     let (tui_result, runtime_result) = tokio::join!(tui, runtime);
     tui_result.map_err(|error| AppError::Io(format!("terminal failed: {error}")))?;
-    runtime_result?;
+    let staged_for_restart = runtime_result?;
     tracing::info!("application shutdown requested");
+
+    // The TUI task has now fully returned, which means its `TerminalGuard` has already restored
+    // the terminal (left the alternate screen, disabled raw mode). Only now is it safe to spawn
+    // the updater helper / new binary, so it doesn't inherit a console still mid-render.
+    if let Some(staged) = staged_for_restart
+        && let Err(error) = install_and_restart(&staged)
+    {
+        eprintln!("Gocode update failed: {error}");
+    }
 
     Ok(())
 }
