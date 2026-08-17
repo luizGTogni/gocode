@@ -1,9 +1,12 @@
 use futures_util::StreamExt;
 use gocode_core::{
     CancellationToken, ChatMessage, ChatRequest, ChatStream, ChatStreamEvent, FinishReason, Model,
-    ModelCapabilities, ModelId, Provider, ProviderError, ProviderFuture, ToolCallDelta, Usage,
+    ModelId, Provider, ProviderError, ProviderFuture, ToolCallDelta, Usage,
 };
 use gocode_credentials::SecretString;
+
+mod capabilities;
+pub use capabilities::NvidiaCapabilityResolver;
 
 const HOSTED_BASE_URL: &str = "https://integrate.api.nvidia.com/";
 /// Maximum buffered bytes without an SSE newline. A provider response is untrusted input, so a
@@ -352,7 +355,7 @@ pub fn map_models(payload: &str) -> Result<Vec<Model>, NvidiaProtocolError> {
         .map(|id| Model {
             id: ModelId::new(id),
             display_name: id.into(),
-            capabilities: ModelCapabilities::unknown(),
+            capabilities: NvidiaCapabilityResolver::resolve(id),
         })
         .collect())
 }
@@ -684,6 +687,18 @@ mod tests {
         assert_eq!(
             models[0].capabilities.tools,
             gocode_core::ToolCapability::Unsupported
+        );
+    }
+
+    #[test]
+    fn discovered_nemotron_models_are_reported_with_tool_support() {
+        let models =
+            super::map_models(r#"{"data":[{"id":"nvidia/llama-3.1-nemotron-70b-instruct"}]}"#)
+                .expect("model list should map");
+
+        assert_eq!(
+            models[0].capabilities.tools,
+            gocode_core::ToolCapability::Supported
         );
     }
 

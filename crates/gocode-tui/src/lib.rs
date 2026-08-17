@@ -1162,6 +1162,16 @@ impl AppState {
                 self.show_queued_update();
                 return self.queued.take();
             }
+            AppEvent::AgentStopped => {
+                self.activity = None;
+                self.streaming_assistant = false;
+                self.streaming_reasoning = false;
+                self.pending_permission = None;
+                self.flush_file_changes();
+                self.last_submitted_prompt = None;
+                self.show_queued_update();
+                return self.queued.take();
+            }
             AppEvent::ReasoningEffortChanged { effort, announce } => {
                 self.current_effort.clone_from(effort);
                 if *announce {
@@ -7120,6 +7130,31 @@ mod tests {
         state.apply(&AppEvent::AgentCancelled);
 
         assert!(state.pending_permission.is_none());
+    }
+
+    #[test]
+    fn agent_stopped_releases_the_running_tools_indicator_left_by_a_limit_warning() {
+        // A run that hits a safety limit (max turns, a detected loop, ...) sends an AgentWarning
+        // with the explanation, then AgentStopped as the terminal signal — mirroring what a
+        // successful or cancelled run would otherwise do to release the busy indicator.
+        let mut state = AppState::default();
+        state.apply(&AppEvent::AgentStateChanged(
+            AgentActivityState::RunningTools,
+        ));
+        assert!(state.activity.is_some());
+
+        state.apply(&AppEvent::AgentWarning(
+            "run stopped: the maximum number of turns was reached".into(),
+        ));
+        state.apply(&AppEvent::AgentStopped);
+
+        assert!(state.activity.is_none());
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, ChatEntry::Warning(message) if message.contains("maximum number of turns")))
+        );
     }
 
     #[test]

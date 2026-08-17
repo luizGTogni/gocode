@@ -1675,6 +1675,8 @@ async fn run_application() -> Result<(), AppError> {
                                             other.to_string(),
                                         ))
                                         .await;
+                                    let _ =
+                                        event_tx.send(gocode_core::AppEvent::AgentStopped).await;
                                 }
                             },
                         }

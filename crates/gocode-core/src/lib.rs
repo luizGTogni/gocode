@@ -363,6 +363,11 @@ pub enum AppEvent {
     },
     /// The agent run was cancelled by the user.
     AgentCancelled,
+    /// The agent run ended early due to a configured safety limit (e.g. max turns, a detected
+    /// tool-call loop). Distinct from [`AppEvent::AgentCompleted`] and [`AppEvent::AgentCancelled`]
+    /// so the interface still releases its busy state; the explanatory message was already sent
+    /// as a preceding [`AppEvent::AgentWarning`].
+    AgentStopped,
     /// The active reasoning-effort level changed.
     ReasoningEffortChanged {
         /// The newly active level, or `None` to clear it.
