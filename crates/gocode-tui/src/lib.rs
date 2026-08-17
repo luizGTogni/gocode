@@ -777,6 +777,10 @@ pub struct AppState {
     selection: Option<Selection>,
     copy_notification: Option<String>,
     entries: Vec<ChatEntry>,
+    /// Memoizes the word-wrapped chat history so redraws that don't change the conversation or
+    /// the terminal width (every scroll key press, every idle poll tick) skip re-wrapping the
+    /// entire history from scratch. See `render_history`.
+    history_wrap_cache: std::cell::RefCell<HistoryWrapCache>,
     streaming_assistant: bool,
     file_change_buffer: Vec<String>,
     activity: Option<AgentActivityState>,
@@ -1638,18 +1642,41 @@ fn banner_lines(state: &AppState) -> Vec<String> {
     lines
 }
 
+/// How a composed history line should be painted: `User` gets the themed highlight background
+/// used in place of a literal "You:" prefix (see `render_history`); everything else renders
+/// plain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LineKind {
+    Normal,
+    User,
+}
+
+/// Untagged view of [`compose_lines_tagged`], kept for tests that don't care about line styling.
+#[cfg(test)]
 fn compose_lines(state: &AppState) -> Vec<String> {
-    let mut lines = banner_lines(state);
+    compose_lines_tagged(state)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+fn compose_lines_tagged(state: &AppState) -> Vec<(String, LineKind)> {
+    let mut lines: Vec<(String, LineKind)> = banner_lines(state)
+        .into_iter()
+        .map(|line| (line, LineKind::Normal))
+        .collect();
 
     if state.entries.is_empty() {
-        lines.push("What can I help you build?".into());
+        lines.push(("What can I help you build?".into(), LineKind::Normal));
         return lines;
     }
 
     for entry in &state.entries {
         match entry {
-            ChatEntry::User(text) => push_wrapped(&mut lines, "You: ", text),
-            ChatEntry::Assistant(text) => push_wrapped(&mut lines, "Gocode: ", text),
+            ChatEntry::User(text) => push_wrapped(&mut lines, "", text, LineKind::User),
+            ChatEntry::Assistant(text) => {
+                push_wrapped(&mut lines, "Gocode: ", text, LineKind::Normal);
+            }
             ChatEntry::Tool {
                 name,
                 status,
@@ -1664,7 +1691,7 @@ fn compose_lines(state: &AppState) -> Vec<String> {
                     ToolActivityStatus::Failed => "✗",
                     ToolActivityStatus::Denied | ToolActivityStatus::Cancelled => "⊘",
                 };
-                lines.push(format!("  {marker} {name}: {detail}"));
+                lines.push((format!("  {marker} {name}: {detail}"), LineKind::Normal));
                 if !output.is_empty() {
                     let output_lines: Vec<&str> = output.lines().collect();
                     let limit = if *expanded {
@@ -1673,47 +1700,54 @@ fn compose_lines(state: &AppState) -> Vec<String> {
                         COLLAPSED_OUTPUT_LINES
                     };
                     for line in output_lines.iter().take(limit) {
-                        lines.push(format!("      {line}"));
+                        lines.push((format!("      {line}"), LineKind::Normal));
                     }
                     if output_lines.len() > limit {
                         let hidden = output_lines.len() - limit;
                         let action = if *expanded { "collapse" } else { "expand" };
-                        lines.push(format!(
-                            "      … {hidden} more line(s) (Ctrl+O to {action})"
+                        lines.push((
+                            format!("      … {hidden} more line(s) (Ctrl+O to {action})"),
+                            LineKind::Normal,
                         ));
                     }
                 }
             }
             ChatEntry::FileChanges(paths) => {
-                lines.push(format!("  Modified files: {}", paths.join(", ")));
+                lines.push((
+                    format!("  Modified files: {}", paths.join(", ")),
+                    LineKind::Normal,
+                ));
             }
-            ChatEntry::Warning(text) => lines.push(format!("  ⚠ {text}")),
-            ChatEntry::Error(text) => lines.push(format!("  ✗ {text}")),
-            ChatEntry::Info(text) => lines.push(format!("  · {text}")),
+            ChatEntry::Warning(text) => lines.push((format!("  ⚠ {text}"), LineKind::Normal)),
+            ChatEntry::Error(text) => lines.push((format!("  ✗ {text}"), LineKind::Normal)),
+            ChatEntry::Info(text) => lines.push((format!("  · {text}"), LineKind::Normal)),
         }
-        lines.push(String::new());
+        lines.push((String::new(), LineKind::Normal));
     }
 
     if let Some(activity) = state.activity {
-        lines.push(match activity {
-            AgentActivityState::Thinking => "Gocode is thinking…".into(),
-            AgentActivityState::RunningTools => "Gocode is running tools…".into(),
-        });
+        lines.push((
+            match activity {
+                AgentActivityState::Thinking => "Gocode is thinking…".into(),
+                AgentActivityState::RunningTools => "Gocode is running tools…".into(),
+            },
+            LineKind::Normal,
+        ));
     }
     if let Some(queued) = &state.queued {
-        lines.push(format!("Queued: {queued}"));
+        lines.push((format!("Queued: {queued}"), LineKind::Normal));
     }
 
     lines
 }
 
-fn push_wrapped(lines: &mut Vec<String>, prefix: &str, text: &str) {
+fn push_wrapped(lines: &mut Vec<(String, LineKind)>, prefix: &str, text: &str, kind: LineKind) {
     let indent = " ".repeat(prefix.chars().count());
     for (index, line) in text.lines().enumerate() {
         if index == 0 {
-            lines.push(format!("{prefix}{line}"));
+            lines.push((format!("{prefix}{line}"), kind));
         } else {
-            lines.push(format!("{indent}{line}"));
+            lines.push((format!("{indent}{line}"), kind));
         }
     }
 }
@@ -3235,36 +3269,91 @@ fn render_update_result(frame: &mut Frame, title: &str, heading: &str, message: 
     );
 }
 
+/// Word-wrapped chat history, cached across draws that don't change the conversation or width.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HistoryWrapCache {
+    width: usize,
+    source_hash: u64,
+    wrapped: Vec<(String, LineKind)>,
+}
+
+fn hash_lines(lines: &[(String, LineKind)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lines.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The word-wrapped chat history at `content_width`, recomputed only when the conversation or
+/// the width has actually changed since the last call. Shared by rendering, mouse hit-testing,
+/// and selection-text extraction so none of them re-wrap the whole history on every draw.
+fn wrapped_history_lines(
+    state: &AppState,
+    content_width: usize,
+) -> std::cell::Ref<'_, Vec<(String, LineKind)>> {
+    let composed = compose_lines_tagged(state);
+    let hash = hash_lines(&composed);
+    {
+        let mut cache = state.history_wrap_cache.borrow_mut();
+        if cache.width != content_width || cache.source_hash != hash {
+            cache.wrapped = wrap_lines_tagged(&composed, content_width);
+            cache.width = content_width;
+            cache.source_hash = hash;
+        }
+    }
+    std::cell::Ref::map(state.history_wrap_cache.borrow(), |cache| &cache.wrapped)
+}
+
 fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
     let theme = active_theme(state);
     let content_width = usize::from(area.width.saturating_sub(2));
-    let wrapped = wrap_lines(&compose_lines(state), content_width);
+    let wrapped = wrapped_history_lines(state, content_width);
     let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
     let (start, end) = compute_visible_window(wrapped.len(), visible_rows, state.scroll);
+
+    // Themed background used in place of a literal "You:" prefix on the user's own messages —
+    // a small highlighted "pill" rather than a text label.
+    let user_style = Style::default().bg(theme.highlight).fg(theme.background);
 
     let rendered_lines: Vec<Line> = wrapped[start..end]
         .iter()
         .enumerate()
-        .map(|(offset, line)| {
+        .map(|(offset, (line, kind))| {
             let absolute_index = start + offset;
             let chars: Vec<char> = line.chars().collect();
+            let is_user = *kind == LineKind::User;
             let selected_range = state
                 .selection
                 .as_ref()
                 .and_then(|selection| selected_char_range(selection, absolute_index, chars.len()));
+            let pad = || Span::styled(" ", user_style);
             match selected_range {
                 Some((from, to)) => {
                     let before: String = chars[..from].iter().collect();
                     let marked: String = chars[from..to].iter().collect();
                     let after: String = chars[to..].iter().collect();
-                    Line::from(vec![
-                        Span::raw(before),
-                        Span::styled(
-                            marked,
-                            Style::default().bg(SELECTION_COLOR).fg(Color::Black),
-                        ),
-                        Span::raw(after),
-                    ])
+                    let base = if is_user {
+                        user_style
+                    } else {
+                        Style::default()
+                    };
+                    let mut spans = Vec::new();
+                    if is_user {
+                        spans.push(pad());
+                    }
+                    spans.push(Span::styled(before, base));
+                    spans.push(Span::styled(
+                        marked,
+                        Style::default().bg(SELECTION_COLOR).fg(Color::Black),
+                    ));
+                    spans.push(Span::styled(after, base));
+                    if is_user {
+                        spans.push(pad());
+                    }
+                    Line::from(spans)
+                }
+                None if is_user => {
+                    Line::from(vec![pad(), Span::styled(line.clone(), user_style), pad()])
                 }
                 None => Line::from(line.clone()),
             }
@@ -3289,16 +3378,31 @@ fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
+/// Untagged view of [`wrap_lines_tagged`], kept for tests that don't care about line styling.
+#[cfg(test)]
+fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {
+    let tagged: Vec<(String, LineKind)> = lines
+        .iter()
+        .cloned()
+        .map(|line| (line, LineKind::Normal))
+        .collect();
+    wrap_lines_tagged(&tagged, width)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
 /// Word-wraps every logical line to `width` columns so the resulting rows match 1:1 what gets
 /// drawn to the terminal — the same rows are then used for mouse-selection hit-testing, so
-/// rendering and hit-testing can never disagree about where a character lands.
-fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {
+/// rendering and hit-testing can never disagree about where a character lands. Each output row
+/// keeps the [`LineKind`] tag of the logical line it was split from.
+fn wrap_lines_tagged(lines: &[(String, LineKind)], width: usize) -> Vec<(String, LineKind)> {
     let width = width.max(1);
     let mut wrapped = Vec::new();
-    for line in lines {
+    for (line, kind) in lines {
         let chars: Vec<char> = line.chars().collect();
         if chars.is_empty() {
-            wrapped.push(String::new());
+            wrapped.push((String::new(), *kind));
             continue;
         }
         let mut start = 0usize;
@@ -3311,7 +3415,7 @@ fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {
                 end = start + break_at + 1;
             }
             let segment: String = chars[start..end].iter().collect();
-            wrapped.push(segment.trim_end_matches(' ').to_string());
+            wrapped.push((segment.trim_end_matches(' ').to_string(), *kind));
             start = end;
             if start < chars.len() && chars[start] == ' ' {
                 start += 1;
@@ -4885,12 +4989,12 @@ fn point_from_terminal_coords(
     let local_row = usize::from(row - history_area.y - 1);
 
     let content_width = usize::from(history_area.width.saturating_sub(2));
-    let wrapped = wrap_lines(&compose_lines(state), content_width);
+    let wrapped = wrapped_history_lines(state, content_width);
     let visible_rows = usize::from(history_area.height.saturating_sub(2)).max(1);
     let (start, _end) = compute_visible_window(wrapped.len(), visible_rows, state.scroll);
 
     let absolute_line = start + local_row;
-    let line_len = wrapped.get(absolute_line)?.chars().count();
+    let line_len = wrapped.get(absolute_line)?.0.chars().count();
     Some(SelectionPoint {
         line: absolute_line,
         col: local_col.min(line_len),
@@ -5001,11 +5105,11 @@ fn extract_selected_text(state: &AppState, terminal_area: Rect) -> Option<String
     let selection = state.selection?;
     let (history_area, _) = chat_layout(terminal_area, state);
     let content_width = usize::from(history_area.width.saturating_sub(2));
-    let wrapped = wrap_lines(&compose_lines(state), content_width);
+    let wrapped = wrapped_history_lines(state, content_width);
     let (start, end) = selection.normalized();
 
     let mut collected = Vec::new();
-    for (line_index, line) in wrapped
+    for (line_index, (line, _)) in wrapped
         .iter()
         .enumerate()
         .take(end.line + 1)
@@ -6517,7 +6621,60 @@ mod tests {
         state.begin_run("hello".into());
         let busy_lines = super::compose_lines(&state);
         assert!(busy_lines.iter().any(|line| line.contains('█')));
-        assert!(busy_lines.iter().any(|line| line.contains("You: hello")));
+        assert!(busy_lines.iter().any(|line| line.trim() == "hello"));
+    }
+
+    #[test]
+    fn user_messages_are_tagged_without_a_literal_you_prefix() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("hello there".into());
+
+        let tagged = super::compose_lines_tagged(&state);
+        assert!(
+            tagged
+                .iter()
+                .any(|(text, kind)| *kind == super::LineKind::User && text.trim() == "hello there")
+        );
+        assert!(tagged.iter().all(|(text, _)| !text.starts_with("You:")));
+    }
+
+    #[test]
+    fn wrapped_history_is_cached_until_content_or_width_changes() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("hi".into());
+
+        let _ = super::wrapped_history_lines(&state, 40);
+        let hash_after_first_draw = state.history_wrap_cache.borrow().source_hash;
+
+        // Redrawing at the same width without touching the conversation must hit the cache.
+        let _ = super::wrapped_history_lines(&state, 40);
+        assert_eq!(
+            state.history_wrap_cache.borrow().source_hash,
+            hash_after_first_draw
+        );
+
+        // New content invalidates the cache.
+        state.entries.push(ChatEntry::Info("new".into()));
+        let _ = super::wrapped_history_lines(&state, 40);
+        assert_ne!(
+            state.history_wrap_cache.borrow().source_hash,
+            hash_after_first_draw
+        );
+
+        // A width change invalidates it too, even with unchanged content.
+        let hash_after_second_draw = state.history_wrap_cache.borrow().source_hash;
+        let _ = super::wrapped_history_lines(&state, 20);
+        assert_eq!(
+            state.history_wrap_cache.borrow().source_hash,
+            hash_after_second_draw
+        );
+        assert_eq!(state.history_wrap_cache.borrow().width, 20);
     }
 
     #[test]
