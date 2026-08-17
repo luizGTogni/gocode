@@ -65,8 +65,7 @@ impl LspClient {
         env: &[(String, String)],
         project_root: &Path,
     ) -> Result<Self, LspError> {
-        let transport: Arc<dyn LspTransport> =
-            Arc::new(StdioTransport::spawn(command, args, env)?);
+        let transport: Arc<dyn LspTransport> = Arc::new(StdioTransport::spawn(command, args, env)?);
         let root_uri = path_to_uri(project_root);
 
         let client = Self {
@@ -340,7 +339,10 @@ mod tests {
 
         let uri = path_to_uri(&path);
         let round_tripped = uri_to_path(&uri).unwrap();
-        assert_eq!(round_tripped.to_string_lossy().replace('\\', "/"), path.to_string_lossy().replace('\\', "/"));
+        assert_eq!(
+            round_tripped.to_string_lossy().replace('\\', "/"),
+            path.to_string_lossy().replace('\\', "/")
+        );
     }
 
     #[test]

@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use gocode_tools::{
     contract::{
-        Tool, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolName, ToolOutput,
-        ToolResult,
+        Tool, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolName, ToolOutput, ToolResult,
     },
     permissions::PermissionAction,
     workspace::resolve_workspace_path,

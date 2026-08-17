@@ -179,7 +179,9 @@ async fn a_turn_that_runs_out_of_tokens_mid_reasoning_warns_instead_of_completin
     // producing any visible text or tool call; the provider reports this as finish_reason
     // "length" with nothing else in the turn.
     let provider = FakeProvider::script(vec![vec![
-        Ok(ChatStreamEvent::ReasoningDelta("thinking forever...".into())),
+        Ok(ChatStreamEvent::ReasoningDelta(
+            "thinking forever...".into(),
+        )),
         Ok(ChatStreamEvent::Finished(FinishReason::Length)),
     ]]);
     let (tx, rx) = mpsc::channel(32);
@@ -189,7 +191,11 @@ async fn a_turn_that_runs_out_of_tokens_mid_reasoning_warns_instead_of_completin
         ToolRegistry::new(),
         PermissionContext::read_only_default(),
     )
-    .run(request(&root, "understand this project"), tx, CancellationToken::new())
+    .run(
+        request(&root, "understand this project"),
+        tx,
+        CancellationToken::new(),
+    )
     .await
     .expect("a truncated turn with no tool calls still completes the run");
 
@@ -215,7 +221,9 @@ async fn a_truncated_turn_that_still_produced_text_does_not_warn() {
     // "produced literally nothing" case this warning targets; don't double-warn on top of the
     // already-visible truncated text.
     let provider = FakeProvider::script(vec![vec![
-        Ok(ChatStreamEvent::TextDelta("Here is what I found so far".into())),
+        Ok(ChatStreamEvent::TextDelta(
+            "Here is what I found so far".into(),
+        )),
         Ok(ChatStreamEvent::Finished(FinishReason::Length)),
     ]]);
     let (tx, rx) = mpsc::channel(32);

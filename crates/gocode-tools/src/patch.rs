@@ -276,8 +276,7 @@ fn find_all_subsequences_fuzzy(haystack: &[String], needle: &[String], from: usi
     }
     (from..=haystack.len() - needle.len())
         .filter(|&start| {
-            (0..needle.len())
-                .all(|i| haystack[start + i].trim_end() == needle[i].trim_end())
+            (0..needle.len()).all(|i| haystack[start + i].trim_end() == needle[i].trim_end())
         })
         .collect()
 }
@@ -660,7 +659,9 @@ mod tests {
         let patch = "*** Begin Patch\n*** Update File: a.txt\n start\n-end\n+END\n*** End Patch";
         let error = apply_patch(&root, patch).unwrap_err();
 
-        assert!(matches!(error, ToolError::InvalidArguments(message) if message.contains("2 locations")));
+        assert!(
+            matches!(error, ToolError::InvalidArguments(message) if message.contains("2 locations"))
+        );
         assert_eq!(
             fs::read_to_string(root.join("a.txt")).unwrap(),
             "start\nend\nmiddle\nstart\nend\n"

@@ -88,9 +88,9 @@ impl StdioTransport {
             .stderr(Stdio::null())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|error| LspError::Transport(format!("failed to spawn '{command}': {error}")))?;
+        let mut child = cmd.spawn().map_err(|error| {
+            LspError::Transport(format!("failed to spawn '{command}': {error}"))
+        })?;
 
         let stdin = child
             .stdin
@@ -181,10 +181,9 @@ impl LspTransport for StdioTransport {
         Box::pin(async move {
             let framed = encode_framed(&notification)?;
             let mut stdin = self.stdin.lock().await;
-            stdin
-                .write_all(&framed)
-                .await
-                .map_err(|error| LspError::Transport(format!("failed to write notification: {error}")))
+            stdin.write_all(&framed).await.map_err(|error| {
+                LspError::Transport(format!("failed to write notification: {error}"))
+            })
         })
     }
 

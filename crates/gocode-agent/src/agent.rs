@@ -337,7 +337,10 @@ impl Agent {
         }
 
         let tool_calls = assembler.finish();
-        if matches!(finish_reason, Some(FinishReason::Length)) && text.is_empty() && tool_calls.is_empty() {
+        if matches!(finish_reason, Some(FinishReason::Length))
+            && text.is_empty()
+            && tool_calls.is_empty()
+        {
             let _ = events
                 .send(AgentEvent::Warning(AgentWarning::TruncatedBeforeContent))
                 .await;

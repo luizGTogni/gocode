@@ -159,13 +159,15 @@ pub fn encode_framed(message: &impl Serialize) -> Result<Vec<u8>, crate::LspErro
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        IncomingMessage, JsonRpcRequest, RequestId, encode_framed, parse_incoming,
-    };
+    use super::{IncomingMessage, JsonRpcRequest, RequestId, encode_framed, parse_incoming};
 
     #[test]
     fn round_trips_a_request() {
-        let request = JsonRpcRequest::new(RequestId::Number(1), "initialize", Some(serde_json::json!({})));
+        let request = JsonRpcRequest::new(
+            RequestId::Number(1),
+            "initialize",
+            Some(serde_json::json!({})),
+        );
         let body = serde_json::to_string(&request).unwrap();
         match parse_incoming(&body).unwrap() {
             IncomingMessage::Request(parsed) => assert_eq!(parsed.method, "initialize"),

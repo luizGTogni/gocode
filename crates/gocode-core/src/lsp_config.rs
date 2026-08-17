@@ -321,7 +321,12 @@ command = "rust-analyzer"
             .into_iter()
             .map(|entry| entry.name)
             .collect();
-        for expected in ["rust-analyzer", "typescript-language-server", "pyright", "gopls"] {
+        for expected in [
+            "rust-analyzer",
+            "typescript-language-server",
+            "pyright",
+            "gopls",
+        ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
     }

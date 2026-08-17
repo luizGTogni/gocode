@@ -5,8 +5,8 @@ mod preferences;
 mod session;
 mod subagent;
 pub use lsp_config::{
-    LspConfig, LspServerEntry, builtin_lsp_defaults, load_or_default_lsp_config,
-    merge_lsp_servers, save_lsp_config,
+    LspConfig, LspServerEntry, builtin_lsp_defaults, load_or_default_lsp_config, merge_lsp_servers,
+    save_lsp_config,
 };
 pub use markdown_doc::{
     CustomCommand, SkillSource, SkillSummary, apply_disabled_skills, load_custom_commands,

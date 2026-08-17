@@ -838,14 +838,14 @@ impl McpRuntime {
 /// built-in defaults (rust-analyzer, typescript-language-server, pyright, gopls) for any
 /// extension the user hasn't configured, filtered to commands actually found on `PATH`.
 fn build_lsp_manager(paths: &PlatformPaths, project: &ProjectContext) -> gocode_lsp::LspManager {
-    let load_layer =
-        |path: &Path, layer: &str| match gocode_core::load_or_default_lsp_config(path) {
-            Ok(config) => config,
-            Err(error) => {
-                tracing::warn!("could not load {layer} lsp.toml: {error}");
-                gocode_core::LspConfig::default()
-            }
-        };
+    let load_layer = |path: &Path, layer: &str| match gocode_core::load_or_default_lsp_config(path)
+    {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!("could not load {layer} lsp.toml: {error}");
+            gocode_core::LspConfig::default()
+        }
+    };
     let global_lsp = load_layer(&paths.lsp_config_path(), "global");
     let project_lsp = load_layer(&project.lsp_config_path(), "project");
     let mut configured = gocode_core::merge_lsp_servers(&global_lsp, &project_lsp);
