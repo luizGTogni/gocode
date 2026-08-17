@@ -3327,6 +3327,13 @@ fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
                 .as_ref()
                 .and_then(|selection| selected_char_range(selection, absolute_index, chars.len()));
             let pad = || Span::styled(" ", user_style);
+            // Fill the rest of the row with styled spaces so the highlight spans the full
+            // content width instead of stopping at the text (a "pill" the width of the panel,
+            // not just the message).
+            let fill = || {
+                let used = chars.len() + 2; // the leading and trailing single-space pads
+                Span::styled(" ".repeat(content_width.saturating_sub(used)), user_style)
+            };
             match selected_range {
                 Some((from, to)) => {
                     let before: String = chars[..from].iter().collect();
@@ -3349,12 +3356,16 @@ fn render_history(frame: &mut Frame, state: &AppState, area: Rect) {
                     spans.push(Span::styled(after, base));
                     if is_user {
                         spans.push(pad());
+                        spans.push(fill());
                     }
                     Line::from(spans)
                 }
-                None if is_user => {
-                    Line::from(vec![pad(), Span::styled(line.clone(), user_style), pad()])
-                }
+                None if is_user => Line::from(vec![
+                    pad(),
+                    Span::styled(line.clone(), user_style),
+                    pad(),
+                    fill(),
+                ]),
                 None => Line::from(line.clone()),
             }
         })
