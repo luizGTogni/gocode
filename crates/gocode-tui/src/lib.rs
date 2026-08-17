@@ -8246,7 +8246,7 @@ mod tests {
 
     #[test]
     fn the_effort_slash_command_resolves_and_skips_the_model_picker() {
-        use super::{handle_effort_picker_event, resolve_slash_command, EFFORT_OPTIONS};
+        use super::{EFFORT_OPTIONS, handle_effort_picker_event, resolve_slash_command};
 
         assert_eq!(resolve_slash_command("/effort"), Some(SlashCommand::Effort));
 
