@@ -2,6 +2,7 @@ mod markdown_doc;
 mod mcp_config;
 mod preferences;
 mod session;
+mod subagent;
 pub use markdown_doc::{
     CustomCommand, SkillSource, SkillSummary, apply_disabled_skills, load_custom_commands,
     load_disabled_skills, load_skills, parse_frontmatter, save_disabled_skills, set_skill_enabled,
@@ -17,6 +18,11 @@ pub use preferences::{
 pub use session::{
     DebugInvestigation, SessionRecord, SessionSummary, SessionTransition, list_sessions,
     load_session, save_session, sessions_dir,
+};
+pub use subagent::{
+    SUBAGENT_SCHEMA_VERSION, SubagentMessage, SubagentMessageRole, SubagentMode, SubagentRecord,
+    SubagentResult, SubagentStatus, list_subagents, load_subagent, recover_interrupted,
+    save_subagent, subagents_dir,
 };
 
 /// Conservative trigger for automatic compaction: the provider's reported input-token count for
@@ -142,7 +148,7 @@ pub struct WorktreeSummary {
 }
 
 /// How permissively an agent run is allowed to act without asking the user first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PermissionMode {
     /// The MVP default: reads and low-risk commands proceed, writes and other commands follow
     /// the existing risk-based policy.

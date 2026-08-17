@@ -13,6 +13,7 @@ mod events;
 mod ids;
 mod limits;
 mod state;
+mod subagent_manager;
 mod toolcalls;
 
 pub use agent::{Agent, AgentRequest};
@@ -21,6 +22,10 @@ pub use events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning};
 pub use ids::AgentRunId;
 pub use limits::{AgentLimit, AgentLimits};
 pub use state::AgentState;
+pub use subagent_manager::{
+    SpawnRequest, SubagentError, SubagentEvent, SubagentLimits, SubagentManager,
+    effective_subagent_mode, parse_result,
+};
 
 #[cfg(test)]
 mod tests;
