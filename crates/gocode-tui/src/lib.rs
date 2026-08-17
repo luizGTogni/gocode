@@ -3951,8 +3951,16 @@ fn run_terminal(
             continue;
         }
 
+        let was_model_picker = state.screen == Screen::ModelPicker;
         if let Some(model) = handle_model_picker_event(&mut state, &terminal_event) {
             send_command(&command_tx, AppCommand::SelectModel(model))?;
+            continue;
+        }
+        if was_model_picker && state.screen != Screen::ModelPicker {
+            // Enter chained straight into the effort picker (see
+            // `handle_model_picker_event`'s `model_flow_pending_effort` branch). Stop here so
+            // the same key press isn't replayed into `handle_effort_picker_event` below, which
+            // would immediately confirm whatever effort happened to be preselected.
             continue;
         }
 
