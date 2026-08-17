@@ -290,6 +290,17 @@ pub struct PendingUndoConflict {
     show_diff: bool,
 }
 
+/// An `/agent apply <id>` or `/agent cleanup <id>` awaiting explicit Y/N confirmation before the
+/// merge or removal is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingAgentConfirm {
+    /// Merge the subagent's worktree branch into the main workspace. `diff` is the already
+    /// computed `git diff`, shown for review before the user decides.
+    Apply { id: String, diff: String },
+    /// Remove the subagent's worktree and metadata. `message` names what will be discarded.
+    Cleanup { id: String, message: String },
+}
+
 /// Which screen the update popup is currently showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateStage {
@@ -724,6 +735,8 @@ pub struct AppState {
     pending_permission: Option<PermissionPrompt>,
     /// A `/worktree remove <target>` awaiting explicit Y/N confirmation before it is sent.
     pending_worktree_removal: Option<String>,
+    /// An `/agent apply` or `/agent cleanup` awaiting explicit Y/N confirmation before it is sent.
+    pending_agent_confirm: Option<PendingAgentConfirm>,
     /// An `/undo` or `/redo` that stopped on a conflicting file, awaiting the user's choice to
     /// cancel, view a diff, or force it through.
     pending_undo_conflict: Option<PendingUndoConflict>,
@@ -896,6 +909,7 @@ impl AppState {
                     && self.activity.is_none()
                     && self.pending_permission.is_none()
                     && self.pending_worktree_removal.is_none()
+                    && self.pending_agent_confirm.is_none()
                     && self.pending_undo_conflict.is_none()
                 {
                     self.pending_update = Some(prompt);
@@ -936,7 +950,7 @@ impl AppState {
             } => self.apply_tool_activity(id, name, *status, detail),
             AppEvent::ToolOutputChunk { id, chunk } => self.append_tool_output(id, chunk),
             AppEvent::FileChanged { path, .. } => self.file_change_buffer.push(path.clone()),
-            AppEvent::AgentWarning(message) | AppEvent::AgentCleanupWarning { message, .. } => {
+            AppEvent::AgentWarning(message) => {
                 self.entries.push(ChatEntry::Warning(message.clone()));
             }
             AppEvent::AgentNotice(message) => {
@@ -945,8 +959,17 @@ impl AppState {
             AppEvent::AgentProgress { line, .. } => {
                 self.entries.push(ChatEntry::Info(line.clone()));
             }
-            AppEvent::AgentDiffReady { diff, .. } => {
-                self.entries.push(ChatEntry::Info(diff.clone()));
+            AppEvent::AgentDiffReady { id, diff } => {
+                self.pending_agent_confirm = Some(PendingAgentConfirm::Apply {
+                    id: id.clone(),
+                    diff: diff.clone(),
+                });
+            }
+            AppEvent::AgentCleanupWarning { id, message } => {
+                self.pending_agent_confirm = Some(PendingAgentConfirm::Cleanup {
+                    id: id.clone(),
+                    message: message.clone(),
+                });
             }
             AppEvent::PermissionRequested {
                 summary,
@@ -1174,6 +1197,7 @@ impl AppState {
         if self.screen == Screen::Chat
             && self.pending_permission.is_none()
             && self.pending_worktree_removal.is_none()
+            && self.pending_agent_confirm.is_none()
             && self.pending_undo_conflict.is_none()
             && self.pending_update.is_none()
             && self.queued_update.is_some()
@@ -2171,6 +2195,8 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
         render_permission_modal(frame, prompt, area);
     } else if let Some(target) = &state.pending_worktree_removal {
         render_worktree_removal_modal(frame, target, area);
+    } else if let Some(prompt) = &state.pending_agent_confirm {
+        render_agent_confirm_modal(frame, prompt, area);
     } else if let Some(prompt) = &state.pending_undo_conflict {
         render_undo_conflict_modal(frame, prompt, area);
     } else if let Some(prompt) = &state.pending_update {
@@ -3108,6 +3134,7 @@ fn render_composer(
 
     let editing = state.pending_permission.is_none()
         && state.pending_worktree_removal.is_none()
+        && state.pending_agent_confirm.is_none()
         && state.pending_undo_conflict.is_none()
         && state.pending_update.is_none()
         && state.blocking_error.is_none();
@@ -3159,6 +3186,32 @@ fn render_worktree_removal_modal(frame: &mut Frame, target: &str, area: Rect) {
         Paragraph::new(content)
             .wrap(Wrap { trim: false })
             .block(Block::default().title("Confirm").borders(Borders::ALL)),
+        modal,
+    );
+}
+
+fn render_agent_confirm_modal(frame: &mut Frame, prompt: &PendingAgentConfirm, area: Rect) {
+    let (title, body, height) = match prompt {
+        PendingAgentConfirm::Apply { id, diff } => (
+            "Apply subagent changes",
+            format!(
+                "Merge subagent {id}'s branch into the current branch?\n\n{diff}\n\n[y] Apply   \
+                 [n] Cancel"
+            ),
+            18,
+        ),
+        PendingAgentConfirm::Cleanup { message, .. } => (
+            "Confirm",
+            format!("{message}\n\n[y] Remove   [n] Cancel"),
+            9,
+        ),
+    };
+    let modal = centered(area, 76, height);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(title).borders(Borders::ALL)),
         modal,
     );
 }
@@ -3404,6 +3457,28 @@ fn run_terminal(
                 state.entries.push(ChatEntry::Info(format!(
                     "Cancelled removing worktree '{target}'."
                 )));
+            }
+            continue;
+        }
+
+        if let Some((action, confirmed)) = handle_agent_confirm_event(&mut state, &terminal_event) {
+            match (action, confirmed) {
+                (AgentConfirmAction::Apply(id), true) => {
+                    send_command(&command_tx, AppCommand::AgentApplyConfirm(id))?;
+                }
+                (AgentConfirmAction::Apply(id), false) => {
+                    state.entries.push(ChatEntry::Info(format!(
+                        "Cancelled applying subagent {id}."
+                    )));
+                }
+                (AgentConfirmAction::Cleanup(id), true) => {
+                    send_command(&command_tx, AppCommand::AgentCleanupConfirm(id))?;
+                }
+                (AgentConfirmAction::Cleanup(id), false) => {
+                    state.entries.push(ChatEntry::Info(format!(
+                        "Cancelled cleaning up subagent {id}."
+                    )));
+                }
             }
             continue;
         }
@@ -4013,6 +4088,7 @@ fn run_terminal(
             && state.blocking_error.is_none()
             && state.pending_permission.is_none()
             && state.pending_worktree_removal.is_none()
+            && state.pending_agent_confirm.is_none()
             && state.pending_undo_conflict.is_none()
             && matches!(
                 terminal_event,
@@ -4300,6 +4376,7 @@ pub fn handle_permission_mode_event(state: &mut AppState, event: &Event) -> Opti
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
         || state.pending_worktree_removal.is_some()
+        || state.pending_agent_confirm.is_some()
         || state.pending_undo_conflict.is_some()
         || state.pending_update.is_some()
     {
@@ -4577,6 +4654,52 @@ pub fn handle_worktree_removal_event(
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             state.pending_worktree_removal = None;
             Some((target, false))
+        }
+        _ => None,
+    }
+}
+
+/// Which pending `/agent` action a [`handle_agent_confirm_event`] outcome refers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentConfirmAction {
+    /// Merge the subagent's worktree branch.
+    Apply(String),
+    /// Remove the subagent's worktree and metadata.
+    Cleanup(String),
+}
+
+/// Applies Y/N confirmation keys to a pending `/agent apply` or `/agent cleanup` prompt.
+///
+/// Returns the action together with `true` on confirmation or `false` on cancellation, clearing
+/// the prompt either way.
+#[must_use]
+pub fn handle_agent_confirm_event(
+    state: &mut AppState,
+    event: &Event,
+) -> Option<(AgentConfirmAction, bool)> {
+    let pending = state.pending_agent_confirm.clone()?;
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+
+    let action = match &pending {
+        PendingAgentConfirm::Apply { id, .. } => AgentConfirmAction::Apply(id.clone()),
+        PendingAgentConfirm::Cleanup { id, .. } => AgentConfirmAction::Cleanup(id.clone()),
+    };
+
+    match code {
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+            state.pending_agent_confirm = None;
+            Some((action, true))
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            state.pending_agent_confirm = None;
+            Some((action, false))
         }
         _ => None,
     }
@@ -5177,6 +5300,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
         || state.pending_worktree_removal.is_some()
+        || state.pending_agent_confirm.is_some()
         || state.pending_undo_conflict.is_some()
         || state.pending_update.is_some()
     {
@@ -5459,11 +5583,12 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
-        AgentInvocation, AppState, ChatEntry, ChatSubmission, HelpTab, InputAction,
-        MAX_VISIBLE_SUGGESTIONS, McpAddStep, McpEventOutcome, McpView, Screen, SkillsEventOutcome,
-        SkillsView, SlashCommand, UpdateEventOutcome, UpdateStage, WorktreeInvocation,
-        classify_event, handle_chat_event, handle_effort_picker_event, handle_help_event,
-        handle_mcp_event, handle_model_picker_event, handle_onboarding_event,
+        AgentConfirmAction, AgentInvocation, AppState, ChatEntry, ChatSubmission, HelpTab,
+        InputAction, MAX_VISIBLE_SUGGESTIONS, McpAddStep, McpEventOutcome, McpView,
+        PendingAgentConfirm, Screen, SkillsEventOutcome, SkillsView, SlashCommand,
+        UpdateEventOutcome, UpdateStage, WorktreeInvocation, classify_event,
+        handle_agent_confirm_event, handle_chat_event, handle_effort_picker_event,
+        handle_help_event, handle_mcp_event, handle_model_picker_event, handle_onboarding_event,
         handle_permission_event, handle_session_picker_event, handle_skills_event,
         handle_update_event, handle_worktree_removal_event, parse_agent_command,
         parse_worktree_command, render, run_with_event_source, slash_suggestions,
@@ -6402,6 +6527,82 @@ mod tests {
         let mut state = AppState {
             screen: Screen::Chat,
             pending_worktree_removal: Some("my-task".into()),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Char('x'))),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_diff_ready_opens_a_confirm_prompt_instead_of_logging_immediately() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::AgentDiffReady {
+            id: "a1b2c3d4".into(),
+            diff: "+added line".into(),
+        });
+        assert_eq!(
+            state.pending_agent_confirm,
+            Some(PendingAgentConfirm::Apply {
+                id: "a1b2c3d4".into(),
+                diff: "+added line".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn agent_cleanup_warning_opens_a_confirm_prompt() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::AgentCleanupWarning {
+            id: "a1b2c3d4".into(),
+            message: "This removes the worktree...".into(),
+        });
+        assert_eq!(
+            state.pending_agent_confirm,
+            Some(PendingAgentConfirm::Cleanup {
+                id: "a1b2c3d4".into(),
+                message: "This removes the worktree...".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn agent_apply_confirmation_resolves_on_yes_and_cancels_on_no() {
+        let mut state = AppState {
+            pending_agent_confirm: Some(PendingAgentConfirm::Apply {
+                id: "a1b2c3d4".into(),
+                diff: "+added line".into(),
+            }),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_agent_confirm_event(&mut state, &press(KeyCode::Char('n'))),
+            Some((AgentConfirmAction::Apply("a1b2c3d4".into()), false))
+        );
+        assert!(state.pending_agent_confirm.is_none());
+
+        state.pending_agent_confirm = Some(PendingAgentConfirm::Apply {
+            id: "a1b2c3d4".into(),
+            diff: "+added line".into(),
+        });
+        assert_eq!(
+            handle_agent_confirm_event(&mut state, &press(KeyCode::Char('y'))),
+            Some((AgentConfirmAction::Apply("a1b2c3d4".into()), true))
+        );
+        assert!(state.pending_agent_confirm.is_none());
+    }
+
+    #[test]
+    fn agent_cleanup_confirmation_blocks_chat_input_while_pending() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            pending_agent_confirm: Some(PendingAgentConfirm::Cleanup {
+                id: "a1b2c3d4".into(),
+                message: "This removes the worktree...".into(),
+            }),
             ..AppState::default()
         };
 

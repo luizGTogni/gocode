@@ -45,10 +45,11 @@ Supervisor + isolated workers, entirely in-process:
 
 ```
 Queued -> Running -> Completed
-                   -> Failed
-                   -> Stopped        (via /agent stop)
-                   -> TimedOut       (per_task_timeout exceeded)
-        (WaitingInput reserved for future turn-based intake; unused in the MVP)
+        <-------->  WaitingInput   (subagent ended a message with `NEEDS_INPUT: <question>`;
+                                     resumes as Running once `/agent message <id> <answer>` lands)
+Running -> Failed
+Running -> Stopped        (via /agent stop)
+Running -> TimedOut       (per_task_timeout exceeded, bounds WaitingInput too)
 
 Any of {Queued, Running, WaitingInput} found on disk at startup -> Interrupted
 ```
@@ -67,7 +68,9 @@ Built by `render_objective` (`subagent_manager.rs`), **not** the supervisor's co
 - the objective, in the supervisor's own words;
 - the project's `AGENTS.md` / `.gocode/instructions.md` content (same as the supervisor loads);
 - the work mode and a request to end the final message with a fenced ` ```json ` block matching
-  `SubagentResult`'s shape.
+  `SubagentResult`'s shape;
+- instructions for pausing instead of guessing: end the message with `NEEDS_INPUT: <question>`
+  (no JSON block) when clarification is needed before the task can continue.
 
 Explicitly **not** included: the supervisor's chat history, secrets, or other subagents' results.
 
@@ -148,35 +151,41 @@ user reviews via `/agents` and discards via `/agent cleanup <id>`.
 | `/agent spawn <task> [--mode research\|plan\|implement\|review] [--model <id>] [--worktree]` | Creates a subagent; prints id/mode/permissions/location once it starts. |
 | `/agents` | Lists id, task, status, elapsed time, model, worktree. |
 | `/agent status <id>` | Current status plus the last few messages. |
-| `/agent message <id> <text>` | Queues a follow-up, delivered at the next `Agent::run` step boundary (see §11.1). |
+| `/agent message <id> <text>` | Queues a follow-up. If the subagent is `WaitingInput` (it asked a `NEEDS_INPUT:` question), this resumes it immediately; otherwise it's delivered at the next `Agent::run` step boundary (see §11.1). |
 | `/agent stop <id>` | Cooperative stop; preserves partial result; never touches the worktree. |
 | `/agent result <id>` | The structured `SubagentResult`. |
-| `/agent apply <id>` / `/agent apply <id> confirm` | Shows the diff, then merges on explicit confirmation. |
-| `/agent cleanup <id>` / `/agent cleanup <id> confirm` | Shows a warning, then removes the worktree + metadata on explicit confirmation. |
+| `/agent apply <id>` | Requests the diff. When it arrives, a modal shows it with `[y] Apply [n] Cancel`; `/agent apply <id> confirm` is an equivalent typed shortcut. |
+| `/agent cleanup <id>` | Requests the warning. When it arrives, a modal shows it with `[y] Remove [n] Cancel`; `/agent cleanup <id> confirm` is an equivalent typed shortcut. |
 
 `<id>` accepts either the full UUID or the 8-character prefix `/agents` displays;
 `SubagentManager::find` resolves it, refusing an ambiguous prefix.
 
+Apply/cleanup confirmation reuses the same `pending_*` modal pattern `/worktree remove` already
+uses (`AppState::pending_agent_confirm`, `handle_agent_confirm_event`,
+`render_agent_confirm_modal`): the modal blocks composer input and every other pending prompt
+gate in the TUI until the user presses `y`/Enter or `n`/Esc, so nothing is ever applied or removed
+without an explicit keypress.
+
 # 11. Known MVP limitations and recommended next increments
 
-1. **Mid-run messaging is not truly mid-turn.** `Agent::run` is one bounded prompt-to-completion
-   call with no injection hook. A subagent's work is modeled as a sequence of `Agent::run` calls;
-   `/agent message` is delivered as the next call's prompt once the current one finishes, not
-   instantly. Acceptable for the MVP; a future increment could add a cancellable
-   "check for new input" point inside `Agent::drive`.
-2. **Apply-time conflict handling is detect-and-abort only.** On a merge conflict, `/agent apply`
-   aborts and reports git's own conflict summary; there is no guided in-TUI resolver. The user
-   resolves manually in the worktree and re-runs `/agent apply`.
-3. **Confirmation is a typed subcommand, not a keyboard modal.** `/agent apply <id> confirm` and
-   `/agent cleanup <id> confirm` require retyping the command rather than a y/n keypress (unlike
-   `/worktree remove`). This avoided touching the several modal-gating call sites spread across
-   `gocode-tui/src/lib.rs`; a follow-up could add a dedicated confirm modal for parity.
-4. **No dedicated popup/list view.** Every `/agent ...` response renders as a chat-log `Info`/
-   `Warning` entry, consistent with how `/debug` already works, rather than a scrollable popup like
-   `/mcp` or `/skills`.
-5. **`WaitingInput` is unused.** The status exists in the model for a future turn-based intake
-   flow but no code currently transitions into it.
-6. **No nested subagents**, by construction (see §2) — not a limitation to lift casually, since the
+1. **Mid-run messaging is still not mid-turn.** `Agent::run` is one bounded prompt-to-completion
+   call with no injection hook, so a message sent while the subagent is mid-tool-call-sequence is
+   only picked up once that whole run finishes producing a final text response. What *is* handled
+   now: a subagent can explicitly pause (see `WaitingInput` below) by ending its message with
+   `NEEDS_INPUT: <question>` instead of guessing or stalling — `/agent message <id> <answer>`
+   resumes it immediately from there, without waiting for any timeout. A subagent that doesn't ask
+   still only sees a queued message after its current run completes. A future increment could add
+   a cancellable "check for new input" point inside `Agent::drive` itself for the fully general
+   case.
+2. **Apply-time conflict resolution is still manual.** `/agent apply` now parses git's own
+   `CONFLICT (...): Merge conflict in <path>` lines into an explicit "Conflicting files:" list
+   (`parse_conflicting_files` in `crates/gocode/src/main.rs`) rather than dumping raw stdout/stderr,
+   but there is still no guided in-TUI resolver — the user resolves manually in the worktree and
+   re-runs `/agent apply`.
+3. **No dedicated popup/list view.** Every `/agent ...` response (other than the apply/cleanup
+   confirm modal) renders as a chat-log `Info`/`Warning` entry, consistent with how `/debug`
+   already works, rather than a scrollable popup like `/mcp` or `/skills`.
+4. **No nested subagents**, by construction (see §2) — not a limitation to lift casually, since the
    spec explicitly requires it stay out of the MVP.
 
 # 12. Example session
@@ -191,21 +200,19 @@ Subagent e5f6a7b8 created — mode: implement, editing, location: /code/gocode-w
 Subagent e5f6a7b8 finished: completed. Added a doc comment explaining the renewal window.
 
 > /agent apply e5f6a7b8
-Diff for subagent e5f6a7b8 (branch subagent-e5f6a7b8):
+[modal] Subagent e5f6a7b8 (branch subagent-e5f6a7b8), merging into main:
 --- a/src/session_store.rs
 +++ b/src/session_store.rs
 @@ ...
-Run `/agent apply e5f6a7b8 confirm` to merge into main, or ignore to cancel.
-
-> /agent apply e5f6a7b8 confirm
+[y] Apply   [n] Cancel
+# user presses 'y'
 Applied subagent e5f6a7b8's changes (merged branch subagent-e5f6a7b8).
 
 > /agent cleanup e5f6a7b8
-This removes the worktree at /code/gocode-worktrees/subagent-e5f6a7b8 (branch subagent-e5f6a7b8).
-Any changes not already applied via `/agent apply e5f6a7b8` will be discarded. Run
-`/agent cleanup e5f6a7b8 confirm` to proceed.
-
-> /agent cleanup e5f6a7b8 confirm
+[modal] This removes the worktree at /code/gocode-worktrees/subagent-e5f6a7b8 (branch
+subagent-e5f6a7b8). Any changes not already applied via `/agent apply e5f6a7b8` will be discarded.
+[y] Remove   [n] Cancel
+# user presses 'y'
 Removed subagent e5f6a7b8.
 ```
 
@@ -214,9 +221,12 @@ Removed subagent e5f6a7b8.
 - `crates/gocode-core/src/subagent.rs` — data model, persistence round-trip, restart recovery.
 - `crates/gocode-agent/src/subagent_manager.rs` — read-only lifecycle, two subagents running
   concurrently, concurrency-cap queueing, timeout, stop-preserves-partial-result, Plan-mode
-  permission denial, structured-result parsing (with and without a valid block).
+  permission denial, structured-result parsing (with and without a valid block), a subagent that
+  asks `NEEDS_INPUT:` pausing at `WaitingInput` and resuming once `/agent message` answers it.
 - `crates/gocode-tui/src/lib.rs` — `/agent`/`/agents` parsing (spawn flags in any order, apply
-  confirm/no-confirm, message text joining, worktree-outside-implement-mode rejection).
+  confirm/no-confirm, message text joining, worktree-outside-implement-mode rejection), and the
+  apply/cleanup confirm modal (opens on `AgentDiffReady`/`AgentCleanupWarning`, resolves on y/n,
+  blocks chat input while pending).
 - `crates/gocode/src/main.rs` — diff computation, a clean merge applying successfully, a
-  conflicting merge aborting without leaving the workspace half-merged, and cleanup removing both
-  the worktree and the persisted record.
+  conflicting merge aborting without leaving the workspace half-merged and reporting a structured
+  conflicting-files list, and cleanup removing both the worktree and the persisted record.

@@ -235,9 +235,7 @@ async fn compute_subagent_diff(
                 result.stdout
             };
             AgentDiffOutcome::Diff(format!(
-                "Diff for subagent {} (branch {branch}):\n\n{diff}\n\nRun `/agent apply {} \
-                 confirm` to merge into {base}, or ignore to cancel.",
-                short_id(id),
+                "Subagent {} (branch {branch}), merging into {base}:\n\n{diff}",
                 short_id(id),
             ))
         }
@@ -290,12 +288,25 @@ async fn apply_subagent_branch(
                     None,
                 )
                 .await;
+            let conflicts = parse_conflicting_files(&result.stdout);
+            let detail = if conflicts.is_empty() {
+                format!("{}\n{}", result.stdout.trim(), result.stderr.trim())
+            } else {
+                format!(
+                    "Conflicting files:\n{}",
+                    conflicts
+                        .iter()
+                        .map(|path| format!("- {path}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
             format!(
                 "Could not apply subagent {}'s changes; the merge was aborted so nothing was \
-                 left half-applied.\n\n{}\n{}",
+                 left half-applied.\n\n{detail}\n\nResolve manually in the subagent's worktree \
+                 and re-run `/agent apply {}`.",
                 short_id(id),
-                result.stdout.trim(),
-                result.stderr.trim(),
+                short_id(id),
             )
         }
         Err(gocode_tools::process::ProcessError::SpawnFailed(message)) => {
@@ -304,22 +315,28 @@ async fn apply_subagent_branch(
     }
 }
 
-/// The warning shown before `/agent cleanup <id> confirm` removes a subagent's worktree.
+/// Extracts the file paths git reports as conflicting from `git merge`'s stdout, e.g. lines like
+/// `CONFLICT (content): Merge conflict in src/foo.rs`. Returns an empty vec (never an error) when
+/// the output doesn't match the expected shape, so callers can fall back to showing it raw.
+fn parse_conflicting_files(merge_stdout: &str) -> Vec<String> {
+    merge_stdout
+        .lines()
+        .filter_map(|line| line.rsplit_once("Merge conflict in "))
+        .map(|(_, path)| path.trim().to_string())
+        .collect()
+}
+
+/// The warning shown before a confirmed `/agent cleanup <id>` removes a subagent's worktree.
 fn cleanup_warning(record: &gocode_core::SubagentRecord) -> String {
     match &record.worktree_path {
         Some(path) => format!(
             "This removes the worktree at {} (branch {}). Any changes not already applied via \
-             `/agent apply {}` will be discarded. Run `/agent cleanup {} confirm` to proceed.",
+             `/agent apply {}` will be discarded.",
             path.display(),
             record.branch.as_deref().unwrap_or("?"),
             short_id(&record.id),
-            short_id(&record.id),
         ),
-        None => format!(
-            "This removes subagent {}'s metadata. Run `/agent cleanup {} confirm` to proceed.",
-            short_id(&record.id),
-            short_id(&record.id),
-        ),
+        None => format!("This removes subagent {}'s metadata.", short_id(&record.id)),
     }
 }
 
@@ -2744,7 +2761,7 @@ mod tests {
     use super::{
         AgentDiffOutcome, application_paths, apply_subagent_branch, cleanup_subagent,
         cleanup_warning, compute_subagent_diff, format_subagent_list, format_subagent_result,
-        format_subagent_status,
+        format_subagent_status, parse_conflicting_files,
     };
 
     #[test]
@@ -2801,6 +2818,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_conflicting_files_from_git_merge_output() {
+        let stdout = "Auto-merging src/lib.rs\n\
+                       CONFLICT (content): Merge conflict in src/lib.rs\n\
+                       CONFLICT (add/add): Merge conflict in docs/README.md\n\
+                       Automatic merge failed; fix conflicts and then commit the result.\n";
+        assert_eq!(
+            parse_conflicting_files(stdout),
+            vec!["src/lib.rs".to_string(), "docs/README.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn parsing_conflicting_files_from_unexpected_output_is_an_empty_list_not_an_error() {
+        assert!(parse_conflicting_files("some unrelated git output\n").is_empty());
+    }
+
+    #[test]
     fn subagent_result_reports_no_result_yet_before_completion() {
         let record = sample_record(gocode_core::SubagentMode::Research);
         assert!(format_subagent_result(&record).contains("no result yet"));
@@ -2830,7 +2864,7 @@ mod tests {
         record.branch = Some("subagent-abc".into());
         let message = cleanup_warning(&record);
         assert!(message.contains("subagent-abc"));
-        assert!(message.contains("confirm"));
+        assert!(message.contains("discarded"));
     }
 
     #[test]
@@ -2890,7 +2924,7 @@ mod tests {
             panic!("expected a diff, got a notice");
         };
         assert!(diff.contains("feature.txt"));
-        assert!(diff.contains("/agent apply sub1 confirm"));
+        assert!(diff.contains("merging into main"));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2920,6 +2954,10 @@ mod tests {
         assert!(
             notice.contains("Could not apply"),
             "unexpected notice: {notice}"
+        );
+        assert!(
+            notice.contains("Conflicting files:") && notice.contains("feature.txt"),
+            "expected a structured conflict list, got: {notice}"
         );
 
         // The abort must leave no merge in progress and no conflict markers on disk.

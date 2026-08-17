@@ -545,6 +545,24 @@ impl SubagentWorker {
                 }
             }
 
+            if let Some(question) = detect_waiting_marker(&last_text) {
+                let mut working = record.clone();
+                working.set_status(SubagentStatus::WaitingInput);
+                self.update(&working).await;
+                let _ = self
+                    .event_tx
+                    .send(SubagentEvent::Progress {
+                        id: record.id.clone(),
+                        line: format!("waiting for input: {}", redact_secrets(&question)),
+                    })
+                    .await;
+
+                prompt = self.await_message(&record.id).await;
+                working.set_status(SubagentStatus::Running);
+                self.update(&working).await;
+                continue;
+            }
+
             let next = self
                 .pending_messages
                 .lock()
@@ -558,6 +576,24 @@ impl SubagentWorker {
         }
 
         (SubagentStatus::Completed, parse_result(&last_text))
+    }
+
+    /// Blocks until a message is queued for `id` via [`SubagentManager::send_message`], then
+    /// returns it. Has no timeout of its own — the caller (`run`) already wraps the whole
+    /// [`Self::drive_turns`] call in a `select!` against the subagent's overall timeout and
+    /// cancellation, so a subagent stuck waiting for an answer is still bounded from the outside.
+    async fn await_message(&self, id: &str) -> String {
+        loop {
+            {
+                let mut pending = self.pending_messages.lock().await;
+                if let Some(queue) = pending.get_mut(id)
+                    && !queue.is_empty()
+                {
+                    return std::mem::take(queue).join("\n");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     async fn finish(
@@ -604,9 +640,25 @@ fn render_objective(record: &SubagentRecord, instructions: Option<&str>) -> Stri
          shape: {\"summary\": string, \"findings\": [string], \"files_read\": [string], \
          \"files_changed\": [string], \"commands_run\": [string], \"tests_run\": [string], \
          \"risks\": [string], \"next_steps\": [string]}. If you cannot complete the objective, \
-         still emit the block with as much of it filled in as you know.",
+         still emit the block with as much of it filled in as you know.\n\n\
+         If you need clarification from the supervisor before you can continue, do not emit \
+         that block yet — instead end your message with a single line: `NEEDS_INPUT: <your \
+         question>`. You will receive the supervisor's answer as your next message and should \
+         continue the task from there.",
     );
     prompt
+}
+
+/// Looks for a `NEEDS_INPUT: <question>` line (see [`render_objective`]), scanning from the last
+/// line since the subagent is instructed to end its message with it. Returns the question text,
+/// or `None` when the subagent's message carries no such line (the common case).
+fn detect_waiting_marker(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("NEEDS_INPUT:"))
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .map(str::to_string)
 }
 
 /// Parses a subagent's final message into a [`SubagentResult`], looking for a fenced `json` code
@@ -988,6 +1040,68 @@ mod tests {
         let result = parse_result("just a plain answer, no structure");
         assert_eq!(result.summary, "just a plain answer, no structure");
         assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn detects_a_needs_input_line_scanning_from_the_end_of_the_message() {
+        assert_eq!(
+            super::detect_waiting_marker(
+                "Looked at the logs.\nNEEDS_INPUT: which environment should I check?"
+            ),
+            Some("which environment should I check?".to_string())
+        );
+        assert_eq!(super::detect_waiting_marker("all done, no questions"), None);
+        assert_eq!(super::detect_waiting_marker("NEEDS_INPUT:   "), None);
+    }
+
+    #[tokio::test]
+    async fn a_subagent_that_asks_for_clarification_pauses_and_resumes_after_a_message() {
+        let dir = fixture("waiting-input");
+        let (tx, _rx) = mpsc::channel(64);
+        let manager = SubagentManager::new(dir.clone(), SubagentLimits::default(), tx);
+
+        let provider: Arc<dyn gocode_core::Provider> = Arc::new(FakeProvider::script(vec![
+            text_turn(
+                "Before I continue, I need to know something.\nNEEDS_INPUT: which environment \
+                 should I check?",
+            ),
+            text_turn("Done. ```json\n{\"summary\": \"checked staging\"}\n```"),
+        ]));
+        let id = manager
+            .spawn(base_request(
+                &dir,
+                "investigate the outage",
+                SubagentMode::Research,
+                provider,
+            ))
+            .await
+            .unwrap();
+
+        let mut reached_waiting = false;
+        for _ in 0..200 {
+            if manager.get(&id).await.map(|record| record.status)
+                == Some(SubagentStatus::WaitingInput)
+            {
+                reached_waiting = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reached_waiting, "subagent never reached WaitingInput");
+
+        manager
+            .send_message(&id, "check staging")
+            .await
+            .expect("message should be accepted while waiting for input");
+
+        let record = wait_for_terminal(&manager, &id).await;
+        assert_eq!(record.status, SubagentStatus::Completed);
+        assert_eq!(
+            record.result.expect("result should be set").summary,
+            "checked staging"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
