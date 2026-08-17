@@ -497,6 +497,10 @@ async fn bridge_agent_events(
                 tool_calls: completion.stats.tool_calls,
                 failed_tool_calls: completion.stats.failed_tool_calls,
                 last_input_tokens: completion.stats.last_input_tokens,
+                partial: !matches!(
+                    completion.termination,
+                    gocode_agent::TerminationReason::Normal
+                ),
             }),
             AgentEvent::Cancelled => Some(gocode_core::AppEvent::AgentCancelled),
         };
@@ -700,6 +704,9 @@ fn describe_warning(warning: &gocode_agent::AgentWarning) -> String {
              (often happens on reasoning models whose thinking alone fills the budget). Try \
              again, or lower the reasoning effort."
                 .to_string()
+        }
+        gocode_agent::AgentWarning::BudgetExhausted(limit) => {
+            format!("Run limit reached ({limit}); wrapping up with a summary of progress so far.")
         }
     }
 }

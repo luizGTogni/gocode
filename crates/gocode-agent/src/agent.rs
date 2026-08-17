@@ -1,7 +1,8 @@
 //! The Agent runtime: a cancellable, multi-turn inference-then-tool loop.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, VecDeque},
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -19,12 +20,54 @@ use tokio::sync::mpsc;
 use crate::{
     context::{RequestContext, build_request},
     error::AgentError,
-    events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning},
+    events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning, TerminationReason},
     ids::AgentRunId,
     limits::{AgentLimit, AgentLimits},
     state::AgentState,
     toolcalls::ToolCallAssembler,
 };
+
+/// Sent as one final no-tools user turn when a safety limit is reached, asking the model to
+/// land the run gracefully instead of ending it silently mid-work.
+const SOFT_LANDING_PROMPT: &str = "You've reached this run's safety budget and must stop now. \
+    Do not request any more tools. Reply with a concise plain-text summary covering: changes \
+    made, validations performed, the current state, and any blockers or remaining steps.";
+
+/// Number of most recent tool calls kept for [`local_budget_summary`]'s fallback report.
+const RECENT_TOOL_LOG_CAPACITY: usize = 5;
+
+/// Assembles a minimal local summary when a safety limit is reached and the model's own
+/// wrap-up inference also fails, so the run still ends with something actionable instead of
+/// nothing at all.
+fn local_budget_summary(
+    limit: AgentLimit,
+    changed_files: &BTreeSet<PathBuf>,
+    recent_tool_log: &VecDeque<String>,
+) -> String {
+    let mut summary = format!(
+        "Run stopped: {limit}. The model could not produce a summary, so here is what's known from the run:\n"
+    );
+
+    if changed_files.is_empty() {
+        summary.push_str("- No files were changed.\n");
+    } else {
+        summary.push_str("- Files changed:\n");
+        for path in changed_files {
+            let _ = writeln!(summary, "  - {}", path.display());
+        }
+    }
+
+    if recent_tool_log.is_empty() {
+        summary.push_str("- No tools were executed.\n");
+    } else {
+        summary.push_str("- Last tool calls:\n");
+        for entry in recent_tool_log {
+            let _ = writeln!(summary, "  - {entry}");
+        }
+    }
+
+    summary
+}
 
 /// Everything one agent run needs beyond the [`Agent`]'s own configuration.
 pub struct AgentRequest {
@@ -151,15 +194,21 @@ impl Agent {
         };
 
         let mut consecutive_failures = 0usize;
-        let mut last_failure_signature: Option<(String, String)> = None;
-        let mut repeat_count = 0usize;
+        let mut last_call_signature: Option<(String, String)> = None;
+        let mut same_call_repeat_count = 0usize;
+        let mut changed_files: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut recent_tool_log: VecDeque<String> = VecDeque::new();
 
-        let final_text = loop {
+        let mut normal_final_text: Option<String> = None;
+        let mut budget_exhausted: Option<AgentLimit> = None;
+
+        'drive: loop {
             if cancellation.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
             if stats.turns >= self.limits.max_turns {
-                return Err(AgentError::LimitReached(AgentLimit::MaxTurns));
+                budget_exhausted = Some(AgentLimit::MaxTurns);
+                break 'drive;
             }
             stats.turns += 1;
             let _ = events
@@ -179,11 +228,13 @@ impl Agent {
             });
 
             if tool_calls.is_empty() {
-                break text.unwrap_or_default();
+                normal_final_text = Some(text.unwrap_or_default());
+                break 'drive;
             }
 
             if stats.tool_calls + tool_calls.len() > self.limits.max_total_tool_calls {
-                return Err(AgentError::LimitReached(AgentLimit::MaxTotalToolCalls));
+                budget_exhausted = Some(AgentLimit::MaxTotalToolCalls);
+                break 'drive;
             }
             if tool_calls.len() > self.limits.max_tool_calls_per_turn {
                 return Err(AgentError::LimitReached(AgentLimit::MaxToolCallsPerTurn));
@@ -206,23 +257,37 @@ impl Agent {
                     .execute_tool(&request, &call, &tool_cancellation, events)
                     .await?;
 
+                // Tracked regardless of success: a model that keeps re-running the same
+                // successful `search`/`read_file` call is just as stuck as one that keeps
+                // failing, and left alone would burn the whole turn budget making no progress.
+                let signature = (call.name.as_str().to_string(), call.arguments.to_string());
+                if last_call_signature.as_ref() == Some(&signature) {
+                    same_call_repeat_count += 1;
+                } else {
+                    last_call_signature = Some(signature);
+                    same_call_repeat_count = 1;
+                }
+
+                let status_label = match tool_result.status {
+                    ToolStatus::Success => "ok",
+                    ToolStatus::Failed => "failed",
+                    ToolStatus::Cancelled => "cancelled",
+                    ToolStatus::Denied => "denied",
+                };
+                recent_tool_log.push_back(format!("{} -> {status_label}", call.name.as_str()));
+                if recent_tool_log.len() > RECENT_TOOL_LOG_CAPACITY {
+                    recent_tool_log.pop_front();
+                }
+
                 if tool_result.status == ToolStatus::Success {
                     consecutive_failures = 0;
-                    repeat_count = 0;
-                    last_failure_signature = None;
                 } else {
                     stats.failed_tool_calls += 1;
                     consecutive_failures += 1;
-                    let signature = (call.name.as_str().to_string(), call.arguments.to_string());
-                    if last_failure_signature.as_ref() == Some(&signature) {
-                        repeat_count += 1;
-                    } else {
-                        last_failure_signature = Some(signature);
-                        repeat_count = 1;
-                    }
                 }
 
                 for change in &tool_result.metadata.affected_files {
+                    changed_files.insert(change.path.clone());
                     let _ = events.send(AgentEvent::FileChanged(change.clone())).await;
 
                     if let Some(observer) = &self.file_change_observer {
@@ -243,18 +308,41 @@ impl Agent {
                 history.push(tool_result_message(&tool_result));
                 let _ = events.send(AgentEvent::ToolFinished(tool_result)).await;
 
-                if repeat_count >= 3 {
+                if same_call_repeat_count >= 3 {
                     let _ = events
                         .send(AgentEvent::Warning(AgentWarning::LoopDetected(
                             call.name.as_str().to_string(),
                         )))
                         .await;
-                    return Err(AgentError::LimitReached(AgentLimit::RepeatedToolCall));
+                    budget_exhausted = Some(AgentLimit::RepeatedToolCall);
+                    break 'drive;
                 }
                 if consecutive_failures >= self.limits.max_consecutive_failures {
-                    return Err(AgentError::LimitReached(AgentLimit::ConsecutiveFailures));
+                    budget_exhausted = Some(AgentLimit::ConsecutiveFailures);
+                    break 'drive;
                 }
             }
+        }
+
+        let (final_text, termination) = if let Some(limit) = budget_exhausted {
+            let summary = self
+                .soft_land(
+                    &request,
+                    &mut history,
+                    limit,
+                    &changed_files,
+                    &recent_tool_log,
+                    &mut stats,
+                    events,
+                    &cancellation,
+                )
+                .await?;
+            (summary, TerminationReason::BudgetExhausted(limit))
+        } else {
+            (
+                normal_final_text.unwrap_or_default(),
+                TerminationReason::Normal,
+            )
         };
 
         Ok(AgentCompletion {
@@ -262,7 +350,63 @@ impl Agent {
             final_text,
             stats,
             history,
+            termination,
         })
+    }
+
+    /// Wraps up a run that hit a safety limit with one final no-tools inference asking the
+    /// model to summarize its progress, so the run ends with an honest partial result instead
+    /// of stopping silently mid-work. Falls back to a locally assembled summary if that
+    /// inference itself fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "internal helper, not part of the public API"
+    )]
+    async fn soft_land(
+        &self,
+        request: &AgentRequest,
+        history: &mut Vec<ChatMessage>,
+        limit: AgentLimit,
+        changed_files: &BTreeSet<PathBuf>,
+        recent_tool_log: &VecDeque<String>,
+        stats: &mut AgentRunStats,
+        events: &mpsc::Sender<AgentEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<String, AgentError> {
+        let _ = events
+            .send(AgentEvent::Warning(AgentWarning::BudgetExhausted(limit)))
+            .await;
+
+        if cancellation.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+
+        history.push(ChatMessage::User(SOFT_LANDING_PROMPT.into()));
+        let _ = events
+            .send(AgentEvent::StateChanged(AgentState::Inference))
+            .await;
+
+        let summary = match self
+            .run_turn(request, history, &[], events, cancellation)
+            .await
+        {
+            Ok((text, _tool_calls, input_tokens)) => {
+                stats.turns += 1;
+                if input_tokens.is_some() {
+                    stats.last_input_tokens = input_tokens;
+                }
+                text.unwrap_or_else(|| local_budget_summary(limit, changed_files, recent_tool_log))
+            }
+            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+            Err(_) => local_budget_summary(limit, changed_files, recent_tool_log),
+        };
+
+        history.push(ChatMessage::Assistant {
+            text: Some(summary.clone()),
+            tool_calls: Vec::new(),
+        });
+
+        Ok(summary)
     }
 
     async fn run_turn(

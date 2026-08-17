@@ -3,7 +3,7 @@
 use gocode_core::ChatMessage;
 use gocode_tools::{FileChange, FileSnapshot, ToolCall, ToolCallId, ToolResult};
 
-use crate::{ids::AgentRunId, state::AgentState};
+use crate::{ids::AgentRunId, limits::AgentLimit, state::AgentState};
 
 /// A fact emitted while an [`crate::Agent`] drives one run.
 ///
@@ -61,6 +61,10 @@ pub enum AgentWarning {
     /// models whose chain-of-thought alone can consume the entire budget, leaving nothing for
     /// the actual answer — without this warning that turn looks like a silent no-op.
     TruncatedBeforeContent,
+    /// A configured safety limit was reached. Rather than ending the run silently, the Agent
+    /// asks the model for one final no-tools summary of progress before completing — this
+    /// warning explains why that summary was requested.
+    BudgetExhausted(AgentLimit),
 }
 
 /// Counters describing one run's shape, useful for diagnostics and the final response.
@@ -88,4 +92,18 @@ pub struct AgentCompletion {
     pub stats: AgentRunStats,
     /// The full conversation transcript after this run, ready to seed the next turn's request.
     pub history: Vec<ChatMessage>,
+    /// Whether the run finished on its own or was wrapped up early by a safety limit. A
+    /// [`TerminationReason::BudgetExhausted`] completion is a best-effort summary, not full
+    /// success — callers should present it as such.
+    pub termination: TerminationReason,
+}
+
+/// How an [`AgentCompletion`] came to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationReason {
+    /// The model stopped requesting tools on its own.
+    Normal,
+    /// A configured safety limit was reached; `final_text` is a best-effort summary produced by
+    /// one final no-tools inference (or, if that also failed, a locally assembled fallback).
+    BudgetExhausted(AgentLimit),
 }

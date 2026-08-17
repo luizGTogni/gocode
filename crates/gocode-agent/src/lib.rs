@@ -20,7 +20,7 @@ mod toolcalls;
 pub use agent::{Agent, AgentRequest};
 pub use agent_spawn_tool::AgentSpawnTool;
 pub use error::AgentError;
-pub use events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning};
+pub use events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning, TerminationReason};
 pub use ids::AgentRunId;
 pub use limits::{AgentLimit, AgentLimits};
 pub use state::AgentState;

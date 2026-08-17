@@ -1135,6 +1135,7 @@ impl AppState {
                 tool_calls,
                 failed_tool_calls,
                 last_input_tokens,
+                partial,
             } => {
                 self.last_input_tokens = *last_input_tokens;
                 self.activity = None;
@@ -1144,8 +1145,9 @@ impl AppState {
                     self.entries.push(ChatEntry::Assistant(text.clone()));
                 }
                 self.flush_file_changes();
+                let status = if *partial { "Stopped early" } else { "Done" };
                 self.entries.push(ChatEntry::Info(format!(
-                    "Done — {turns} turn(s), {tool_calls} tool call(s), {failed_tool_calls} failed."
+                    "{status} — {turns} turn(s), {tool_calls} tool call(s), {failed_tool_calls} failed."
                 )));
                 self.last_submitted_prompt = None;
                 self.show_queued_update();
@@ -6491,6 +6493,7 @@ mod tests {
             tool_calls: 0,
             failed_tool_calls: 0,
             last_input_tokens: None,
+            partial: false,
         });
         assert_eq!(
             state
@@ -7016,6 +7019,7 @@ mod tests {
             tool_calls: 0,
             failed_tool_calls: 0,
             last_input_tokens: None,
+            partial: false,
         });
 
         assert!(
@@ -8434,6 +8438,7 @@ mod tests {
             tool_calls: 0,
             failed_tool_calls: 0,
             last_input_tokens: None,
+            partial: false,
         });
 
         assert_eq!(dispatched, Some("second".into()));

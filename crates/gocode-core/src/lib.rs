@@ -346,7 +346,8 @@ pub enum AppEvent {
         /// Working directory the action would run or write in.
         working_directory: String,
     },
-    /// The agent run finished normally.
+    /// The agent run finished, normally or with a best-effort summary after hitting a safety
+    /// limit (see `partial`).
     AgentCompleted {
         /// The model's final visible response, present only when no delta was streamed.
         final_text: Option<String>,
@@ -360,6 +361,10 @@ pub enum AppEvent {
         /// approximate signal for context usage, since NVIDIA NIM does not expose real
         /// per-model context-window sizes.
         last_input_tokens: Option<u64>,
+        /// `true` when a safety limit cut the run short and `final_text` is a best-effort
+        /// summary rather than the model concluding on its own. The interface should present
+        /// this distinctly from a normal completion, not as full success.
+        partial: bool,
     },
     /// The agent run was cancelled by the user.
     AgentCancelled,

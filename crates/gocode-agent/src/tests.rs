@@ -20,7 +20,9 @@ use gocode_tools::{
 };
 use tokio::sync::mpsc;
 
-use crate::{Agent, AgentError, AgentEvent, AgentLimit, AgentLimits, AgentRequest};
+use crate::{
+    Agent, AgentError, AgentEvent, AgentLimit, AgentLimits, AgentRequest, TerminationReason,
+};
 
 type Script = Vec<Result<ChatStreamEvent, ProviderError>>;
 
@@ -661,8 +663,55 @@ async fn cancellation_before_the_run_starts_stops_it_immediately() {
 }
 
 #[tokio::test]
-async fn max_turns_limit_stops_a_run_that_keeps_requesting_tools() {
+async fn max_turns_limit_lands_softly_with_a_model_produced_summary() {
     let root = fixture("max-turns");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ScriptedTool {
+        name: "loopy",
+        outcome: |id| Ok(ToolResult::success(id, ToolOutput::new("ok"))),
+    }));
+    let provider = FakeProvider::script(vec![
+        tool_call_turn("call-1", "loopy", &serde_json::json!({"n": 1})),
+        text_turn("Summary: made no changes, was still exploring."),
+    ]);
+    let (tx, rx) = mpsc::channel(32);
+    let agent = Agent::new(
+        Arc::new(provider),
+        Arc::new(tools),
+        PermissionContext::read_only_default(),
+        AgentLimits {
+            max_turns: 1,
+            ..AgentLimits::default()
+        },
+    );
+
+    let outcome = agent
+        .run(request(&root, "keep going"), tx, CancellationToken::new())
+        .await
+        .expect("a run that hits max_turns should still land softly and complete");
+
+    assert_eq!(
+        outcome.final_text,
+        "Summary: made no changes, was still exploring."
+    );
+    assert_eq!(
+        outcome.termination,
+        TerminationReason::BudgetExhausted(AgentLimit::MaxTurns)
+    );
+
+    let events = drain(rx).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Warning(crate::AgentWarning::BudgetExhausted(AgentLimit::MaxTurns))
+    )));
+    assert!(matches!(events.last(), Some(AgentEvent::Completed(_))));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn a_soft_landing_inference_that_also_fails_falls_back_to_a_local_summary() {
+    let root = fixture("max-turns-fallback");
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(ScriptedTool {
         name: "loopy",
@@ -686,18 +735,21 @@ async fn max_turns_limit_stops_a_run_that_keeps_requesting_tools() {
 
     let outcome = agent
         .run(request(&root, "keep going"), tx, CancellationToken::new())
-        .await;
+        .await
+        .expect("a failed wrap-up inference should still fall back to a local summary");
 
-    assert!(matches!(
-        outcome,
-        Err(AgentError::LimitReached(AgentLimit::MaxTurns))
-    ));
+    assert_eq!(
+        outcome.termination,
+        TerminationReason::BudgetExhausted(AgentLimit::MaxTurns)
+    );
+    assert!(outcome.final_text.contains("Run stopped"));
+    assert!(outcome.final_text.contains("loopy -> ok"));
 
     fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]
-async fn repeated_identical_failures_trigger_loop_detection() {
+async fn repeated_identical_calls_trigger_loop_detection_and_land_softly() {
     let root = fixture("loop-detection");
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(ScriptedTool {
@@ -709,28 +761,72 @@ async fn repeated_identical_failures_trigger_loop_detection() {
         tool_call_turn("call-1", "always_fails", &same_args),
         tool_call_turn("call-2", "always_fails", &same_args),
         tool_call_turn("call-3", "always_fails", &same_args),
+        text_turn("Gave up after three identical attempts."),
     ]);
     let (tx, rx) = mpsc::channel(32);
 
     let outcome = agent(provider, tools, PermissionContext::read_only_default())
         .run(request(&root, "keep trying"), tx, CancellationToken::new())
-        .await;
+        .await
+        .expect("a detected loop should still land softly and complete");
 
-    assert!(matches!(
-        outcome,
-        Err(AgentError::LimitReached(AgentLimit::RepeatedToolCall))
-    ));
+    assert_eq!(
+        outcome.termination,
+        TerminationReason::BudgetExhausted(AgentLimit::RepeatedToolCall)
+    );
     let events = drain(rx).await;
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::Warning(crate::AgentWarning::LoopDetected(_))
     )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Warning(crate::AgentWarning::BudgetExhausted(
+            AgentLimit::RepeatedToolCall
+        ))
+    )));
+
+    fs::remove_dir_all(root).ok();
+}
+
+/// A repeated call that keeps *succeeding* is just as stuck as one that keeps failing, and
+/// should be caught by the same semantic loop detection rather than running until `max_turns`.
+#[tokio::test]
+async fn repeated_identical_successful_calls_also_trigger_loop_detection() {
+    let root = fixture("loop-detection-success");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ScriptedTool {
+        name: "search",
+        outcome: |id| Ok(ToolResult::success(id, ToolOutput::new("no new results"))),
+    }));
+    let same_args = serde_json::json!({"query": "foo"});
+    let provider = FakeProvider::script(vec![
+        tool_call_turn("call-1", "search", &same_args),
+        tool_call_turn("call-2", "search", &same_args),
+        tool_call_turn("call-3", "search", &same_args),
+        text_turn("Stopped repeating the same search."),
+    ]);
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent(provider, tools, PermissionContext::read_only_default())
+        .run(
+            request(&root, "keep searching"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a detected loop of successful calls should still land softly and complete");
+
+    assert_eq!(
+        outcome.termination,
+        TerminationReason::BudgetExhausted(AgentLimit::RepeatedToolCall)
+    );
 
     fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]
-async fn consecutive_failures_across_different_tools_stop_the_run() {
+async fn consecutive_failures_across_different_tools_land_softly() {
     let root = fixture("consecutive-failures");
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(ScriptedTool {
@@ -749,17 +845,19 @@ async fn consecutive_failures_across_different_tools_stop_the_run() {
         tool_call_turn("call-1", "fails_a", &serde_json::json!({})),
         tool_call_turn("call-2", "fails_b", &serde_json::json!({})),
         tool_call_turn("call-3", "fails_c", &serde_json::json!({})),
+        text_turn("Gave up after three different tools all failed."),
     ]);
     let (tx, _rx) = mpsc::channel(32);
 
     let outcome = agent(provider, tools, PermissionContext::read_only_default())
         .run(request(&root, "try things"), tx, CancellationToken::new())
-        .await;
+        .await
+        .expect("consecutive failures should still land softly and complete");
 
-    assert!(matches!(
-        outcome,
-        Err(AgentError::LimitReached(AgentLimit::ConsecutiveFailures))
-    ));
+    assert_eq!(
+        outcome.termination,
+        TerminationReason::BudgetExhausted(AgentLimit::ConsecutiveFailures)
+    );
 
     fs::remove_dir_all(root).ok();
 }
