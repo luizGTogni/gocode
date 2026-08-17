@@ -23,8 +23,8 @@ impl Default for AgentLimits {
     fn default() -> Self {
         Self {
             max_response_chars: 64 * 1024,
-            max_turns: 20,
-            max_total_tool_calls: 50,
+            max_turns: 100,
+            max_total_tool_calls: 150,
             max_tool_calls_per_turn: 10,
             max_consecutive_failures: 3,
         }
