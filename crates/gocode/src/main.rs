@@ -1015,6 +1015,9 @@ async fn run_application() -> Result<(), AppError> {
         let mut permission_mode = gocode_core::PermissionMode::default();
         let mut auto_compact_enabled = true;
         let mut staged_update: Option<StagedUpdate> = None;
+        // Set once `RestartForUpdate` is handled; installed only after the TUI's final `Exit`
+        // command confirms it has torn down (see the `AppCommand::Exit` arm below).
+        let mut restart_after_exit: Option<StagedUpdate> = None;
         let sessions_dir = gocode_core::sessions_dir(&paths.state_dir);
         let subagents_dir = gocode_core::subagents_dir(&paths.state_dir);
         let (subagent_event_tx, subagent_event_rx) = mpsc::channel::<SubagentEvent>(128);
@@ -1243,7 +1246,7 @@ async fn run_application() -> Result<(), AppError> {
 
         while let Some(command) = driver.command_rx.recv().await {
             match command {
-                AppCommand::Exit => return Ok(None),
+                AppCommand::Exit => return Ok(restart_after_exit.take()),
                 AppCommand::Resize { columns, rows } => driver
                     .event_tx
                     .send(gocode_core::AppEvent::TerminalResized { columns, rows })
@@ -2270,11 +2273,16 @@ async fn run_application() -> Result<(), AppError> {
                     // concurrently. Instead, only signal the TUI to shut down; the actual
                     // install happens after `tokio::join!` below has observed both tasks finish,
                     // so the terminal is guaranteed restored first (see docs/UPDATER.md §47).
+                    //
+                    // Keep looping instead of returning here: the TUI still needs to send its
+                    // own `AppCommand::Exit` once it tears down (see `run_terminal`), and that
+                    // send would fail with a "channel closed" error if this task had already
+                    // dropped `driver.command_rx` by returning early.
+                    restart_after_exit = Some(staged);
                     let _ = driver
                         .event_tx
                         .send(gocode_core::AppEvent::ExitForUpdate)
                         .await;
-                    return Ok(Some(staged));
                 }
                 AppCommand::AgentSpawn {
                     task,
