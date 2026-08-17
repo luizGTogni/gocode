@@ -828,6 +828,62 @@ impl McpRuntime {
     }
 }
 
+/// Builds a language server manager from the merged global+project `lsp.toml`, falling back to
+/// built-in defaults (rust-analyzer, typescript-language-server, pyright, gopls) for any
+/// extension the user hasn't configured, filtered to commands actually found on `PATH`.
+fn build_lsp_manager(paths: &PlatformPaths, project: &ProjectContext) -> gocode_lsp::LspManager {
+    let load_layer =
+        |path: &Path, layer: &str| match gocode_core::load_or_default_lsp_config(path) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!("could not load {layer} lsp.toml: {error}");
+                gocode_core::LspConfig::default()
+            }
+        };
+    let global_lsp = load_layer(&paths.lsp_config_path(), "global");
+    let project_lsp = load_layer(&project.lsp_config_path(), "project");
+    let mut configured = gocode_core::merge_lsp_servers(&global_lsp, &project_lsp);
+
+    let configured_extensions: std::collections::HashSet<String> = configured
+        .iter()
+        .flat_map(|entry| entry.extensions.iter().cloned())
+        .collect();
+    for default_entry in gocode_core::builtin_lsp_defaults() {
+        let covers_new_extension = default_entry
+            .extensions
+            .iter()
+            .any(|extension| !configured_extensions.contains(extension));
+        if covers_new_extension && gocode_lsp::is_command_available(&default_entry.command) {
+            configured.push(default_entry);
+        }
+    }
+
+    let specs = configured
+        .into_iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| gocode_lsp::LspServerSpec {
+            name: entry.name,
+            extensions: entry.extensions,
+            command: entry.command,
+            args: entry.args,
+            env: entry.env.into_iter().collect(),
+        })
+        .collect();
+
+    gocode_lsp::LspManager::new(project.root.clone(), specs)
+}
+
+/// Rebuilds the full tool registry (built-ins + connected MCP servers + the `lsp` tool) after
+/// any change to MCP server connections. The LSP manager itself is long-lived across rebuilds.
+fn build_full_registry(
+    mcp_runtime: &McpRuntime,
+    lsp_manager: &Arc<gocode_lsp::LspManager>,
+) -> ToolRegistry {
+    let mut registry = mcp_runtime.build_registry();
+    registry.register(Arc::new(gocode_lsp::LspTool::new(Arc::clone(lsp_manager))));
+    registry
+}
+
 fn first_line(text: &str, max_chars: usize) -> String {
     let first = text.lines().next().unwrap_or_default();
     if first.chars().count() > max_chars {
@@ -1064,7 +1120,11 @@ async fn run_application() -> Result<(), AppError> {
         let mut active_personality = loaded_preferences.preferences.personality;
         let config_path = paths.config_dir.join("config.toml");
         let mut mcp_runtime = McpRuntime::bootstrap(&paths, &bootstrap.project).await;
-        let mut tool_registry: Arc<ToolRegistry> = Arc::new(mcp_runtime.build_registry());
+        let lsp_manager = Arc::new(build_lsp_manager(&paths, &bootstrap.project));
+        let file_change_observer: Arc<dyn gocode_tools::contract::FileChangeObserver> =
+            Arc::new(gocode_lsp::ArcLspManagerObserver(Arc::clone(&lsp_manager)));
+        let mut tool_registry: Arc<ToolRegistry> =
+            Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
         driver
             .event_tx
             .send(gocode_core::AppEvent::McpServersAvailable(
@@ -1491,7 +1551,8 @@ async fn run_application() -> Result<(), AppError> {
                         tool_registry.clone(),
                         permissions,
                         gocode_agent::AgentLimits::default(),
-                    );
+                    )
+                    .with_file_change_observer(Arc::clone(&file_change_observer));
                     let history_snapshot = current_session.lock().await.history.clone();
                     let prompt = message.clone();
                     let request = AgentRequest {
@@ -1822,7 +1883,7 @@ async fn run_application() -> Result<(), AppError> {
                             )))
                             .await;
                     }
-                    tool_registry = Arc::new(mcp_runtime.build_registry());
+                    tool_registry = Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::McpServersAvailable(
@@ -1837,7 +1898,7 @@ async fn run_application() -> Result<(), AppError> {
                 }
                 AppCommand::McpDisconnect(name) => {
                     mcp_runtime.disconnect(&name);
-                    tool_registry = Arc::new(mcp_runtime.build_registry());
+                    tool_registry = Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::McpServersAvailable(
@@ -1891,7 +1952,7 @@ async fn run_application() -> Result<(), AppError> {
                             )))
                             .await;
                     }
-                    tool_registry = Arc::new(mcp_runtime.build_registry());
+                    tool_registry = Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::McpServersAvailable(
@@ -1982,7 +2043,7 @@ async fn run_application() -> Result<(), AppError> {
                         }
                     }
 
-                    tool_registry = Arc::new(mcp_runtime.build_registry());
+                    tool_registry = Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::McpServersAvailable(

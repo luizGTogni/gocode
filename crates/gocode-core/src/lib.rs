@@ -1,8 +1,13 @@
+mod lsp_config;
 mod markdown_doc;
 mod mcp_config;
 mod preferences;
 mod session;
 mod subagent;
+pub use lsp_config::{
+    LspConfig, LspServerEntry, builtin_lsp_defaults, load_or_default_lsp_config,
+    merge_lsp_servers, save_lsp_config,
+};
 pub use markdown_doc::{
     CustomCommand, SkillSource, SkillSummary, apply_disabled_skills, load_custom_commands,
     load_disabled_skills, load_skills, parse_frontmatter, save_disabled_skills, set_skill_enabled,
@@ -1316,6 +1321,12 @@ impl PlatformPaths {
     pub fn mcp_config_path(&self) -> PathBuf {
         self.config_dir.join("mcp.toml")
     }
+
+    /// Path to the global language server configuration, alongside `config.toml`.
+    #[must_use]
+    pub fn lsp_config_path(&self) -> PathBuf {
+        self.config_dir.join("lsp.toml")
+    }
 }
 
 #[cfg(unix)]
@@ -1406,6 +1417,14 @@ impl ProjectContext {
     #[must_use]
     pub fn mcp_config_path(&self) -> PathBuf {
         self.gocode_dir.join("mcp.toml")
+    }
+
+    /// Path to the project-layer language server configuration, alongside `project.toml`. Not
+    /// created by [`initialize_project`] — servers are opt-in, so this file only exists once one
+    /// has been added.
+    #[must_use]
+    pub fn lsp_config_path(&self) -> PathBuf {
+        self.gocode_dir.join("lsp.toml")
     }
 }
 

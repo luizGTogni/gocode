@@ -15,9 +15,9 @@ pub mod workspace;
 pub mod worktree;
 
 pub use contract::{
-    ChangeKind, FileChange, NullEventSink, Tool, ToolCall, ToolCallId, ToolContext, ToolDefinition,
-    ToolError, ToolEvent, ToolEventSink, ToolFuture, ToolMetadata, ToolName, ToolOutput,
-    ToolResult, ToolStatus,
+    ChangeKind, FileChange, FileChangeObserver, NullEventSink, Tool, ToolCall, ToolCallId,
+    ToolContext, ToolDefinition, ToolError, ToolEvent, ToolEventSink, ToolFuture, ToolMetadata,
+    ToolName, ToolOutput, ToolResult, ToolStatus,
 };
 pub use registry::{ToolRegistry, builtin_registry};
 pub use undo::{

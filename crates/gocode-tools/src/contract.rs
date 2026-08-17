@@ -250,6 +250,16 @@ pub struct FileChange {
     pub kind: ChangeKind,
 }
 
+/// Observer notified whenever a tool call changes a file, so long-lived side services (e.g. an
+/// LSP client keeping a document open) can refresh their own state. Defined here rather than in
+/// `gocode-agent` so the agent crate does not need a compile-time dependency on whichever crate
+/// implements the observer.
+pub trait FileChangeObserver: Send + Sync {
+    /// Called for each [`FileChange`] after the owning tool call completes. Implementations must
+    /// not block; long-running work should be spawned onto a background task.
+    fn notify(&self, project_root: &std::path::Path, change: &FileChange);
+}
+
 /// Progress reported by a long-running tool while it executes.
 #[derive(Debug, Clone)]
 pub enum ToolEvent {

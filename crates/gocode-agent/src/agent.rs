@@ -11,8 +11,8 @@ use gocode_core::{
     Provider, ProviderToolCall,
 };
 use gocode_tools::{
-    FileSnapshot, ToolCall, ToolContext, ToolError, ToolEvent, ToolEventSink, ToolRegistry,
-    ToolResult, ToolStatus, permissions::PermissionContext,
+    FileChangeObserver, FileSnapshot, ToolCall, ToolContext, ToolError, ToolEvent, ToolEventSink,
+    ToolRegistry, ToolResult, ToolStatus, permissions::PermissionContext,
 };
 use tokio::sync::mpsc;
 
@@ -62,6 +62,7 @@ pub struct Agent {
     tools: Arc<ToolRegistry>,
     permissions: PermissionContext,
     limits: AgentLimits,
+    file_change_observer: Option<Arc<dyn FileChangeObserver>>,
 }
 
 impl Agent {
@@ -78,7 +79,16 @@ impl Agent {
             tools,
             permissions,
             limits,
+            file_change_observer: None,
         }
+    }
+
+    /// Attaches an observer notified after every tool call that writes a file (e.g. an LSP
+    /// client keeping open documents in sync). Optional: a run works identically without one.
+    #[must_use]
+    pub fn with_file_change_observer(mut self, observer: Arc<dyn FileChangeObserver>) -> Self {
+        self.file_change_observer = Some(observer);
+        self
     }
 
     /// Drives one complete agent run to completion, cancellation, or failure.
@@ -214,6 +224,10 @@ impl Agent {
 
                 for change in &tool_result.metadata.affected_files {
                     let _ = events.send(AgentEvent::FileChanged(change.clone())).await;
+
+                    if let Some(observer) = &self.file_change_observer {
+                        observer.notify(&request.project_root, change);
+                    }
 
                     let after = read_workspace_file(&request.project_root, &change.path);
                     let before = before_snapshots.get(&change.path).cloned().flatten();
