@@ -273,6 +273,9 @@ pub enum AppEvent {
     ModelSelected(String),
     /// Incremental assistant text normalized from the provider stream.
     AssistantTextDelta(String),
+    /// Incremental reasoning/"thinking" text a reasoning-capable model streamed separately from
+    /// its final answer. Shown to the user but never sent back as conversation history.
+    AssistantReasoningDelta(String),
     /// The persisted `/debug` investigation changed; the interface mirrors it for status/help.
     DebugStateUpdated(DebugInvestigation),
     /// Guided intake is complete and the agent can begin a safe investigation with this prompt.
@@ -1744,6 +1747,9 @@ impl ModelCapabilities {
 pub enum ChatStreamEvent {
     /// Additional visible assistant text.
     TextDelta(String),
+    /// Additional reasoning/"thinking" text, streamed separately from the final answer by
+    /// reasoning-capable models. Not part of the assistant's committed response text.
+    ReasoningDelta(String),
     /// An incremental fragment of one tool call, correlated by `index` until assembled.
     ToolCallDelta(ToolCallDelta),
     /// A provider request identifier safe to retain for diagnostics.

@@ -242,6 +242,10 @@ pub enum ChatEntry {
     User(String),
     /// Assistant text, appended to while a response streams.
     Assistant(String),
+    /// Reasoning/"thinking" text a reasoning-capable model streamed separately from its final
+    /// answer this turn. Shown so a turn that ends without visible answer text isn't silently
+    /// empty, but never sent back as conversation history.
+    Reasoning(String),
     /// One tool call's lifecycle, updated in place as it progresses.
     Tool {
         /// Correlation id shared by the matching start/finish pair.
@@ -782,6 +786,7 @@ pub struct AppState {
     /// entire history from scratch. See `render_history`.
     history_wrap_cache: std::cell::RefCell<HistoryWrapCache>,
     streaming_assistant: bool,
+    streaming_reasoning: bool,
     file_change_buffer: Vec<String>,
     activity: Option<AgentActivityState>,
     pending_permission: Option<PermissionPrompt>,
@@ -955,6 +960,7 @@ impl AppState {
                 self.status = Some(format!("Model: {model}"));
             }
             AppEvent::AssistantTextDelta(delta) => self.push_assistant_delta(delta),
+            AppEvent::AssistantReasoningDelta(delta) => self.push_reasoning_delta(delta),
             AppEvent::DebugStateUpdated(debug) => self.debug.clone_from(debug),
             AppEvent::DebugInvestigationReady(prompt) => return Some(prompt.clone()),
             AppEvent::ProviderFailed(message) => {
@@ -1133,6 +1139,7 @@ impl AppState {
                 self.last_input_tokens = *last_input_tokens;
                 self.activity = None;
                 self.streaming_assistant = false;
+                self.streaming_reasoning = false;
                 if let Some(text) = final_text.as_ref().filter(|text| !text.is_empty()) {
                     self.entries.push(ChatEntry::Assistant(text.clone()));
                 }
@@ -1147,6 +1154,7 @@ impl AppState {
             AppEvent::AgentCancelled => {
                 self.activity = None;
                 self.streaming_assistant = false;
+                self.streaming_reasoning = false;
                 self.pending_permission = None;
                 self.flush_file_changes();
                 self.entries.push(ChatEntry::Info("Cancelled.".into()));
@@ -1188,6 +1196,7 @@ impl AppState {
                 self.entries.clear();
                 self.scroll = 0;
                 self.streaming_assistant = false;
+                self.streaming_reasoning = false;
                 self.file_change_buffer.clear();
                 for message in history {
                     match message {
@@ -1336,6 +1345,17 @@ impl AppState {
         self.streaming_assistant = true;
     }
 
+    fn push_reasoning_delta(&mut self, delta: &str) {
+        if self.streaming_reasoning
+            && let Some(ChatEntry::Reasoning(text)) = self.entries.last_mut()
+        {
+            text.push_str(delta);
+            return;
+        }
+        self.entries.push(ChatEntry::Reasoning(delta.to_string()));
+        self.streaming_reasoning = true;
+    }
+
     fn show_queued_update(&mut self) {
         if self.screen == Screen::Chat
             && self.pending_permission.is_none()
@@ -1446,6 +1466,7 @@ impl AppState {
         self.last_submitted_prompt = Some(prompt);
         self.activity = Some(AgentActivityState::Thinking);
         self.streaming_assistant = false;
+        self.streaming_reasoning = false;
         self.scroll = 0;
     }
 
@@ -1676,6 +1697,9 @@ fn compose_lines_tagged(state: &AppState) -> Vec<(String, LineKind)> {
             ChatEntry::User(text) => push_wrapped(&mut lines, "", text, LineKind::User),
             ChatEntry::Assistant(text) => {
                 push_wrapped(&mut lines, "Gocode: ", text, LineKind::Normal);
+            }
+            ChatEntry::Reasoning(text) => {
+                push_wrapped(&mut lines, "Gocode (thinking): ", text, LineKind::Normal);
             }
             ChatEntry::Tool {
                 name,
@@ -6956,6 +6980,38 @@ mod tests {
         assert_eq!(
             state.entries.last(),
             Some(&ChatEntry::Assistant("Hello".into()))
+        );
+    }
+
+    #[test]
+    fn streaming_reasoning_deltas_append_to_one_entry_and_a_turn_with_only_reasoning_is_not_empty()
+    {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("hi".into());
+
+        state.apply(&AppEvent::AssistantReasoningDelta("hmm".into()));
+        state.apply(&AppEvent::AssistantReasoningDelta(", let me think".into()));
+
+        assert_eq!(
+            state.entries.last(),
+            Some(&ChatEntry::Reasoning("hmm, let me think".into()))
+        );
+
+        state.apply(&AppEvent::AgentCompleted {
+            final_text: None,
+            turns: 1,
+            tool_calls: 0,
+            failed_tool_calls: 0,
+            last_input_tokens: None,
+        });
+
+        assert!(
+            super::compose_lines(&state)
+                .iter()
+                .any(|line| line.contains("hmm, let me think"))
         );
     }
 

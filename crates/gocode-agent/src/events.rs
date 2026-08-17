@@ -19,6 +19,8 @@ pub enum AgentEvent {
     StateChanged(AgentState),
     /// Incremental assistant text produced this turn.
     TextDelta(String),
+    /// Incremental reasoning/"thinking" text produced this turn, separate from the final answer.
+    ReasoningDelta(String),
     /// The model requested a tool call.
     ToolRequested(ToolCall),
     /// Execution began for the given call.

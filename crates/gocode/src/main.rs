@@ -436,6 +436,9 @@ async fn bridge_agent_events(
                 streamed_any_text = true;
                 Some(gocode_core::AppEvent::AssistantTextDelta(delta))
             }
+            AgentEvent::ReasoningDelta(delta) => {
+                Some(gocode_core::AppEvent::AssistantReasoningDelta(delta))
+            }
             AgentEvent::ToolRequested(call) => {
                 let id = call.id.as_str().to_string();
                 let name = call.name.as_str().to_string();

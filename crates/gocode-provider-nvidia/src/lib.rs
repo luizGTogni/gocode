@@ -365,6 +365,18 @@ pub fn map_stream_chunk(payload: &str) -> Result<Vec<ChatStreamEvent>, NvidiaPro
                 events.push(ChatStreamEvent::TextDelta(content.into()));
             }
 
+            // Some reasoning-capable models (served via vLLM/NIM) stream their chain-of-thought
+            // in a separate `reasoning_content` field rather than `content`; without this, a
+            // turn that finishes without producing final-answer text looks completely empty.
+            if let Some(reasoning) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("reasoning_content"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                events.push(ChatStreamEvent::ReasoningDelta(reasoning.into()));
+            }
+
             if let Some(tool_calls) = choice
                 .get("delta")
                 .and_then(|delta| delta.get("tool_calls"))
@@ -505,6 +517,22 @@ mod tests {
             vec![
                 ChatStreamEvent::RequestId("req-123".into()),
                 ChatStreamEvent::TextDelta("Olá".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_reasoning_content_delta_to_a_generic_event() {
+        let event = super::map_stream_chunk(
+            r#"{"id":"req-123","choices":[{"delta":{"reasoning_content":"pensando..."}}]}"#,
+        )
+        .expect("valid NVIDIA chunk should map");
+
+        assert_eq!(
+            event,
+            vec![
+                ChatStreamEvent::RequestId("req-123".into()),
+                ChatStreamEvent::ReasoningDelta("pensando...".into())
             ]
         );
     }

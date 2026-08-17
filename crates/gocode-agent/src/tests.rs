@@ -144,6 +144,35 @@ async fn completes_without_any_tool_call() {
 }
 
 #[tokio::test]
+async fn reasoning_delta_is_forwarded_but_not_added_to_final_text() {
+    let root = fixture("reasoning-delta");
+    let provider = FakeProvider::script(vec![vec![
+        Ok(ChatStreamEvent::ReasoningDelta("hmm, let me think".into())),
+        Ok(ChatStreamEvent::TextDelta("Hello there.".into())),
+        Ok(ChatStreamEvent::Finished(FinishReason::Stop)),
+    ]]);
+    let (tx, rx) = mpsc::channel(32);
+
+    let outcome = agent(
+        provider,
+        ToolRegistry::new(),
+        PermissionContext::read_only_default(),
+    )
+    .run(request(&root, "hi"), tx, CancellationToken::new())
+    .await
+    .expect("a text-only turn should complete the run");
+
+    assert_eq!(outcome.final_text, "Hello there.");
+
+    let events = drain(rx).await;
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::ReasoningDelta(text) if text == "hmm, let me think")
+    ));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn seeded_history_is_preserved_and_extended_with_this_run_and_reported_usage() {
     let root = fixture("seeded-history");
     let mut script = text_turn("Sure, continuing from before.");

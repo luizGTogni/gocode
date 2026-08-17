@@ -295,6 +295,11 @@ impl Agent {
                         text.push_str(&delta);
                         let _ = events.send(AgentEvent::TextDelta(delta)).await;
                     }
+                    Some(Ok(ChatStreamEvent::ReasoningDelta(delta))) => {
+                        // Not accumulated into `text`: reasoning is shown to the user but never
+                        // sent back as conversation history.
+                        let _ = events.send(AgentEvent::ReasoningDelta(delta)).await;
+                    }
                     Some(Ok(ChatStreamEvent::ToolCallDelta(delta))) => {
                         if !assembler.apply(delta) {
                             return Err(AgentError::LimitReached(AgentLimit::ToolCallPayloadTooLarge));
