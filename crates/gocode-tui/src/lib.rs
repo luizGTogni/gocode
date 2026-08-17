@@ -74,8 +74,10 @@ mod preference_tests {
 
     #[test]
     fn parses_debug_description_and_auxiliary_commands() {
-        let mut state = AppState::default();
-        state.screen = Screen::Chat;
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..Default::default()
+        };
         state.set_chat_input("/debug login fails after refresh".into());
         assert_eq!(
             handle_chat_event(
@@ -3835,7 +3837,7 @@ fn run_terminal(
             && key_action_matches(
                 &state.preferences,
                 gocode_core::KeyAction::InterruptExecution,
-                code,
+                *code,
                 *modifiers,
             )
         {
@@ -4063,11 +4065,7 @@ fn run_terminal(
                         }
                         state.entries.push(ChatEntry::Info(body));
                     } else if args[0] == "reset-all" {
-                        if !args.contains(&"--force") {
-                            state.entries.push(ChatEntry::Warning(
-                                "Confirm with `/keymap reset-all --force`.".into(),
-                            ));
-                        } else {
+                        if args.contains(&"--force") {
                             state.preferences.keymap = gocode_core::default_keymap();
                             send_command(
                                 &command_tx,
@@ -4075,6 +4073,10 @@ fn run_terminal(
                             )?;
                             state.entries.push(ChatEntry::Info(
                                 "All shortcuts restored to defaults.".into(),
+                            ));
+                        } else {
+                            state.entries.push(ChatEntry::Warning(
+                                "Confirm with `/keymap reset-all --force`.".into(),
                             ));
                         }
                     } else if args.first() == Some(&"reset") && args.len() == 2 {
@@ -5040,7 +5042,7 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
         _ if key_action_matches(
             &state.preferences,
             gocode_core::KeyAction::Approve,
-            code,
+            *code,
             *modifiers,
         ) || matches!(code, KeyCode::Enter) =>
         {
@@ -5050,7 +5052,7 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
         _ if key_action_matches(
             &state.preferences,
             gocode_core::KeyAction::Reject,
-            code,
+            *code,
             *modifiers,
         ) || matches!(code, KeyCode::Esc) =>
         {
@@ -5969,7 +5971,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     if key_action_matches(
         &state.preferences,
         gocode_core::KeyAction::OpenHelp,
-        code,
+        *code,
         *modifiers,
     ) {
         return Some(ChatSubmission::Command(SlashCommand::Help));
@@ -5977,7 +5979,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     if key_action_matches(
         &state.preferences,
         gocode_core::KeyAction::OpenModelPicker,
-        code,
+        *code,
         *modifiers,
     ) {
         return Some(ChatSubmission::Command(SlashCommand::Model));
@@ -5985,7 +5987,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     if key_action_matches(
         &state.preferences,
         gocode_core::KeyAction::NewConversation,
-        code,
+        *code,
         *modifiers,
     ) {
         return Some(ChatSubmission::Command(SlashCommand::NewSession));
@@ -5993,7 +5995,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     if key_action_matches(
         &state.preferences,
         gocode_core::KeyAction::OpenCommandList,
-        code,
+        *code,
         *modifiers,
     ) {
         state.set_chat_input("/".into());
@@ -6003,26 +6005,26 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     let code = if key_action_matches(
         &state.preferences,
         gocode_core::KeyAction::SendMessage,
-        code,
+        *code,
         *modifiers,
     ) {
         KeyCode::Enter
     } else if key_action_matches(
         &state.preferences,
         gocode_core::KeyAction::HistoryPrevious,
-        code,
+        *code,
         *modifiers,
     ) {
         KeyCode::Up
     } else if key_action_matches(
         &state.preferences,
         gocode_core::KeyAction::HistoryNext,
-        code,
+        *code,
         *modifiers,
     ) {
         KeyCode::Down
     } else {
-        code.clone()
+        *code
     };
 
     let suggestion_count = slash_suggestions(&state.chat_input, &state.custom_commands).len();
@@ -6170,7 +6172,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
 fn key_action_matches(
     preferences: &gocode_core::Preferences,
     action: gocode_core::KeyAction,
-    code: &KeyCode,
+    code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
     let Some(binding) = preferences.keymap.get(&action) else {
@@ -6196,17 +6198,17 @@ fn key_action_matches(
         return false;
     }
     match key {
-        "enter" => *code == KeyCode::Enter,
-        "esc" => *code == KeyCode::Esc,
-        "tab" => *code == KeyCode::Tab,
-        "up" => *code == KeyCode::Up,
-        "down" => *code == KeyCode::Down,
-        "left" => *code == KeyCode::Left,
-        "right" => *code == KeyCode::Right,
-        "f1" => *code == KeyCode::F(1),
-        "f2" => *code == KeyCode::F(2),
-        "f3" => *code == KeyCode::F(3),
-        "f4" => *code == KeyCode::F(4),
+        "enter" => code == KeyCode::Enter,
+        "esc" => code == KeyCode::Esc,
+        "tab" => code == KeyCode::Tab,
+        "up" => code == KeyCode::Up,
+        "down" => code == KeyCode::Down,
+        "left" => code == KeyCode::Left,
+        "right" => code == KeyCode::Right,
+        "f1" => code == KeyCode::F(1),
+        "f2" => code == KeyCode::F(2),
+        "f3" => code == KeyCode::F(3),
+        "f4" => code == KeyCode::F(4),
         one if one.chars().count() == 1 => {
             matches!(code, KeyCode::Char(character) if character.to_string() == one)
         }

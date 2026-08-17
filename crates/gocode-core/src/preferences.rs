@@ -233,6 +233,10 @@ fn normalize(mut preferences: Preferences) -> Preferences {
     preferences
 }
 
+/// # Errors
+///
+/// Returns an error if `preferences` cannot be serialized to TOML or if the
+/// atomic write to `path` fails.
 pub fn save_preferences(path: &Path, preferences: &Preferences) -> Result<(), AppError> {
     let contents = toml::to_string_pretty(preferences).map_err(|error| {
         AppError::Configuration(format!("could not serialize preferences.toml: {error}"))

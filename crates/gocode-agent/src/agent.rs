@@ -17,7 +17,7 @@ use gocode_tools::{
 use tokio::sync::mpsc;
 
 use crate::{
-    context::build_request,
+    context::{RequestContext, build_request},
     error::AgentError,
     events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning},
     ids::AgentRunId,
@@ -260,14 +260,16 @@ impl Agent {
         cancellation: &CancellationToken,
     ) -> Result<(Option<String>, Vec<ToolCall>, Option<u64>), AgentError> {
         let chat_request = build_request(
-            request.model.clone(),
-            request.project_overview.as_deref(),
-            request.instructions.as_deref(),
-            request.skills_summary.as_deref(),
+            RequestContext {
+                model: request.model.clone(),
+                project_overview: request.project_overview.as_deref(),
+                project_instructions: request.instructions.as_deref(),
+                skills_summary: request.skills_summary.as_deref(),
+                reasoning_effort: request.reasoning_effort.clone(),
+                personality: request.personality,
+            },
             history,
             tool_defs.to_vec(),
-            request.reasoning_effort.clone(),
-            request.personality,
         );
 
         let mut stream = self
