@@ -54,18 +54,34 @@ impl Tool for ApplyPatchTool {
                 .await
                 .map_err(|reason| ToolError::PermissionDenied(reason.0))?;
 
-            let changes = patch::apply_patch(&ctx.project_root, &args.patch)?;
+            let applied = patch::apply_patch(&ctx.project_root, &args.patch)?;
 
             let mut content = String::from("Applied patch:\n");
-            for change in &changes {
-                let _ = writeln!(content, "  {:?} {}", change.kind, change.path.display());
+            for entry in &applied {
+                let _ = write!(
+                    content,
+                    "  {:?} {}",
+                    entry.change.kind,
+                    entry.change.path.display()
+                );
+                if entry.fuzzy_hunks > 0 {
+                    let _ = write!(
+                        content,
+                        " ({} hunk(s) matched only after ignoring trailing whitespace \u{2014} \
+                         verify the result)",
+                        entry.fuzzy_hunks
+                    );
+                }
+                content.push('\n');
             }
+
+            let affected_files = applied.iter().map(|entry| entry.change.clone()).collect();
 
             Ok(ToolResult {
                 call_id: ctx.call_id.clone(),
                 status: ToolStatus::Success,
                 metadata: ToolMetadata {
-                    affected_files: changes.clone(),
+                    affected_files,
                     ..ToolMetadata::default()
                 },
                 output: ToolOutput::new(content),

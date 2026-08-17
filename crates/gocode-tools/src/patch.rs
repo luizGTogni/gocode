@@ -254,25 +254,108 @@ fn join_content(lines: &[String], ending: &str, trailing_newline: bool) -> Strin
     joined
 }
 
-fn find_subsequence(haystack: &[String], needle: &[String], from: usize) -> Option<usize> {
+/// Every position in `haystack[from..]` where the exact `needle` subsequence occurs. Collecting
+/// every match (not just the first) is what lets [`locate_hunk`] tell a genuine ambiguity (the
+/// same context appears twice) apart from a clean single match.
+fn find_all_subsequences(haystack: &[String], needle: &[String], from: usize) -> Vec<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
+        return Vec::new();
     }
     (from..=haystack.len() - needle.len())
-        .find(|&start| haystack[start..start + needle.len()] == *needle)
+        .filter(|&start| haystack[start..start + needle.len()] == *needle)
+        .collect()
 }
 
-fn apply_hunks(original: &str, hunks: &[Hunk], display_path: &str) -> Result<String, ToolError> {
-    let split = split_content(original);
+/// Same as [`find_all_subsequences`], but ignoring trailing whitespace on each line. Catches the
+/// most common near-miss a model produces (context copied with different trailing spaces/tabs
+/// than the file actually has) without loosening matching enough to risk landing on the wrong
+/// block.
+fn find_all_subsequences_fuzzy(haystack: &[String], needle: &[String], from: usize) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    (from..=haystack.len() - needle.len())
+        .filter(|&start| {
+            (0..needle.len())
+                .all(|i| haystack[start + i].trim_end() == needle[i].trim_end())
+        })
+        .collect()
+}
+
+/// Whether a hunk's location was found by an exact match or the trailing-whitespace-insensitive
+/// fallback, so the caller can tell the model when a patch was accepted despite not matching
+/// byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchKind {
+    Exact,
+    FuzzyTrailingWhitespace,
+}
+
+/// Locates where `hunk.old_lines` starts in `lines` at or after `cursor`.
+///
+/// Tries an exact match first; a single exact match wins outright. Zero exact matches fall back
+/// to a trailing-whitespace-insensitive search. More than one match at either stage is reported
+/// as ambiguous rather than silently applied to the first occurrence — applying to the wrong one
+/// of several identical blocks is exactly the kind of "quiet corruption" this function exists to
+/// prevent.
+fn locate_hunk(
+    lines: &[String],
+    hunk: &Hunk,
+    cursor: usize,
+    display_path: &str,
+) -> Result<(usize, MatchKind), ToolError> {
+    let exact = find_all_subsequences(lines, &hunk.old_lines, cursor);
+    match exact.len() {
+        1 => return Ok((exact[0], MatchKind::Exact)),
+        n if n > 1 => {
+            return Err(ToolError::InvalidArguments(format!(
+                "patch context in `{display_path}` matches {n} locations in the file; add more \
+                 surrounding context lines to the hunk so it identifies a unique location"
+            )));
+        }
+        _ => {}
+    }
+
+    let fuzzy = find_all_subsequences_fuzzy(lines, &hunk.old_lines, cursor);
+    match fuzzy.len() {
+        1 => Ok((fuzzy[0], MatchKind::FuzzyTrailingWhitespace)),
+        n if n > 1 => Err(ToolError::InvalidArguments(format!(
+            "patch context in `{display_path}` matches {n} locations after ignoring trailing \
+             whitespace; add more surrounding context lines to the hunk so it identifies a \
+             unique location"
+        ))),
+        _ => Err(ToolError::InvalidArguments(format!(
+            "patch could not be applied because the expected context in `{display_path}` no \
+             longer matches the file; read the file again and generate a new patch"
+        ))),
+    }
+}
+
+/// UTF-8 byte order mark some editors and Windows tools prepend to text files. Neither Rust's
+/// `str` matching nor the patch's `+`/`-`/` ` lines account for it, so it must be stripped before
+/// matching and restored after, or the first hunk of a BOM-prefixed file would never match.
+const BOM: char = '\u{feff}';
+
+fn apply_hunks(
+    original: &str,
+    hunks: &[Hunk],
+    display_path: &str,
+) -> Result<(String, usize), ToolError> {
+    let (had_bom, body) = match original.strip_prefix(BOM) {
+        Some(rest) => (true, rest),
+        None => (false, original),
+    };
+
+    let split = split_content(body);
     let mut lines = split.lines;
     let mut cursor = 0;
+    let mut fuzzy_matches = 0;
 
     for hunk in hunks {
-        let Some(position) = find_subsequence(&lines, &hunk.old_lines, cursor) else {
-            return Err(ToolError::InvalidArguments(format!(
-                "patch could not be applied because the expected context in `{display_path}` no longer matches the file; read the file again and generate a new patch"
-            )));
-        };
+        let (position, kind) = locate_hunk(&lines, hunk, cursor, display_path)?;
+        if kind == MatchKind::FuzzyTrailingWhitespace {
+            fuzzy_matches += 1;
+        }
         lines.splice(
             position..position + hunk.old_lines.len(),
             hunk.new_lines.clone(),
@@ -280,7 +363,19 @@ fn apply_hunks(original: &str, hunks: &[Hunk], display_path: &str) -> Result<Str
         cursor = position + hunk.new_lines.len();
     }
 
-    Ok(join_content(&lines, split.ending, split.trailing_newline))
+    let mut result = join_content(&lines, split.ending, split.trailing_newline);
+    if had_bom {
+        result.insert(0, BOM);
+    }
+    Ok((result, fuzzy_matches))
+}
+
+/// A [`FileChange`] plus how many of its hunks (if any) only matched after ignoring trailing
+/// whitespace, so callers can tell the model its patch was accepted but wasn't byte-exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedChange {
+    pub change: FileChange,
+    pub fuzzy_hunks: usize,
 }
 
 /// Applies a `*** Begin Patch` document to the workspace rooted at `project_root`.
@@ -288,14 +383,16 @@ fn apply_hunks(original: &str, hunks: &[Hunk], display_path: &str) -> Result<Str
 /// Every file touched by the patch must resolve inside the workspace. Update sections fail
 /// atomically per-file when their context no longer matches; files already written by earlier
 /// operations in the same patch are not rolled back, matching the documented "prefer atomic
-/// behavior, report explicitly on partial application" guidance.
+/// behavior, report explicitly on partial application" guidance. A pre-existing UTF-8 BOM is
+/// preserved; hunks that only match once trailing whitespace is ignored are applied and reported
+/// back via [`AppliedChange::fuzzy_hunks`] rather than rejected outright.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidArguments`] for a malformed patch or context mismatch,
-/// [`ToolError::OutsideWorkspace`] for a path escaping the project root, and
+/// Returns [`ToolError::InvalidArguments`] for a malformed patch, an ambiguous or missing hunk
+/// context, [`ToolError::OutsideWorkspace`] for a path escaping the project root, and
 /// [`ToolError::NotFound`] when updating or deleting a file that does not exist.
-pub fn apply_patch(project_root: &Path, patch: &str) -> Result<Vec<FileChange>, ToolError> {
+pub fn apply_patch(project_root: &Path, patch: &str) -> Result<Vec<AppliedChange>, ToolError> {
     let operations = parse_patch(patch)?;
     let mut changes = Vec::new();
 
@@ -309,11 +406,14 @@ pub fn apply_patch(project_root: &Path, patch: &str) -> Result<Vec<FileChange>, 
                 let original = std::fs::read_to_string(&resolved).map_err(|error| {
                     ToolError::Io(format!("could not read {}: {error}", resolved.display()))
                 })?;
-                let updated = apply_hunks(&original, &hunks, &path)?;
+                let (updated, fuzzy_hunks) = apply_hunks(&original, &hunks, &path)?;
                 atomic_write_file(&resolved, &updated)?;
-                changes.push(FileChange {
-                    path: PathBuf::from(path),
-                    kind: ChangeKind::Modified,
+                changes.push(AppliedChange {
+                    change: FileChange {
+                        path: PathBuf::from(path),
+                        kind: ChangeKind::Modified,
+                    },
+                    fuzzy_hunks,
                 });
             }
             FileOperation::Add { path, content } => {
@@ -329,9 +429,12 @@ pub fn apply_patch(project_root: &Path, patch: &str) -> Result<Vec<FileChange>, 
                     format!("{}\n", content.join("\n"))
                 };
                 atomic_write_file(&resolved, &joined)?;
-                changes.push(FileChange {
-                    path: PathBuf::from(path),
-                    kind: ChangeKind::Created,
+                changes.push(AppliedChange {
+                    change: FileChange {
+                        path: PathBuf::from(path),
+                        kind: ChangeKind::Created,
+                    },
+                    fuzzy_hunks: 0,
                 });
             }
             FileOperation::Delete { path } => {
@@ -342,9 +445,12 @@ pub fn apply_patch(project_root: &Path, patch: &str) -> Result<Vec<FileChange>, 
                 std::fs::remove_file(&resolved).map_err(|error| {
                     ToolError::Io(format!("could not delete {}: {error}", resolved.display()))
                 })?;
-                changes.push(FileChange {
-                    path: PathBuf::from(path),
-                    kind: ChangeKind::Deleted,
+                changes.push(AppliedChange {
+                    change: FileChange {
+                        path: PathBuf::from(path),
+                        kind: ChangeKind::Deleted,
+                    },
+                    fuzzy_hunks: 0,
                 });
             }
         }
@@ -389,7 +495,8 @@ mod tests {
         let changes = apply_patch(&root, patch).unwrap();
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].kind, ChangeKind::Modified);
+        assert_eq!(changes[0].change.kind, ChangeKind::Modified);
+        assert_eq!(changes[0].fuzzy_hunks, 0);
         assert_eq!(
             fs::read_to_string(root.join("main.rs")).unwrap(),
             "fn main() {\n    println!(\"hello\");\n}\n"
@@ -421,7 +528,7 @@ mod tests {
             "*** Begin Patch\n*** Add File: new_module.rs\n+pub fn hello() {}\n*** End Patch";
         let changes = apply_patch(&root, patch).unwrap();
 
-        assert_eq!(changes[0].kind, ChangeKind::Created);
+        assert_eq!(changes[0].change.kind, ChangeKind::Created);
         assert_eq!(
             fs::read_to_string(root.join("new_module.rs")).unwrap(),
             "pub fn hello() {}\n"
@@ -504,6 +611,61 @@ mod tests {
         let patch = "*** Begin Patch\n*** Delete File: missing.txt\n*** End Patch";
         let error = apply_patch(&root, patch).unwrap_err();
         assert!(matches!(error, ToolError::NotFound(_)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_leading_bom_is_preserved_across_an_update() {
+        let root = fixture("bom");
+        fs::write(root.join("a.txt"), "\u{feff}one\ntwo\nthree\n").unwrap();
+
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n one\n-two\n+TWO\n*** End Patch";
+        apply_patch(&root, patch).unwrap();
+
+        let written = fs::read_to_string(root.join("a.txt")).unwrap();
+        assert!(written.starts_with('\u{feff}'), "BOM should be preserved");
+        assert_eq!(written, "\u{feff}one\nTWO\nthree\n");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_with_mismatched_trailing_whitespace_still_applies_and_is_reported_as_fuzzy() {
+        let root = fixture("fuzzy-trailing-ws");
+        // The file has trailing whitespace the patch's context/removed lines don't reproduce;
+        // an exact match fails but the trailing-whitespace-insensitive fallback finds the
+        // (unique) location. The spliced-in lines come from the patch's own text, so the
+        // context line's trailing whitespace is normalized away as a side effect of applying
+        // at that position.
+        fs::write(root.join("a.txt"), "one  \ntwo\t\nthree\n").unwrap();
+
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n one\n-two\n+TWO\n*** End Patch";
+        let changes = apply_patch(&root, patch).unwrap();
+
+        assert_eq!(changes[0].fuzzy_hunks, 1);
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_context_is_rejected_instead_of_guessing() {
+        let root = fixture("ambiguous");
+        // "start\nend" appears twice; the hunk gives no way to tell which one is meant.
+        fs::write(root.join("a.txt"), "start\nend\nmiddle\nstart\nend\n").unwrap();
+
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n start\n-end\n+END\n*** End Patch";
+        let error = apply_patch(&root, patch).unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(message) if message.contains("2 locations")));
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "start\nend\nmiddle\nstart\nend\n"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 }
