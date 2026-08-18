@@ -3,19 +3,23 @@
 //! See `docs/AGENT.md` §98–102 for the scenario list these are meant to cover.
 
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use gocode_core::{
-    CancellationToken, ChatMessage, ChatStreamEvent, FinishReason, ModelId, ProviderError,
-    ToolCallDelta, Usage, testing::FakeProvider,
+    CancellationToken, ChatMessage, ChatRequest, ChatStreamEvent, FinishReason, ModelId, Provider,
+    ProviderError, ProviderFuture, ToolCallDelta, Usage, testing::FakeProvider,
 };
 use gocode_tools::{
-    Tool, ToolCallId, ToolContext, ToolDefinition, ToolError, ToolFuture, ToolName, ToolOutput,
-    ToolRegistry, ToolResult,
+    ChangeKind, FileChange, Tool, ToolCallId, ToolContext, ToolDefinition, ToolError, ToolFuture,
+    ToolName, ToolOutput, ToolRegistry, ToolResult,
     permissions::{AlwaysDenyResolver, DefaultPermissionPolicy, PermissionContext},
 };
 use tokio::sync::mpsc;
@@ -25,6 +29,48 @@ use crate::{
 };
 
 type Script = Vec<Result<ChatStreamEvent, ProviderError>>;
+
+struct RecordingProvider {
+    turns: Mutex<VecDeque<Script>>,
+    requests: Arc<Mutex<Vec<ChatRequest>>>,
+}
+
+impl RecordingProvider {
+    fn script(turns: Vec<Script>, requests: Arc<Mutex<Vec<ChatRequest>>>) -> Self {
+        Self {
+            turns: Mutex::new(turns.into_iter().collect()),
+            requests,
+        }
+    }
+}
+
+impl Provider for RecordingProvider {
+    fn stream_chat(
+        &self,
+        request: ChatRequest,
+        _cancellation: CancellationToken,
+    ) -> ProviderFuture<'_> {
+        self.requests
+            .lock()
+            .expect("recording provider request lock should not be poisoned")
+            .push(request);
+        Box::pin(async move {
+            let events = self
+                .turns
+                .lock()
+                .expect("recording provider script lock should not be poisoned")
+                .pop_front()
+                .ok_or_else(|| {
+                    ProviderError::InvalidRequest("RecordingProvider script exhausted".into())
+                })?;
+            let (sender, receiver) = mpsc::channel(events.len().max(1));
+            for event in events {
+                let _ = sender.send(event).await;
+            }
+            Ok(receiver)
+        })
+    }
+}
 
 fn text_turn(text: &str) -> Script {
     vec![
@@ -116,6 +162,32 @@ impl Tool for ScriptedTool {
     fn execute(&self, ctx: ToolContext, _input: serde_json::Value) -> ToolFuture<'_> {
         let outcome = self.outcome;
         Box::pin(async move { outcome(ctx.call_id) })
+    }
+}
+
+/// Returns new evidence for every invocation while keeping the tool call itself identical.
+struct ChangingOutputTool {
+    name: &'static str,
+    calls: AtomicUsize,
+}
+
+impl Tool for ChangingOutputTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: ToolName::new(self.name),
+            description: "A test tool that returns fresh evidence each time.".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn execute(&self, ctx: ToolContext, _input: serde_json::Value) -> ToolFuture<'_> {
+        let call_number = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        Box::pin(async move {
+            Ok(ToolResult::success(
+                ctx.call_id,
+                ToolOutput::new(format!("result version {call_number}")),
+            ))
+        })
     }
 }
 
@@ -497,6 +569,315 @@ async fn write_tool_is_denied_without_editing_intent() {
 }
 
 #[tokio::test]
+async fn an_unvalidated_edit_requires_a_final_progress_summary() {
+    let root = fixture("unvalidated-edit");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ScriptedTool {
+        name: "edit_source",
+        outcome: |id| {
+            let mut result = ToolResult::success(id, ToolOutput::new("updated src/lib.rs"));
+            result.metadata.affected_files.push(FileChange {
+                path: PathBuf::from("src/lib.rs"),
+                kind: ChangeKind::Modified,
+            });
+            Ok(result)
+        },
+    }));
+    let provider = FakeProvider::script(vec![
+        tool_call_turn("call-1", "edit_source", &serde_json::json!({})),
+        text_turn("I changed the implementation."),
+        text_turn("The implementation changed, but validation is still pending."),
+    ]);
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent(provider, tools, PermissionContext::read_only_default())
+        .run(
+            request(&root, "fix the implementation"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("an unvalidated edit should still end with an actionable summary");
+
+    assert_eq!(
+        outcome.final_text,
+        "The implementation changed, but validation is still pending."
+    );
+    assert_eq!(outcome.stats.turns, 3);
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn a_non_validation_command_does_not_clear_an_edit_validation_obligation() {
+    let root = fixture("non-validation-command");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ScriptedTool {
+        name: "edit_source",
+        outcome: |id| {
+            let mut result = ToolResult::success(id, ToolOutput::new("updated src/lib.rs"));
+            result.metadata.affected_files.push(FileChange {
+                path: PathBuf::from("src/lib.rs"),
+                kind: ChangeKind::Modified,
+            });
+            Ok(result)
+        },
+    }));
+    tools.register(Arc::new(ScriptedTool {
+        name: "run_command",
+        outcome: |id| {
+            Ok(ToolResult::success(
+                id,
+                ToolOutput::new("working tree is dirty"),
+            ))
+        },
+    }));
+    let provider = FakeProvider::script(vec![
+        tool_call_turn("call-1", "edit_source", &serde_json::json!({})),
+        tool_call_turn(
+            "call-2",
+            "run_command",
+            &serde_json::json!({"program": "git", "args": ["status"]}),
+        ),
+        text_turn("The task is complete."),
+        text_turn("The implementation changed, but no build or test has validated it yet."),
+    ]);
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent(provider, tools, PermissionContext::read_only_default())
+        .run(
+            request(&root, "fix the implementation"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a non-validation command should still lead to an actionable summary");
+
+    assert_eq!(
+        outcome.final_text,
+        "The implementation changed, but no build or test has validated it yet."
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn a_successful_test_command_allows_normal_completion_after_an_edit() {
+    let root = fixture("validated-edit");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ScriptedTool {
+        name: "edit_source",
+        outcome: |id| {
+            let mut result = ToolResult::success(id, ToolOutput::new("updated src/lib.rs"));
+            result.metadata.affected_files.push(FileChange {
+                path: PathBuf::from("src/lib.rs"),
+                kind: ChangeKind::Modified,
+            });
+            Ok(result)
+        },
+    }));
+    tools.register(Arc::new(ScriptedTool {
+        name: "run_command",
+        outcome: |id| Ok(ToolResult::success(id, ToolOutput::new("tests passed"))),
+    }));
+    let provider = FakeProvider::script(vec![
+        tool_call_turn("call-1", "edit_source", &serde_json::json!({})),
+        tool_call_turn(
+            "call-2",
+            "run_command",
+            &serde_json::json!({"program": "cargo", "args": ["test"]}),
+        ),
+        text_turn("Updated src/lib.rs and cargo test passed."),
+    ]);
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent(provider, tools, PermissionContext::read_only_default())
+        .run(
+            request(&root, "fix the implementation"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a successful validation should allow normal completion");
+
+    assert_eq!(outcome.termination, TerminationReason::Normal);
+    assert_eq!(
+        outcome.final_text,
+        "Updated src/lib.rs and cargo test passed."
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn a_failed_validation_blocks_another_edit_until_new_evidence_is_gathered() {
+    let root = fixture("failed-validation-recovery");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ScriptedTool {
+        name: "write_file",
+        outcome: |id| {
+            let mut result = ToolResult::success(id, ToolOutput::new("updated src/lib.rs"));
+            result.metadata.affected_files.push(FileChange {
+                path: PathBuf::from("src/lib.rs"),
+                kind: ChangeKind::Modified,
+            });
+            Ok(result)
+        },
+    }));
+    tools.register(Arc::new(ScriptedTool {
+        name: "run_command",
+        outcome: |id| {
+            let mut result = ToolResult::success(id, ToolOutput::new("test failure"));
+            result.metadata.exit_code = Some(1);
+            Ok(result)
+        },
+    }));
+    let provider = FakeProvider::script(vec![
+        tool_call_turn("call-1", "write_file", &serde_json::json!({})),
+        tool_call_turn(
+            "call-2",
+            "run_command",
+            &serde_json::json!({"program": "cargo", "args": ["test"]}),
+        ),
+        tool_call_turn("call-3", "write_file", &serde_json::json!({})),
+        text_turn("I need to inspect the failing test before trying another edit."),
+    ]);
+    let (tx, rx) = mpsc::channel(32);
+
+    let outcome = agent(provider, tools, PermissionContext::read_only_default())
+        .run(
+            request(&root, "fix the implementation"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the run should retain a partial result after blocking an unsafe recovery edit");
+
+    assert_eq!(outcome.stats.failed_tool_calls, 1);
+    let events = drain(rx).await;
+    let file_changes = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::FileChanged(_)))
+        .count();
+    assert_eq!(file_changes, 1, "the second edit must not execute");
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn a_failed_validation_adds_a_runtime_recovery_reminder_to_the_next_turn() {
+    let root = fixture("recovery-reminder");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ScriptedTool {
+        name: "write_file",
+        outcome: |id| {
+            let mut result = ToolResult::success(id, ToolOutput::new("updated src/lib.rs"));
+            result.metadata.affected_files.push(FileChange {
+                path: PathBuf::from("src/lib.rs"),
+                kind: ChangeKind::Modified,
+            });
+            Ok(result)
+        },
+    }));
+    tools.register(Arc::new(ScriptedTool {
+        name: "run_command",
+        outcome: |id| {
+            let mut result = ToolResult::success(id, ToolOutput::new("test failure: expected 2"));
+            result.metadata.exit_code = Some(1);
+            Ok(result)
+        },
+    }));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider::script(
+        vec![
+            tool_call_turn("call-1", "write_file", &serde_json::json!({})),
+            tool_call_turn(
+                "call-2",
+                "run_command",
+                &serde_json::json!({"program": "cargo", "args": ["test"]}),
+            ),
+            vec![Err(ProviderError::Server {
+                status: Some(500),
+                message: "stop after recording the recovery turn".into(),
+            })],
+        ],
+        Arc::clone(&requests),
+    );
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = Agent::new(
+        Arc::new(provider),
+        Arc::new(tools),
+        PermissionContext::read_only_default(),
+        AgentLimits::default(),
+    )
+    .run(
+        request(&root, "fix the implementation"),
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert!(matches!(outcome, Err(AgentError::Provider(_))));
+    let requests = requests
+        .lock()
+        .expect("recorded requests should remain accessible");
+    let recovery_request = &requests[2];
+    assert!(recovery_request.messages.iter().any(|message| matches!(
+        message,
+        ChatMessage::System(text)
+            if text.contains("Runtime recovery requirement")
+                && text.contains("read_file, search, list_files")
+                && text.contains("test failure: expected 2")
+    )));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn repeated_exploration_with_unchanged_evidence_lands_before_the_hard_turn_limit() {
+    let root = fixture("no-progress");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ScriptedTool {
+        name: "search",
+        outcome: |id| {
+            Ok(ToolResult::success(
+                id,
+                ToolOutput::new("No useful matches found."),
+            ))
+        },
+    }));
+    let provider = FakeProvider::script(vec![
+        tool_call_turn("call-1", "search", &serde_json::json!({"query": "first"})),
+        tool_call_turn("call-2", "search", &serde_json::json!({"query": "second"})),
+        tool_call_turn("call-3", "search", &serde_json::json!({"query": "third"})),
+        text_turn("I stopped because repeated exploration produced no new evidence."),
+    ]);
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent(provider, tools, PermissionContext::read_only_default())
+        .run(
+            request(&root, "find the implementation"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("stalled exploration should still produce a useful summary");
+
+    assert_eq!(
+        outcome.final_text,
+        "I stopped because repeated exploration produced no new evidence."
+    );
+    assert_eq!(
+        outcome.termination,
+        TerminationReason::BudgetExhausted(AgentLimit::NoProgress)
+    );
+    assert_eq!(outcome.stats.turns, 4);
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn medium_risk_command_denied_by_the_resolver_is_reported_as_denied() {
     let root = fixture("command-denied");
     let provider = FakeProvider::script(vec![
@@ -826,6 +1207,39 @@ async fn repeated_identical_successful_calls_also_trigger_loop_detection() {
 }
 
 #[tokio::test]
+async fn repeated_calls_with_new_evidence_do_not_trigger_loop_detection() {
+    let root = fixture("loop-detection-changing-evidence");
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ChangingOutputTool {
+        name: "search",
+        calls: AtomicUsize::new(0),
+    }));
+    let same_args = serde_json::json!({"query": "foo"});
+    let provider = FakeProvider::script(vec![
+        tool_call_turn("call-1", "search", &same_args),
+        tool_call_turn("call-2", "search", &same_args),
+        tool_call_turn("call-3", "search", &same_args),
+        text_turn("Each search returned new evidence."),
+    ]);
+    let (tx, _rx) = mpsc::channel(32);
+
+    let outcome = agent(provider, tools, PermissionContext::read_only_default())
+        .run(
+            request(&root, "keep searching while results change"),
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("fresh evidence should allow the agent to continue");
+
+    assert_eq!(outcome.termination, TerminationReason::Normal);
+    assert_eq!(outcome.final_text, "Each search returned new evidence.");
+    assert_eq!(outcome.stats.tool_calls, 3);
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn consecutive_failures_across_different_tools_land_softly() {
     let root = fixture("consecutive-failures");
     let mut tools = ToolRegistry::new();
@@ -1055,8 +1469,16 @@ async fn a_cancelled_run_still_reports_snapshots_for_tools_that_already_complete
 #[tokio::test]
 async fn reference_flow_completes_a_search_read_patch_and_command_task() {
     let root = fixture("reference-flow");
+    fs::create_dir_all(root.join("src")).expect("fixture source directory should be created");
     fs::write(
-        root.join("auth.rs"),
+        root.join("Cargo.toml"),
+        "[package]\nname = \"reference-flow\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest should be written");
+    fs::write(root.join("src/lib.rs"), "mod auth;\n")
+        .expect("fixture library entrypoint should be written");
+    fs::write(
+        root.join("src/auth.rs"),
         "fn validate_token(token: &str) -> bool {\n    true\n}\n",
     )
     .expect("fixture file should be written");
@@ -1070,22 +1492,22 @@ async fn reference_flow_completes_a_search_read_patch_and_command_task() {
         tool_call_turn(
             "call-2",
             "read_file",
-            &serde_json::json!({"path": "auth.rs"}),
+            &serde_json::json!({"path": "src/auth.rs"}),
         ),
         tool_call_turn(
             "call-3",
             "write_file",
             &serde_json::json!({
-                "path": "auth.rs",
+                "path": "src/auth.rs",
                 "content": "fn validate_token(token: &str) -> bool {\n    !token.is_empty()\n}\n"
             }),
         ),
         tool_call_turn(
             "call-4",
             "run_command",
-            &serde_json::json!({"program": "cargo", "args": ["--version"]}),
+            &serde_json::json!({"program": "cargo", "args": ["test"]}),
         ),
-        text_turn("Fixed token validation in auth.rs. I ran cargo --version to confirm tooling."),
+        text_turn("Fixed token validation in src/auth.rs. cargo test passed."),
     ]);
     let (tx, rx) = mpsc::channel(64);
 
@@ -1095,7 +1517,7 @@ async fn reference_flow_completes_a_search_read_patch_and_command_task() {
         editing_permissions(),
     )
     .run(
-        request(&root, "fix the authentication bug and check tooling"),
+        request(&root, "fix the authentication bug and run the tests"),
         tx,
         CancellationToken::new(),
     )
@@ -1107,7 +1529,7 @@ async fn reference_flow_completes_a_search_read_patch_and_command_task() {
     assert_eq!(outcome.stats.failed_tool_calls, 0);
     assert!(outcome.final_text.contains("Fixed token validation"));
     assert_eq!(
-        fs::read_to_string(root.join("auth.rs")).expect("file should have been rewritten"),
+        fs::read_to_string(root.join("src/auth.rs")).expect("file should have been rewritten"),
         "fn validate_token(token: &str) -> bool {\n    !token.is_empty()\n}\n"
     );
 

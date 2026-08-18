@@ -65,6 +65,9 @@ pub enum AgentWarning {
     /// asks the model for one final no-tools summary of progress before completing — this
     /// warning explains why that summary was requested.
     BudgetExhausted(AgentLimit),
+    /// Multiple exploration calls returned identical evidence, so the run was wrapped up before
+    /// it consumed its full turn budget.
+    NoProgress,
 }
 
 /// Counters describing one run's shape, useful for diagnostics and the final response.

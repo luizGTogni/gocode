@@ -46,6 +46,10 @@ pub enum AgentLimit {
     ConsecutiveFailures,
     /// The same tool call failed with the same arguments repeatedly.
     RepeatedToolCall,
+    /// A source change needs validation before the agent can claim normal completion.
+    ValidationPending,
+    /// Multiple exploration steps returned the same evidence without advancing the task.
+    NoProgress,
     /// Provider stream data exceeded the bounded tool-call assembly budget.
     ToolCallPayloadTooLarge,
 }
@@ -69,6 +73,10 @@ impl fmt::Display for AgentLimit {
             Self::RepeatedToolCall => {
                 formatter.write_str("the same tool call repeated with the same arguments")
             }
+            Self::ValidationPending => {
+                formatter.write_str("a source change still needs validation")
+            }
+            Self::NoProgress => formatter.write_str("exploration stopped producing new evidence"),
             Self::ToolCallPayloadTooLarge => {
                 formatter.write_str("the provider sent an oversized tool-call payload")
             }

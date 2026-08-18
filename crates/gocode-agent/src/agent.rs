@@ -23,6 +23,7 @@ use crate::{
     events::{AgentCompletion, AgentEvent, AgentRunStats, AgentWarning, TerminationReason},
     ids::AgentRunId,
     limits::{AgentLimit, AgentLimits},
+    progress::TaskProgress,
     state::AgentState,
     toolcalls::ToolCallAssembler,
 };
@@ -32,6 +33,15 @@ use crate::{
 const SOFT_LANDING_PROMPT: &str = "You've reached this run's safety budget and must stop now. \
     Do not request any more tools. Reply with a concise plain-text summary covering: changes \
     made, validations performed, the current state, and any blockers or remaining steps.";
+
+const VALIDATION_PENDING_PROMPT: &str = "You changed project files but did not validate them. \
+    Do not request any more tools and do not claim the task is complete. Reply with a concise \
+    plain-text summary covering: changes made, validations performed, the current state, and \
+    the exact validation still required.";
+
+const RECOVERY_EVIDENCE_REQUIRED: &str = "The last validation failed. Before another edit, inspect \
+    the failure with read_file, search, list_files, or diagnostics and use that new evidence to \
+    choose a different fix.";
 
 /// Number of most recent tool calls kept for [`local_budget_summary`]'s fallback report.
 const RECENT_TOOL_LOG_CAPACITY: usize = 5;
@@ -194,10 +204,11 @@ impl Agent {
         };
 
         let mut consecutive_failures = 0usize;
-        let mut last_call_signature: Option<(String, String)> = None;
+        let mut last_call_signature: Option<(String, String, String)> = None;
         let mut same_call_repeat_count = 0usize;
         let mut changed_files: BTreeSet<PathBuf> = BTreeSet::new();
         let mut recent_tool_log: VecDeque<String> = VecDeque::new();
+        let mut progress = TaskProgress::default();
 
         let mut normal_final_text: Option<String> = None;
         let mut budget_exhausted: Option<AgentLimit> = None;
@@ -228,6 +239,10 @@ impl Agent {
             });
 
             if tool_calls.is_empty() {
+                if progress.requires_validation() {
+                    budget_exhausted = Some(AgentLimit::ValidationPending);
+                    break 'drive;
+                }
                 normal_final_text = Some(text.unwrap_or_default());
                 break 'drive;
             }
@@ -253,14 +268,21 @@ impl Agent {
 
                 let before_snapshots = capture_before_snapshots(&request.project_root, &call);
 
-                let tool_result = self
-                    .execute_tool(&request, &call, &tool_cancellation, events)
-                    .await?;
+                let tool_result = if progress.blocks_edit(&call) {
+                    ToolResult::failed(call.id.clone(), RECOVERY_EVIDENCE_REQUIRED)
+                } else {
+                    self.execute_tool(&request, &call, &tool_cancellation, events)
+                        .await?
+                };
+                progress.observe(&call, &tool_result);
 
-                // Tracked regardless of success: a model that keeps re-running the same
-                // successful `search`/`read_file` call is just as stuck as one that keeps
-                // failing, and left alone would burn the whole turn budget making no progress.
-                let signature = (call.name.as_str().to_string(), call.arguments.to_string());
+                // A loop needs both the same request and unchanged evidence. Polling a source
+                // with the same arguments can be a valid investigation when the result changes.
+                let signature = (
+                    call.name.as_str().to_string(),
+                    call.arguments.to_string(),
+                    tool_evidence_signature(&tool_result),
+                );
                 if last_call_signature.as_ref() == Some(&signature) {
                     same_call_repeat_count += 1;
                 } else {
@@ -306,6 +328,9 @@ impl Agent {
                 }
 
                 history.push(tool_result_message(&tool_result));
+                if let Some(reminder) = progress.take_recovery_reminder() {
+                    history.push(ChatMessage::System(reminder));
+                }
                 let _ = events.send(AgentEvent::ToolFinished(tool_result)).await;
 
                 if same_call_repeat_count >= 3 {
@@ -315,6 +340,13 @@ impl Agent {
                         )))
                         .await;
                     budget_exhausted = Some(AgentLimit::RepeatedToolCall);
+                    break 'drive;
+                }
+                if progress.has_no_progress() {
+                    let _ = events
+                        .send(AgentEvent::Warning(AgentWarning::NoProgress))
+                        .await;
+                    budget_exhausted = Some(AgentLimit::NoProgress);
                     break 'drive;
                 }
                 if consecutive_failures >= self.limits.max_consecutive_failures {
@@ -381,7 +413,11 @@ impl Agent {
             return Err(AgentError::Cancelled);
         }
 
-        history.push(ChatMessage::User(SOFT_LANDING_PROMPT.into()));
+        let prompt = match limit {
+            AgentLimit::ValidationPending => VALIDATION_PENDING_PROMPT,
+            _ => SOFT_LANDING_PROMPT,
+        };
+        history.push(ChatMessage::User(prompt.into()));
         let _ = events
             .send(AgentEvent::StateChanged(AgentState::Inference))
             .await;
@@ -635,6 +671,17 @@ fn to_provider_tool_call(call: &ToolCall) -> ProviderToolCall {
         name: call.name.as_str().to_string(),
         arguments: call.arguments.clone(),
     }
+}
+
+fn tool_evidence_signature(result: &ToolResult) -> String {
+    format!(
+        "{:?}\u{0}{:?}\u{0}{}\u{0}{}\u{0}{}",
+        result.status,
+        result.metadata.exit_code,
+        result.metadata.truncated,
+        result.output.truncated,
+        result.output.content,
+    )
 }
 
 fn tool_result_message(result: &ToolResult) -> ChatMessage {

@@ -708,6 +708,9 @@ fn describe_warning(warning: &gocode_agent::AgentWarning) -> String {
         gocode_agent::AgentWarning::BudgetExhausted(limit) => {
             format!("Run limit reached ({limit}); wrapping up with a summary of progress so far.")
         }
+        gocode_agent::AgentWarning::NoProgress => {
+            "Stopped exploration because repeated tool calls produced no new evidence.".to_string()
+        }
     }
 }
 

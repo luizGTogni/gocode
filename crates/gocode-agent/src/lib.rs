@@ -13,6 +13,7 @@ mod error;
 mod events;
 mod ids;
 mod limits;
+mod progress;
 mod state;
 mod subagent_manager;
 mod toolcalls;
