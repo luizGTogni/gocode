@@ -3854,6 +3854,7 @@ fn render_composer(
     suggestions: &[(String, String)],
 ) {
     let theme = active_theme(state);
+    let shell_mode = state.chat_input.starts_with('!');
     let input_display_lines: Vec<&str> = state.chat_input.split('\n').collect();
     let input_line_count = input_display_lines.len();
     let mut lines: Vec<Line> = input_display_lines
@@ -3861,9 +3862,29 @@ fn render_composer(
         .enumerate()
         .map(|(index, line_text)| {
             let prefix = if index == 0 { "> " } else { "  " };
-            Line::from(format!("{prefix}{line_text}"))
+            if index == 0 && shell_mode {
+                let rest = &line_text[1..];
+                Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(
+                        "!",
+                        Style::default()
+                            .fg(theme.danger)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(rest),
+                ])
+            } else {
+                Line::from(format!("{prefix}{line_text}"))
+            }
         })
         .collect();
+    if shell_mode {
+        lines.push(Line::from(Span::styled(
+            "  ! for shell mode",
+            Style::default().fg(theme.danger),
+        )));
+    }
 
     let selected = state
         .suggestion_selected
@@ -3920,9 +3941,9 @@ fn render_composer(
             .style(Style::default().fg(theme.primary).bg(theme.background))
             .wrap(Wrap { trim: false })
             .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.border)),
+                Block::default().borders(Borders::ALL).border_style(
+                    Style::default().fg(if shell_mode { theme.danger } else { theme.border }),
+                ),
             ),
         area,
     );
