@@ -3941,9 +3941,13 @@ fn render_composer(
             .style(Style::default().fg(theme.primary).bg(theme.background))
             .wrap(Wrap { trim: false })
             .block(
-                Block::default().borders(Borders::ALL).border_style(
-                    Style::default().fg(if shell_mode { theme.danger } else { theme.border }),
-                ),
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if shell_mode {
+                        theme.danger
+                    } else {
+                        theme.border
+                    })),
             ),
         area,
     );
@@ -7733,7 +7737,10 @@ mod tests {
             Some(ChatSubmission::Shell("ls -la".into()))
         );
         assert!(state.chat_input.is_empty());
-        assert_eq!(state.prompt_history.last().map(String::as_str), Some("!ls -la"));
+        assert_eq!(
+            state.prompt_history.last().map(String::as_str),
+            Some("!ls -la")
+        );
     }
 
     #[test]
