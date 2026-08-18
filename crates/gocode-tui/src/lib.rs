@@ -17,6 +17,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Gauge, Paragraph, Tabs, Wrap},
 };
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -269,6 +270,184 @@ pub enum ChatEntry {
     Error(String),
     /// A neutral status note (command output, completion summary).
     Info(String),
+}
+
+/// The human-readable stage of one active agent run. This is intentionally derived from visible
+/// work rather than provider internals, so the same experience is available for every provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RunPhase {
+    #[default]
+    Understanding,
+    Changing,
+    Validating,
+    Recovering,
+    Finalizing,
+}
+
+impl RunPhase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Understanding => "Entendendo",
+            Self::Changing => "Alterando",
+            Self::Validating => "Validando",
+            Self::Recovering => "Recuperando",
+            Self::Finalizing => "Finalizando",
+        }
+    }
+}
+
+/// Compact, live run summary displayed above the transcript while the agent is active.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag records an independently visible piece of run evidence"
+)]
+struct RunVisibility {
+    phase: RunPhase,
+    current_action: Option<String>,
+    started_at: Option<Instant>,
+    changed_files: BTreeSet<String>,
+    explored: bool,
+    changed: bool,
+    validation_pending: bool,
+    validation_succeeded: bool,
+}
+
+impl RunVisibility {
+    fn start(&mut self) {
+        *self = Self::default();
+        self.started_at = Some(Instant::now());
+    }
+
+    fn observe_tool(&mut self, name: &str, status: ToolActivityStatus, detail: &str) {
+        self.current_action = Some(if detail.is_empty() || detail == "running" {
+            human_tool_name(name).to_string()
+        } else {
+            detail.to_string()
+        });
+
+        if status == ToolActivityStatus::Failed {
+            self.phase = RunPhase::Recovering;
+            return;
+        }
+        match name {
+            "read_file" | "search" | "list_files" => {
+                self.explored = true;
+                if !self.changed {
+                    self.phase = RunPhase::Understanding;
+                }
+            }
+            "write_file" | "apply_patch" => {
+                self.changed = true;
+                self.validation_pending = true;
+                self.phase = RunPhase::Changing;
+            }
+            "run_command" => {
+                if is_validation_command(detail) {
+                    self.phase = RunPhase::Validating;
+                    if status == ToolActivityStatus::Succeeded {
+                        self.validation_pending = false;
+                        self.validation_succeeded = true;
+                    } else {
+                        self.validation_pending = true;
+                    }
+                } else {
+                    self.phase = RunPhase::Understanding;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_file_change(&mut self, path: &str) {
+        self.changed = true;
+        self.validation_pending = true;
+        self.changed_files.insert(path.to_string());
+    }
+
+    fn plan_line(&self) -> String {
+        let understand = if self.explored {
+            "✓ Entender"
+        } else {
+            "○ Entender"
+        };
+        let change = if self.changed {
+            "✓ Alterar"
+        } else {
+            "○ Alterar"
+        };
+        let validate = if self.phase == RunPhase::Validating {
+            "● Validar"
+        } else if self.validation_succeeded {
+            "✓ Validar"
+        } else {
+            "○ Validar"
+        };
+        format!("Plano: {understand} → {change} → {validate}")
+    }
+
+    fn impact_line(&self) -> String {
+        let files = self.changed_files.len();
+        let file_label = if files == 1 {
+            "arquivo alterado"
+        } else {
+            "arquivos alterados"
+        };
+        let validation = if self.validation_pending {
+            "validação pendente"
+        } else if self.validation_succeeded {
+            "validação concluída"
+        } else {
+            "sem validação necessária"
+        };
+        format!("Impacto: {files} {file_label} · {validation}")
+    }
+
+    fn elapsed_label(&self) -> String {
+        let seconds = self
+            .started_at
+            .map_or(0, |started_at| started_at.elapsed().as_secs());
+        format!("{seconds}s")
+    }
+
+    fn completion_summary(&mut self, partial: bool) -> String {
+        self.phase = RunPhase::Finalizing;
+        let outcome = if partial {
+            "interrompida"
+        } else {
+            "concluída"
+        };
+        format!(
+            "Entrega — execução {outcome}\n  {}\n  {}",
+            self.impact_line(),
+            if self.validation_pending {
+                "Próximo passo: validar as alterações antes de considerar a tarefa concluída."
+            } else {
+                "Próximo passo: revisar o resumo e o diff, se desejar."
+            }
+        )
+    }
+}
+
+fn human_tool_name(name: &str) -> &str {
+    match name {
+        "read_file" => "Lendo arquivo",
+        "search" => "Buscando no projeto",
+        "list_files" => "Listando arquivos",
+        "write_file" => "Editando arquivo",
+        "apply_patch" => "Aplicando alteração",
+        "run_command" => "Executando validação",
+        _ => "Executando ação",
+    }
+}
+
+fn is_validation_command(detail: &str) -> bool {
+    [
+        " test", " check", " clippy", " fmt", " lint", " build", "pytest", "ruff", "tsc", "mypy",
+        " vet",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
 }
 
 /// A pending permission confirmation shown as a modal.
@@ -789,6 +968,8 @@ pub struct AppState {
     streaming_reasoning: bool,
     file_change_buffer: Vec<String>,
     activity: Option<AgentActivityState>,
+    /// Live, user-facing account of the current run's phase, impact, and validation state.
+    run_visibility: RunVisibility,
     pending_permission: Option<PermissionPrompt>,
     /// A `/worktree remove <target>` awaiting explicit Y/N confirmation before it is sent.
     pending_worktree_removal: Option<String>,
@@ -1027,9 +1208,15 @@ impl AppState {
                 name,
                 status,
                 detail,
-            } => self.apply_tool_activity(id, name, *status, detail),
+            } => {
+                self.run_visibility.observe_tool(name, *status, detail);
+                self.apply_tool_activity(id, name, *status, detail);
+            }
             AppEvent::ToolOutputChunk { id, chunk } => self.append_tool_output(id, chunk),
-            AppEvent::FileChanged { path, .. } => self.file_change_buffer.push(path.clone()),
+            AppEvent::FileChanged { path, .. } => {
+                self.run_visibility.observe_file_change(path);
+                self.file_change_buffer.push(path.clone());
+            }
             AppEvent::AgentWarning(message) => {
                 self.entries.push(ChatEntry::Warning(message.clone()));
             }
@@ -1145,6 +1332,9 @@ impl AppState {
                     self.entries.push(ChatEntry::Assistant(text.clone()));
                 }
                 self.flush_file_changes();
+                self.entries.push(ChatEntry::Info(
+                    self.run_visibility.completion_summary(*partial),
+                ));
                 let status = if *partial { "Stopped early" } else { "Done" };
                 self.entries.push(ChatEntry::Info(format!(
                     "{status} — {turns} turn(s), {tool_calls} tool call(s), {failed_tool_calls} failed."
@@ -1159,6 +1349,9 @@ impl AppState {
                 self.streaming_reasoning = false;
                 self.pending_permission = None;
                 self.flush_file_changes();
+                self.entries.push(ChatEntry::Info(
+                    self.run_visibility.completion_summary(true),
+                ));
                 self.entries.push(ChatEntry::Info("Cancelled.".into()));
                 self.last_submitted_prompt = None;
                 self.show_queued_update();
@@ -1477,6 +1670,7 @@ impl AppState {
         self.entries.push(ChatEntry::User(prompt.clone()));
         self.last_submitted_prompt = Some(prompt);
         self.activity = Some(AgentActivityState::Thinking);
+        self.run_visibility.start();
         self.streaming_assistant = false;
         self.streaming_reasoning = false;
         self.scroll = 0;
@@ -1698,6 +1892,25 @@ fn compose_lines_tagged(state: &AppState) -> Vec<(String, LineKind)> {
         .into_iter()
         .map(|line| (line, LineKind::Normal))
         .collect();
+
+    if state.activity.is_some() {
+        let action = state
+            .run_visibility
+            .current_action
+            .as_deref()
+            .unwrap_or("Preparando a tarefa");
+        lines.push((
+            format!(
+                "● {} · {action} · {}",
+                state.run_visibility.phase.label(),
+                state.run_visibility.elapsed_label()
+            ),
+            LineKind::Normal,
+        ));
+        lines.push((state.run_visibility.impact_line(), LineKind::Normal));
+        lines.push((state.run_visibility.plan_line(), LineKind::Normal));
+        lines.push((String::new(), LineKind::Normal));
+    }
 
     if state.entries.is_empty() {
         lines.push(("What can I help you build?".into(), LineKind::Normal));
@@ -6407,14 +6620,14 @@ mod tests {
         AgentConfirmAction, AgentConflictEventOutcome, AgentInvocation, AgentsEventOutcome,
         AgentsView, AppState, ChatEntry, ChatSubmission, ConflictFileState, ConflictResolution,
         HelpTab, InputAction, MAX_VISIBLE_SUGGESTIONS, McpAddStep, McpEventOutcome, McpView,
-        PendingAgentConfirm, PendingAgentConflict, Screen, SkillsEventOutcome, SkillsView,
-        SlashCommand, UpdateEventOutcome, UpdateStage, WorktreeInvocation, classify_event,
-        handle_agent_confirm_event, handle_agent_conflict_event, handle_agents_event,
-        handle_chat_event, handle_effort_picker_event, handle_help_event, handle_mcp_event,
-        handle_model_picker_event, handle_onboarding_event, handle_permission_event,
-        handle_session_picker_event, handle_skills_event, handle_update_event,
-        handle_worktree_removal_event, parse_agent_command, parse_worktree_command, render,
-        run_with_event_source, slash_suggestions,
+        PendingAgentConfirm, PendingAgentConflict, RunPhase, Screen, SkillsEventOutcome,
+        SkillsView, SlashCommand, UpdateEventOutcome, UpdateStage, WorktreeInvocation,
+        classify_event, handle_agent_confirm_event, handle_agent_conflict_event,
+        handle_agents_event, handle_chat_event, handle_effort_picker_event, handle_help_event,
+        handle_mcp_event, handle_model_picker_event, handle_onboarding_event,
+        handle_permission_event, handle_session_picker_event, handle_skills_event,
+        handle_update_event, handle_worktree_removal_event, parse_agent_command,
+        parse_worktree_command, render, run_with_event_source, slash_suggestions,
     };
 
     fn press(code: KeyCode) -> Event {
@@ -6507,6 +6720,58 @@ mod tests {
             UpdateEventOutcome::Rejected
         );
         assert!(state.pending_update.is_none());
+    }
+
+    #[test]
+    fn active_run_shows_phase_current_action_and_validation_impact() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("add a health endpoint".into());
+        state.apply(&AppEvent::ToolActivity {
+            id: "edit-1".into(),
+            name: "apply_patch".into(),
+            status: ToolActivityStatus::Succeeded,
+            detail: "updated src/health.rs".into(),
+        });
+        state.apply(&AppEvent::FileChanged {
+            path: "src/health.rs".into(),
+            kind: "modified".into(),
+        });
+        state.apply(&AppEvent::ToolActivity {
+            id: "test-1".into(),
+            name: "run_command".into(),
+            status: ToolActivityStatus::Started,
+            detail: "cargo test".into(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("progress view should render");
+        let output = buffer_text(&terminal);
+
+        assert!(output.contains("Validando"));
+        assert!(output.contains("cargo test"));
+        assert!(output.contains("1 arquivo alterado"));
+        assert!(output.contains("validação pendente"));
+        assert!(output.contains("0s"));
+    }
+
+    #[test]
+    fn non_validation_command_is_not_presented_as_validation() {
+        let mut state = AppState::default();
+        state.begin_run("inspect repository state".into());
+        state.apply(&AppEvent::ToolActivity {
+            id: "command-1".into(),
+            name: "run_command".into(),
+            status: ToolActivityStatus::Started,
+            detail: "git status".into(),
+        });
+
+        assert_eq!(state.run_visibility.phase, RunPhase::Understanding);
+        assert!(!state.run_visibility.validation_pending);
     }
 
     fn update_prompt_state() -> AppState {
