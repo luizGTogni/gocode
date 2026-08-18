@@ -20,7 +20,9 @@ use gocode_core::{
 use gocode_tools::{
     ChangeKind, FileChange, Tool, ToolCallId, ToolContext, ToolDefinition, ToolError, ToolFuture,
     ToolName, ToolOutput, ToolRegistry, ToolResult,
-    permissions::{AlwaysDenyResolver, DefaultPermissionPolicy, PermissionContext},
+    permissions::{
+        AlwaysDenyResolver, ApprovePermissionPolicy, DefaultPermissionPolicy, PermissionContext,
+    },
 };
 use tokio::sync::mpsc;
 
@@ -107,6 +109,17 @@ fn fixture(name: &str) -> PathBuf {
 fn editing_permissions() -> PermissionContext {
     PermissionContext::new(
         Arc::new(DefaultPermissionPolicy::editing()),
+        Arc::new(AlwaysDenyResolver),
+    )
+}
+
+/// Approve-mode permissions: low-risk commands proceed, medium/high-risk commands pause for the
+/// resolver, which here always denies.
+fn approve_permissions() -> PermissionContext {
+    PermissionContext::new(
+        Arc::new(ApprovePermissionPolicy::new(Arc::new(Mutex::new(
+            std::collections::BTreeSet::new(),
+        )))),
         Arc::new(AlwaysDenyResolver),
     )
 }
@@ -893,7 +906,7 @@ async fn medium_risk_command_denied_by_the_resolver_is_reported_as_denied() {
     let outcome = agent(
         provider,
         gocode_tools::builtin_registry(),
-        editing_permissions(),
+        approve_permissions(),
     )
     .run(request(&root, "install deps"), tx, CancellationToken::new())
     .await
