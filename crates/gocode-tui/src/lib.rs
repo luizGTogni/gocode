@@ -1961,6 +1961,44 @@ fn compose_lines(state: &AppState) -> Vec<String> {
         .collect()
 }
 
+/// Appends a `ChatEntry::Tool` entry's header and (possibly truncated) output lines.
+fn push_tool_entry_lines(
+    lines: &mut Vec<(String, LineKind)>,
+    name: &str,
+    status: ToolActivityStatus,
+    detail: &str,
+    output: &str,
+    expanded: bool,
+) {
+    let marker = match status {
+        ToolActivityStatus::Started => "…",
+        ToolActivityStatus::Succeeded => "✓",
+        ToolActivityStatus::Failed => "✗",
+        ToolActivityStatus::Denied | ToolActivityStatus::Cancelled => "⊘",
+    };
+    lines.push((format!("  {marker} {name}: {detail}"), LineKind::Normal));
+    if output.is_empty() {
+        return;
+    }
+    let output_lines: Vec<&str> = output.lines().collect();
+    let limit = if expanded {
+        EXPANDED_OUTPUT_LINES
+    } else {
+        COLLAPSED_OUTPUT_LINES
+    };
+    for line in output_lines.iter().take(limit) {
+        lines.push((format!("      {line}"), LineKind::Normal));
+    }
+    if output_lines.len() > limit {
+        let hidden = output_lines.len() - limit;
+        let action = if expanded { "collapse" } else { "expand" };
+        lines.push((
+            format!("      … {hidden} more line(s) (Ctrl+O to {action})"),
+            LineKind::Normal,
+        ));
+    }
+}
+
 fn compose_lines_tagged(state: &AppState) -> Vec<(String, LineKind)> {
     let mut lines: Vec<(String, LineKind)> = banner_lines(state)
         .into_iter()
@@ -2017,34 +2055,7 @@ fn compose_lines_tagged(state: &AppState) -> Vec<(String, LineKind)> {
                 output,
                 expanded,
                 ..
-            } => {
-                let marker = match status {
-                    ToolActivityStatus::Started => "…",
-                    ToolActivityStatus::Succeeded => "✓",
-                    ToolActivityStatus::Failed => "✗",
-                    ToolActivityStatus::Denied | ToolActivityStatus::Cancelled => "⊘",
-                };
-                lines.push((format!("  {marker} {name}: {detail}"), LineKind::Normal));
-                if !output.is_empty() {
-                    let output_lines: Vec<&str> = output.lines().collect();
-                    let limit = if *expanded {
-                        EXPANDED_OUTPUT_LINES
-                    } else {
-                        COLLAPSED_OUTPUT_LINES
-                    };
-                    for line in output_lines.iter().take(limit) {
-                        lines.push((format!("      {line}"), LineKind::Normal));
-                    }
-                    if output_lines.len() > limit {
-                        let hidden = output_lines.len() - limit;
-                        let action = if *expanded { "collapse" } else { "expand" };
-                        lines.push((
-                            format!("      … {hidden} more line(s) (Ctrl+O to {action})"),
-                            LineKind::Normal,
-                        ));
-                    }
-                }
-            }
+            } => push_tool_entry_lines(&mut lines, name, *status, detail, output, *expanded),
             ChatEntry::FileChanges(paths) => {
                 lines.push((
                     format!("  Modified files: {}", paths.join(", ")),
@@ -3847,16 +3858,13 @@ fn selected_char_range(
     (from < to).then_some((from, to))
 }
 
-fn render_composer(
-    frame: &mut Frame,
-    state: &AppState,
-    area: Rect,
-    suggestions: &[(String, String)],
-) {
-    let theme = active_theme(state);
-    let shell_mode = state.chat_input.starts_with('!');
-    let input_display_lines: Vec<&str> = state.chat_input.split('\n').collect();
-    let input_line_count = input_display_lines.len();
+/// Builds the composer's input lines, highlighting the leading `!` and appending a shell-mode
+/// hint when the input is a raw shell command line.
+fn composer_input_lines<'a>(
+    input_display_lines: &[&'a str],
+    shell_mode: bool,
+    theme: &ThemeTokens,
+) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = input_display_lines
         .iter()
         .enumerate()
@@ -3885,6 +3893,20 @@ fn render_composer(
             Style::default().fg(theme.danger),
         )));
     }
+    lines
+}
+
+fn render_composer(
+    frame: &mut Frame,
+    state: &AppState,
+    area: Rect,
+    suggestions: &[(String, String)],
+) {
+    let theme = active_theme(state);
+    let shell_mode = state.chat_input.starts_with('!');
+    let input_display_lines: Vec<&str> = state.chat_input.split('\n').collect();
+    let input_line_count = input_display_lines.len();
+    let mut lines: Vec<Line> = composer_input_lines(&input_display_lines, shell_mode, &theme);
 
     let selected = state
         .suggestion_selected

@@ -130,8 +130,6 @@ fn is_validation_call(call: &ToolCall) -> bool {
     match program {
         "cargo" => matches!(first, "build" | "check" | "clippy" | "fmt" | "test"),
         "go" => matches!(first, "build" | "test" | "vet"),
-        "pytest" | "ruff" | "eslint" | "tsc" | "mypy" | "gradle" | "./gradlew" | "mvn"
-        | "./mvnw" => true,
         "npm" | "pnpm" | "yarn" | "bun" => {
             matches!(first, "test" | "build" | "lint" | "check")
                 || (first == "run" && matches!(second, "test" | "build" | "lint" | "check"))
@@ -139,8 +137,9 @@ fn is_validation_call(call: &ToolCall) -> bool {
         // A project with no test/build script (e.g. a bare dev server) has no other way to
         // clear validation_pending; hitting the running endpoint is the validation for that
         // shape of project. Kept last so ecosystem-specific commands above stay authoritative.
-        "curl" | "wget" | "http" | "https" | "Invoke-WebRequest" | "Invoke-RestMethod" | "iwr"
-        | "irm" => true,
+        "pytest" | "ruff" | "eslint" | "tsc" | "mypy" | "gradle" | "./gradlew" | "mvn"
+        | "./mvnw" | "curl" | "wget" | "http" | "https" | "Invoke-WebRequest"
+        | "Invoke-RestMethod" | "iwr" | "irm" => true,
         _ => false,
     }
 }
