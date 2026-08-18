@@ -22,7 +22,7 @@ use gocode_tools::{
         DefaultPermissionPolicy, PermissionContext, PermissionPolicy, PermissionRequest,
         PermissionResolver, PlanPermissionPolicy, ResolveFuture,
     },
-    process::{CommandRequest, ProcessRunner, TokioProcessRunner},
+    process::{CommandRequest, ProcessOutcome, ProcessRunner, TokioProcessRunner},
     worktree,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -1762,6 +1762,92 @@ async fn run_application() -> Result<(), AppError> {
                                 }
                             },
                         }
+                    });
+                }
+                AppCommand::RunShellCommand(command_line) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let _ = driver
+                        .event_tx
+                        .send(gocode_core::AppEvent::ToolActivity {
+                            id: id.clone(),
+                            name: "!".into(),
+                            status: gocode_core::ToolActivityStatus::Started,
+                            detail: "running".into(),
+                        })
+                        .await;
+
+                    let event_tx = driver.event_tx.clone();
+                    let project_root_for_run = project_root.clone();
+                    tokio::spawn(async move {
+                        let runner = TokioProcessRunner;
+                        let outcome = runner
+                            .run(
+                                CommandRequest {
+                                    program: command_line,
+                                    args: Vec::new(),
+                                    cwd: project_root_for_run,
+                                    shell: true,
+                                    timeout: Duration::from_secs(120),
+                                },
+                                tokio_util::sync::CancellationToken::new(),
+                                None,
+                            )
+                            .await;
+
+                        let (status, content) = match outcome {
+                            Err(gocode_tools::process::ProcessError::SpawnFailed(message)) => (
+                                gocode_core::ToolActivityStatus::Failed,
+                                format!("could not run command: {message}"),
+                            ),
+                            Ok(process) if process.outcome == ProcessOutcome::Cancelled => (
+                                gocode_core::ToolActivityStatus::Cancelled,
+                                "cancelled".into(),
+                            ),
+                            Ok(process) if process.outcome == ProcessOutcome::TimedOut => (
+                                gocode_core::ToolActivityStatus::Failed,
+                                "command timed out".into(),
+                            ),
+                            Ok(process) => {
+                                let mut content = format!(
+                                    "Process exited with code {}.\n",
+                                    process.exit_code.map_or_else(
+                                        || "unknown".to_string(),
+                                        |code| code.to_string()
+                                    )
+                                );
+                                if !process.stdout.is_empty() {
+                                    content.push_str("--- stdout ---\n");
+                                    content.push_str(&process.stdout);
+                                    content.push('\n');
+                                }
+                                if !process.stderr.is_empty() {
+                                    content.push_str("--- stderr ---\n");
+                                    content.push_str(&process.stderr);
+                                    content.push('\n');
+                                }
+                                let status = if process.exit_code == Some(0) {
+                                    gocode_core::ToolActivityStatus::Succeeded
+                                } else {
+                                    gocode_core::ToolActivityStatus::Failed
+                                };
+                                (status, content)
+                            }
+                        };
+
+                        let _ = event_tx
+                            .send(gocode_core::AppEvent::ToolOutputChunk {
+                                id: id.clone(),
+                                chunk: content.clone(),
+                            })
+                            .await;
+                        let _ = event_tx
+                            .send(gocode_core::AppEvent::ToolActivity {
+                                id,
+                                name: "!".into(),
+                                status,
+                                detail: first_line(&content, 96),
+                            })
+                            .await;
                     });
                 }
                 AppCommand::SetPreferences(updated) => {

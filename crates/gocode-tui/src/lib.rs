@@ -982,6 +982,8 @@ pub enum ChatSubmission {
     Command(SlashCommand),
     /// One answer to `/debug`'s guided intake.
     DebugAnswer(String),
+    /// A raw shell command line typed with a leading `!`, run directly without the model.
+    Shell(String),
 }
 
 /// Renderable interface state derived from application events.
@@ -4751,6 +4753,12 @@ fn run_terminal(
                     state.begin_run(text.clone());
                     send_command(&command_tx, AppCommand::SubmitChat(text))?;
                 }
+                ChatSubmission::Shell(command_line) => {
+                    state
+                        .entries
+                        .push(ChatEntry::Info(format!("! {command_line}")));
+                    send_command(&command_tx, AppCommand::RunShellCommand(command_line))?;
+                }
                 ChatSubmission::Command(SlashCommand::Exit) => {
                     send_command(&command_tx, AppCommand::Exit)?;
                     return Ok(());
@@ -6653,6 +6661,15 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
             if trimmed.is_empty() {
                 return None;
             }
+            if let Some(command_line) = trimmed.strip_prefix('!') {
+                let command_line = command_line.trim().to_string();
+                if !command_line.is_empty() {
+                    let full_input = trimmed.to_string();
+                    state.remember_prompt(&full_input);
+                    state.clear_chat_input();
+                    return Some(ChatSubmission::Shell(command_line));
+                }
+            }
             let suggestions = slash_suggestions(&state.chat_input, &state.custom_commands);
             if !suggestions.is_empty() {
                 let index = state.suggestion_selected.min(suggestions.len() - 1);
@@ -7680,6 +7697,36 @@ mod tests {
             Some(ChatSubmission::Command(SlashCommand::Clear))
         );
         assert!(state.chat_input.is_empty());
+    }
+
+    #[test]
+    fn bang_prefixed_input_is_recognized_as_a_shell_submission() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "!ls -la".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Shell("ls -la".into()))
+        );
+        assert!(state.chat_input.is_empty());
+        assert_eq!(state.prompt_history.last().map(String::as_str), Some("!ls -la"));
+    }
+
+    #[test]
+    fn a_bare_bang_with_no_command_falls_back_to_a_plain_prompt() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            chat_input: "!".into(),
+            ..AppState::default()
+        };
+
+        assert_eq!(
+            handle_chat_event(&mut state, &press(KeyCode::Enter)),
+            Some(ChatSubmission::Prompt("!".into()))
+        );
     }
 
     #[test]

@@ -49,6 +49,8 @@ pub enum AppCommand {
     SelectModel(String),
     /// Send a user message using the currently selected model.
     SubmitChat(String),
+    /// Run a raw shell command line directly, bypassing the model.
+    RunShellCommand(String),
     /// Start a persisted `/debug` investigation. `None` starts the guided intake.
     DebugStart(Option<String>),
     /// Store one answer from the guided `/debug` intake.
