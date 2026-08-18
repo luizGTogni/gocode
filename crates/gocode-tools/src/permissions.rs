@@ -318,7 +318,6 @@ impl DefaultPermissionPolicy {
 impl PermissionPolicy for DefaultPermissionPolicy {
     fn evaluate(&self, action: &PermissionAction) -> PermissionDecision {
         match action {
-            PermissionAction::ReadOnly => PermissionDecision::Allow,
             PermissionAction::Write { path } => {
                 if self.editing_enabled {
                     PermissionDecision::Allow
@@ -329,7 +328,9 @@ impl PermissionPolicy for DefaultPermissionPolicy {
                     )))
                 }
             }
-            PermissionAction::Command { .. } => PermissionDecision::Allow,
+            PermissionAction::ReadOnly | PermissionAction::Command { .. } => {
+                PermissionDecision::Allow
+            }
         }
     }
 }
@@ -440,8 +441,9 @@ impl PermissionPolicy for ApproveEverythingPolicy {
     fn evaluate(&self, action: &PermissionAction) -> PermissionDecision {
         match action {
             PermissionAction::ReadOnly => PermissionDecision::Allow,
-            PermissionAction::Write { .. } => PermissionDecision::Ask(request_for(action)),
-            PermissionAction::Command { .. } => PermissionDecision::Ask(request_for(action)),
+            PermissionAction::Write { .. } | PermissionAction::Command { .. } => {
+                PermissionDecision::Ask(request_for(action))
+            }
         }
     }
 }

@@ -3991,7 +3991,8 @@ fn render_guided_question_modal(
         );
     }
     content.push_str("\n\n↑↓ navega  •  Enter confirma  •  Esc cancela");
-    let height = (question.choices.len() as u16 * 5 + 5).min(area.height.saturating_sub(2));
+    let height = (u16::try_from(question.choices.len()).unwrap_or(u16::MAX) * 5 + 5)
+        .min(area.height.saturating_sub(2));
     let modal = centered(area, 76, height);
     frame.render_widget(Clear, modal);
     frame.render_widget(
