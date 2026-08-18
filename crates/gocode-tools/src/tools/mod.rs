@@ -1,6 +1,7 @@
 //! Built-in MVP tool implementations.
 
 pub mod apply_patch;
+pub mod ask_user;
 pub mod git;
 pub mod list_files;
 pub mod read_file;

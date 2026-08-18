@@ -63,6 +63,8 @@ pub enum AppCommand {
     CancelProviderRequest,
     /// Answer the single active permission prompt: `true` approves, `false` denies.
     PermissionResponse(bool),
+    /// Select one option from a model-requested guided decision.
+    GuidedAnswer(String),
     /// Start the user-approved update download and staging.
     AcceptUpdate,
     /// Dismiss this startup's update prompt without changing the installation.
@@ -242,6 +244,24 @@ impl PermissionMode {
     }
 }
 
+/// One option in a model-requested decision card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidedChoice {
+    pub label: String,
+    pub summary: String,
+    pub advantages: String,
+    pub disadvantages: String,
+    pub recommended: bool,
+}
+
+/// A concise question the UI presents while an agent run is paused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidedQuestion {
+    pub title: String,
+    pub context: String,
+    pub choices: Vec<GuidedChoice>,
+}
+
 /// Fact emitted by the application runtime and rendered by an interface.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
@@ -346,6 +366,8 @@ pub enum AppEvent {
         /// Working directory the action would run or write in.
         working_directory: String,
     },
+    /// The agent needs a product or implementation preference before it can continue.
+    GuidedQuestionRequested(GuidedQuestion),
     /// The agent run finished, normally or with a best-effort summary after hitting a safety
     /// limit (see `partial`).
     AgentCompleted {

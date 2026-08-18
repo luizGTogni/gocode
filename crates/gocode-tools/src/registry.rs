@@ -60,6 +60,7 @@ impl ToolRegistry {
 #[must_use]
 pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(crate::tools::ask_user::AskUserTool::unavailable()));
     registry.register(Arc::new(crate::tools::list_files::ListFilesTool));
     registry.register(Arc::new(crate::tools::read_file::ReadFileTool));
     registry.register(Arc::new(crate::tools::search::SearchTool));
@@ -124,6 +125,7 @@ mod tests {
             .collect();
 
         for expected in [
+            "ask_user",
             "list_files",
             "read_file",
             "search",
@@ -135,6 +137,6 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert_eq!(registry.len(), 8);
+        assert_eq!(registry.len(), 9);
     }
 }

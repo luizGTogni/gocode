@@ -100,6 +100,46 @@ mod preference_tests {
             )))
         );
     }
+
+    #[test]
+    fn guided_question_selects_recommended_choice_and_returns_its_label() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..Default::default()
+        };
+        state.apply(&AppEvent::GuidedQuestionRequested(
+            gocode_core::GuidedQuestion {
+                title: "How should I proceed?".into(),
+                context: "Two valid approaches were found.".into(),
+                choices: vec![
+                    gocode_core::GuidedChoice {
+                        label: "Minimal change".into(),
+                        summary: "Reuse the existing module.".into(),
+                        advantages: "Lower risk.".into(),
+                        disadvantages: "Less flexible.".into(),
+                        recommended: true,
+                    },
+                    gocode_core::GuidedChoice {
+                        label: "New module".into(),
+                        summary: "Create an isolated abstraction.".into(),
+                        advantages: "More flexible.".into(),
+                        disadvantages: "More code.".into(),
+                        recommended: false,
+                    },
+                ],
+            },
+        ));
+
+        assert_eq!(state.selected_guided_choice, 0);
+        assert_eq!(
+            handle_guided_question_event(
+                &mut state,
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ),
+            Some("Minimal change".into())
+        );
+        assert!(state.pending_guided_question.is_none());
+    }
 }
 
 /// Reasoning-effort choices offered by the effort picker, paired with the provider value sent
@@ -437,6 +477,7 @@ fn human_tool_name(name: &str) -> &str {
         "write_file" => "Editando arquivo",
         "apply_patch" => "Aplicando alteração",
         "run_command" => "Executando validação",
+        "ask_user" => "Aguardando sua decisão",
         _ => "Executando ação",
     }
 }
@@ -971,6 +1012,9 @@ pub struct AppState {
     /// Live, user-facing account of the current run's phase, impact, and validation state.
     run_visibility: RunVisibility,
     pending_permission: Option<PermissionPrompt>,
+    /// A structured choice requested by the model; it pauses the active run until answered.
+    pending_guided_question: Option<gocode_core::GuidedQuestion>,
+    selected_guided_choice: usize,
     /// A `/worktree remove <target>` awaiting explicit Y/N confirmation before it is sent.
     pending_worktree_removal: Option<String>,
     /// An `/agent apply` or `/agent cleanup` awaiting explicit Y/N confirmation before it is sent.
@@ -1315,6 +1359,14 @@ impl AppState {
                     summary: summary.clone(),
                     working_directory: working_directory.clone(),
                 });
+            }
+            AppEvent::GuidedQuestionRequested(question) => {
+                self.pending_guided_question = Some(question.clone());
+                self.selected_guided_choice = question
+                    .choices
+                    .iter()
+                    .position(|choice| choice.recommended)
+                    .unwrap_or(0);
             }
             AppEvent::AgentCompleted {
                 final_text,
@@ -2616,6 +2668,8 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: Rect) {
 
     if let Some(prompt) = &state.pending_permission {
         render_permission_modal(frame, prompt, area);
+    } else if let Some(question) = &state.pending_guided_question {
+        render_guided_question_modal(frame, question, state.selected_guided_choice, area);
     } else if let Some(target) = &state.pending_worktree_removal {
         render_worktree_removal_modal(frame, target, area);
     } else if let Some(prompt) = &state.pending_agent_confirm {
@@ -3842,6 +3896,7 @@ fn render_composer(
     );
 
     let editing = state.pending_permission.is_none()
+        && state.pending_guided_question.is_none()
         && state.pending_worktree_removal.is_none()
         && state.pending_agent_confirm.is_none()
         && state.pending_agent_conflict.is_none()
@@ -3881,6 +3936,44 @@ fn render_permission_modal(frame: &mut Frame, prompt: &PermissionPrompt, area: R
         Paragraph::new(content)
             .wrap(Wrap { trim: false })
             .block(Block::default().title("Confirm").borders(Borders::ALL)),
+        modal,
+    );
+}
+
+fn render_guided_question_modal(
+    frame: &mut Frame,
+    question: &gocode_core::GuidedQuestion,
+    selected: usize,
+    area: Rect,
+) {
+    let mut content = question.context.clone();
+    for (index, choice) in question.choices.iter().enumerate() {
+        let marker = if index == selected { "›" } else { " " };
+        let recommended = if choice.recommended {
+            " (recomendado)"
+        } else {
+            ""
+        };
+        let _ = write!(
+            content,
+            "\n\n{marker} {}. {}{recommended}\n  {}\n  + {}\n  − {}",
+            index + 1,
+            choice.label,
+            choice.summary,
+            choice.advantages,
+            choice.disadvantages,
+        );
+    }
+    content.push_str("\n\n↑↓ navega  •  Enter confirma  •  Esc cancela");
+    let height = (question.choices.len() as u16 * 5 + 5).min(area.height.saturating_sub(2));
+    let modal = centered(area, 76, height);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(question.title.as_str())
+                .borders(Borders::ALL),
+        ),
         modal,
     );
 }
@@ -4218,6 +4311,11 @@ fn run_terminal(
 
         if let Some(approved) = handle_permission_event(&mut state, &terminal_event) {
             send_command(&command_tx, AppCommand::PermissionResponse(approved))?;
+            continue;
+        }
+
+        if let Some(answer) = handle_guided_question_event(&mut state, &terminal_event) {
+            send_command(&command_tx, AppCommand::GuidedAnswer(answer))?;
             continue;
         }
 
@@ -4909,6 +5007,7 @@ fn run_terminal(
         if state.screen == Screen::Chat
             && state.blocking_error.is_none()
             && state.pending_permission.is_none()
+            && state.pending_guided_question.is_none()
             && state.pending_worktree_removal.is_none()
             && state.pending_agent_confirm.is_none()
             && state.pending_agent_conflict.is_none()
@@ -5198,6 +5297,7 @@ pub fn handle_permission_mode_event(state: &mut AppState, event: &Event) -> Opti
     if state.screen != Screen::Chat
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
+        || state.pending_guided_question.is_some()
         || state.pending_worktree_removal.is_some()
         || state.pending_agent_confirm.is_some()
         || state.pending_agent_conflict.is_some()
@@ -5446,6 +5546,41 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
         {
             state.pending_permission = None;
             Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Applies navigation and confirmation keys to a model-requested decision card.
+#[must_use]
+pub fn handle_guided_question_event(state: &mut AppState, event: &Event) -> Option<String> {
+    let question = state.pending_guided_question.as_ref()?;
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    let count = question.choices.len();
+    match code {
+        KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+            state.selected_guided_choice = state.selected_guided_choice.saturating_sub(1);
+            None
+        }
+        KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+            state.selected_guided_choice = (state.selected_guided_choice + 1).min(count - 1);
+            None
+        }
+        KeyCode::Enter if count > 0 => {
+            let answer = question.choices[state.selected_guided_choice].label.clone();
+            state.pending_guided_question = None;
+            Some(answer)
+        }
+        KeyCode::Esc => {
+            state.pending_guided_question = None;
+            Some("No option selected; the user cancelled this decision.".into())
         }
         _ => None,
     }
@@ -6332,6 +6467,7 @@ pub fn handle_chat_event(state: &mut AppState, event: &Event) -> Option<ChatSubm
     if state.screen != Screen::Chat
         || state.blocking_error.is_some()
         || state.pending_permission.is_some()
+        || state.pending_guided_question.is_some()
         || state.pending_worktree_removal.is_some()
         || state.pending_agent_confirm.is_some()
         || state.pending_agent_conflict.is_some()

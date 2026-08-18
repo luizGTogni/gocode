@@ -20,6 +20,7 @@ pub use contract::{
     ToolName, ToolOutput, ToolResult, ToolStatus,
 };
 pub use registry::{ToolRegistry, builtin_registry};
+pub use tools::ask_user::{AskUserTool, UserChoice, UserQuestion, UserQuestionResolver};
 pub use undo::{
     AppliedFile, AppliedTransaction, FileAction, FileSnapshot, UndoConflict, UndoConflictFile,
     UndoOutcome, UndoStore, UndoTransaction, load_undo_store, save_undo_store, undo_dir,

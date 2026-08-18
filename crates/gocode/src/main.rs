@@ -15,7 +15,8 @@ use gocode_core::{
 use gocode_credentials::{CredentialStore, NativeCredentialStore, SecretString};
 use gocode_provider_nvidia::NvidiaProvider;
 use gocode_tools::{
-    ChangeKind, ToolRegistry, ToolStatus, builtin_registry,
+    AskUserTool, ChangeKind, ToolRegistry, ToolStatus, UserChoice, UserQuestion,
+    UserQuestionResolver, builtin_registry,
     permissions::{
         ApproveEverythingPolicy, DefaultPermissionPolicy, PermissionContext, PermissionPolicy,
         PermissionRequest, PermissionResolver, PlanPermissionPolicy, ResolveFuture,
@@ -29,11 +30,55 @@ use tracing_subscriber::prelude::*;
 /// Slot for the single active permission prompt, shared between the resolver and the command
 /// loop so a user response (or a run cancellation) can reach the waiting resolver future.
 type PendingPermission = Arc<Mutex<Option<oneshot::Sender<bool>>>>;
+/// Slot for the one active model-requested decision card.
+type PendingGuidedQuestion = Arc<Mutex<Option<oneshot::Sender<Option<String>>>>>;
 
 /// [`PermissionResolver`] that shows the prompt in the TUI and waits for the user's answer.
 struct TuiPermissionResolver {
     event_tx: mpsc::Sender<gocode_core::AppEvent>,
     pending: PendingPermission,
+}
+
+/// Bridges the model's `ask_user` tool to the terminal decision card.
+struct TuiGuidedQuestionResolver {
+    event_tx: mpsc::Sender<gocode_core::AppEvent>,
+    pending: PendingGuidedQuestion,
+}
+
+impl UserQuestionResolver for TuiGuidedQuestionResolver {
+    fn ask<'a>(
+        &'a self,
+        question: UserQuestion,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            *self.pending.lock().await = Some(response_tx);
+            let event = gocode_core::GuidedQuestion {
+                title: question.title,
+                context: question.context,
+                choices: question
+                    .choices
+                    .into_iter()
+                    .map(|choice: UserChoice| gocode_core::GuidedChoice {
+                        label: choice.label,
+                        summary: choice.summary,
+                        advantages: choice.advantages,
+                        disadvantages: choice.disadvantages,
+                        recommended: choice.recommended,
+                    })
+                    .collect(),
+            };
+            if self
+                .event_tx
+                .send(gocode_core::AppEvent::GuidedQuestionRequested(event))
+                .await
+                .is_err()
+            {
+                return None;
+            }
+            response_rx.await.ok().flatten()
+        })
+    }
 }
 
 impl PermissionResolver for TuiPermissionResolver {
@@ -894,8 +939,10 @@ fn build_lsp_manager(paths: &PlatformPaths, project: &ProjectContext) -> gocode_
 fn build_full_registry(
     mcp_runtime: &McpRuntime,
     lsp_manager: &Arc<gocode_lsp::LspManager>,
+    guided_resolver: Arc<dyn UserQuestionResolver>,
 ) -> ToolRegistry {
     let mut registry = mcp_runtime.build_registry();
+    registry.register(Arc::new(AskUserTool::new(guided_resolver)));
     registry.register(Arc::new(gocode_lsp::LspTool::new(Arc::clone(lsp_manager))));
     registry
 }
@@ -1186,8 +1233,17 @@ async fn run_application() -> Result<(), AppError> {
         let mut active_personality = loaded_preferences.preferences.personality;
         let config_path = paths.config_dir.join("config.toml");
         let mut mcp_runtime = McpRuntime::bootstrap(&paths, &bootstrap.project).await;
-        let mut tool_registry: Arc<ToolRegistry> =
-            Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
+        let guided_question_pending: PendingGuidedQuestion = Arc::new(Mutex::new(None));
+        let guided_question_resolver: Arc<dyn UserQuestionResolver> =
+            Arc::new(TuiGuidedQuestionResolver {
+                event_tx: driver.event_tx.clone(),
+                pending: guided_question_pending.clone(),
+            });
+        let mut tool_registry: Arc<ToolRegistry> = Arc::new(build_full_registry(
+            &mcp_runtime,
+            &lsp_manager,
+            guided_question_resolver.clone(),
+        ));
         driver
             .event_tx
             .send(gocode_core::AppEvent::McpServersAvailable(
@@ -1703,10 +1759,18 @@ async fn run_application() -> Result<(), AppError> {
                     if let Some(pending) = permission_pending.lock().await.take() {
                         let _ = pending.send(false);
                     }
+                    if let Some(pending) = guided_question_pending.lock().await.take() {
+                        let _ = pending.send(None);
+                    }
                 }
                 AppCommand::PermissionResponse(approved) => {
                     if let Some(pending) = permission_pending.lock().await.take() {
                         let _ = pending.send(approved);
+                    }
+                }
+                AppCommand::GuidedAnswer(answer) => {
+                    if let Some(pending) = guided_question_pending.lock().await.take() {
+                        let _ = pending.send(Some(answer));
                     }
                 }
                 AppCommand::RejectUpdate => {
@@ -1948,7 +2012,11 @@ async fn run_application() -> Result<(), AppError> {
                             )))
                             .await;
                     }
-                    tool_registry = Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
+                    tool_registry = Arc::new(build_full_registry(
+                        &mcp_runtime,
+                        &lsp_manager,
+                        guided_question_resolver.clone(),
+                    ));
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::McpServersAvailable(
@@ -1963,7 +2031,11 @@ async fn run_application() -> Result<(), AppError> {
                 }
                 AppCommand::McpDisconnect(name) => {
                     mcp_runtime.disconnect(&name);
-                    tool_registry = Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
+                    tool_registry = Arc::new(build_full_registry(
+                        &mcp_runtime,
+                        &lsp_manager,
+                        guided_question_resolver.clone(),
+                    ));
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::McpServersAvailable(
@@ -2017,7 +2089,11 @@ async fn run_application() -> Result<(), AppError> {
                             )))
                             .await;
                     }
-                    tool_registry = Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
+                    tool_registry = Arc::new(build_full_registry(
+                        &mcp_runtime,
+                        &lsp_manager,
+                        guided_question_resolver.clone(),
+                    ));
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::McpServersAvailable(
@@ -2108,7 +2184,11 @@ async fn run_application() -> Result<(), AppError> {
                         }
                     }
 
-                    tool_registry = Arc::new(build_full_registry(&mcp_runtime, &lsp_manager));
+                    tool_registry = Arc::new(build_full_registry(
+                        &mcp_runtime,
+                        &lsp_manager,
+                        guided_question_resolver.clone(),
+                    ));
                     driver
                         .event_tx
                         .send(gocode_core::AppEvent::McpServersAvailable(
