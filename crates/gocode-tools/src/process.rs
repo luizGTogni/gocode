@@ -189,7 +189,12 @@ async fn run_process(
     let started = Instant::now();
     let mut command = build_command(&request);
 
+    // No stdin is ever supplied to a tool-invoked command. Without this, the child inherits the
+    // agent's own stdin; a command that unexpectedly turns interactive (e.g. a shell invoked
+    // without its "run this and exit" flag) then blocks reading from it until the timeout, rather
+    // than failing fast on EOF.
     let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

@@ -136,6 +136,11 @@ fn is_validation_call(call: &ToolCall) -> bool {
             matches!(first, "test" | "build" | "lint" | "check")
                 || (first == "run" && matches!(second, "test" | "build" | "lint" | "check"))
         }
+        // A project with no test/build script (e.g. a bare dev server) has no other way to
+        // clear validation_pending; hitting the running endpoint is the validation for that
+        // shape of project. Kept last so ecosystem-specific commands above stay authoritative.
+        "curl" | "wget" | "http" | "https" | "Invoke-WebRequest" | "Invoke-RestMethod"
+        | "iwr" | "irm" => true,
         _ => false,
     }
 }

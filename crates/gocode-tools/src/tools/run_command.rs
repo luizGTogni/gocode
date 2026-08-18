@@ -79,7 +79,10 @@ impl Tool for RunCommandTool {
         ToolDefinition {
             name: ToolName::new("run_command"),
             description: "Run a development command (build, test, lint, format, or similar) \
-                inside the current project. Prefer program+args over shell=true. The working \
+                inside the current project. Prefer program+args over shell=true. When shell=true, \
+                `program` is the full command line to execute (e.g. \"move a.txt b.txt\"), not \
+                the name of a shell — the shell to interpret it with is chosen automatically; do \
+                not pass \"cmd\", \"powershell\", \"sh\", or \"bash\" as `program`. The working \
                 directory stays inside the project; commands may require user confirmation or be \
                 denied depending on their assessed risk."
                 .into(),

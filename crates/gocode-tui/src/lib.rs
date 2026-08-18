@@ -1997,7 +1997,13 @@ fn compose_lines_tagged(state: &AppState) -> Vec<(String, LineKind)> {
         match entry {
             ChatEntry::User(text) => push_wrapped(&mut lines, "", text, LineKind::User),
             ChatEntry::Assistant(text) => {
-                push_wrapped(&mut lines, "Gocode: ", text, LineKind::Normal);
+                // Providers sometimes stream a throwaway newline/whitespace as "text" ahead of
+                // a tool call, or finish a turn with no content at all. Rendering that verbatim
+                // produces a bare "Gocode: " line with nothing after it; skip turns that carry
+                // no visible content instead of showing an empty bubble.
+                if !text.trim().is_empty() {
+                    push_wrapped(&mut lines, "Gocode: ", text, LineKind::Normal);
+                }
             }
             ChatEntry::Reasoning(text) => {
                 push_wrapped(&mut lines, "Gocode (thinking): ", text, LineKind::Normal);
