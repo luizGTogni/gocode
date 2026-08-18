@@ -443,6 +443,22 @@ impl RunVisibility {
         format!("Impacto: {files} {file_label} · {validation}")
     }
 
+    /// States the immediate next outcome in user language, so the activity banner explains
+    /// both the action in progress and why the agent has not finished yet.
+    fn next_step_line(&self) -> &'static str {
+        match self.phase {
+            RunPhase::Understanding if self.changed => "Próximo: validar as alterações",
+            RunPhase::Understanding => "Próximo: definir a alteração mais segura",
+            RunPhase::Changing => "Próximo: validar as alterações",
+            RunPhase::Validating if self.validation_pending => {
+                "Próximo: aguardar o resultado da validação"
+            }
+            RunPhase::Validating => "Próximo: revisar a validação e finalizar",
+            RunPhase::Recovering => "Próximo: investigar a falha e tentar uma alternativa",
+            RunPhase::Finalizing => "Próximo: preparar o resumo final",
+        }
+    }
+
     fn elapsed_label(&self) -> String {
         let seconds = self
             .started_at
@@ -1965,6 +1981,10 @@ fn compose_lines_tagged(state: &AppState) -> Vec<(String, LineKind)> {
         ));
         lines.push((state.run_visibility.impact_line(), LineKind::Normal));
         lines.push((state.run_visibility.plan_line(), LineKind::Normal));
+        lines.push((
+            state.run_visibility.next_step_line().into(),
+            LineKind::Normal,
+        ));
         lines.push((String::new(), LineKind::Normal));
     }
 
@@ -6909,7 +6929,30 @@ mod tests {
         assert!(output.contains("cargo test"));
         assert!(output.contains("1 arquivo alterado"));
         assert!(output.contains("validação pendente"));
+        assert!(output.contains("Próximo: aguardar o resultado da validação"));
         assert!(output.contains("0s"));
+    }
+
+    #[test]
+    fn active_run_explains_the_next_step_after_an_edit() {
+        let mut state = AppState {
+            screen: Screen::Chat,
+            ..AppState::default()
+        };
+        state.begin_run("add a health endpoint".into());
+        state.apply(&AppEvent::ToolActivity {
+            id: "edit-1".into(),
+            name: "apply_patch".into(),
+            status: ToolActivityStatus::Succeeded,
+            detail: "updated src/health.rs".into(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("progress view should render");
+
+        assert!(buffer_text(&terminal).contains("Próximo: validar as alterações"));
     }
 
     #[test]
