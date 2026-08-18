@@ -206,7 +206,7 @@ fn request_timeout_secs(timeout: Duration) -> u64 {
 mod tests {
     use super::RunCommandTool;
     use crate::contract::{Tool, ToolCallId, ToolContext, ToolStatus};
-    use crate::permissions::{DefaultPermissionPolicy, PermissionContext};
+    use crate::permissions::{DefaultPermissionPolicy, PermissionContext, PlanPermissionPolicy};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -234,7 +234,7 @@ mod tests {
             &'a self,
             _request: &'a crate::permissions::PermissionRequest,
         ) -> crate::permissions::ResolveFuture<'a> {
-            Box::pin(async { true })
+            Box::pin(async { crate::permissions::PermissionResponse::AllowOnce })
         }
     }
 
@@ -244,6 +244,17 @@ mod tests {
             root.to_path_buf(),
             PermissionContext::new(
                 Arc::new(DefaultPermissionPolicy::editing()),
+                Arc::new(crate::permissions::AlwaysDenyResolver),
+            ),
+        )
+    }
+
+    fn plan_ctx(root: &Path) -> ToolContext {
+        ToolContext::new(
+            ToolCallId::new("call-1"),
+            root.to_path_buf(),
+            PermissionContext::new(
+                Arc::new(PlanPermissionPolicy),
                 Arc::new(crate::permissions::AlwaysDenyResolver),
             ),
         )
@@ -268,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn medium_risk_command_is_denied_when_the_resolver_rejects() {
         let root = fixture("medium-risk");
-        let ctx = ctx(&root);
+        let ctx = plan_ctx(&root);
 
         let result = RunCommandTool::default()
             .execute(
@@ -289,7 +300,7 @@ mod tests {
 
         let result = RunCommandTool::default()
             .execute(
-                ctx(&root),
+                plan_ctx(&root),
                 serde_json::json!({"program": "git", "args": ["push"]}),
             )
             .await

@@ -15,11 +15,12 @@ use gocode_core::{
 use gocode_credentials::{CredentialStore, NativeCredentialStore, SecretString};
 use gocode_provider_nvidia::NvidiaProvider;
 use gocode_tools::{
-    AskUserTool, ChangeKind, ToolRegistry, ToolStatus, UserChoice, UserQuestion,
-    UserQuestionResolver, builtin_registry,
+    ApprovePermissionPolicy, AskUserTool, ChangeKind, ManualPermissionPolicy, PermissionResponse,
+    PermissionScope, ToolRegistry, ToolStatus, UserChoice, UserQuestion, UserQuestionResolver,
+    builtin_registry,
     permissions::{
-        ApproveEverythingPolicy, DefaultPermissionPolicy, PermissionContext, PermissionPolicy,
-        PermissionRequest, PermissionResolver, PlanPermissionPolicy, ResolveFuture,
+        DefaultPermissionPolicy, PermissionContext, PermissionPolicy, PermissionRequest,
+        PermissionResolver, PlanPermissionPolicy, ResolveFuture,
     },
     process::{CommandRequest, ProcessRunner, TokioProcessRunner},
     worktree,
@@ -29,7 +30,7 @@ use tracing_subscriber::prelude::*;
 
 /// Slot for the single active permission prompt, shared between the resolver and the command
 /// loop so a user response (or a run cancellation) can reach the waiting resolver future.
-type PendingPermission = Arc<Mutex<Option<oneshot::Sender<bool>>>>;
+type PendingPermission = Arc<Mutex<Option<oneshot::Sender<PermissionResponse>>>>;
 /// Slot for the one active model-requested decision card.
 type PendingGuidedQuestion = Arc<Mutex<Option<oneshot::Sender<Option<String>>>>>;
 
@@ -37,6 +38,7 @@ type PendingGuidedQuestion = Arc<Mutex<Option<oneshot::Sender<Option<String>>>>>
 struct TuiPermissionResolver {
     event_tx: mpsc::Sender<gocode_core::AppEvent>,
     pending: PendingPermission,
+    always_allowed: Arc<std::sync::Mutex<std::collections::BTreeSet<PermissionScope>>>,
 }
 
 /// Bridges the model's `ask_user` tool to the terminal decision card.
@@ -92,14 +94,20 @@ impl PermissionResolver for TuiPermissionResolver {
                 .send(gocode_core::AppEvent::PermissionRequested {
                     summary: request.summary.clone(),
                     working_directory: request.working_directory.display().to_string(),
+                    scope_label: request.scope.label().into(),
                 })
                 .await
                 .is_err()
             {
-                return false;
+                return PermissionResponse::Deny;
             }
-
-            response_rx.await.unwrap_or(false)
+            let response = response_rx.await.unwrap_or(PermissionResponse::Deny);
+            if response == PermissionResponse::AllowAlways
+                && let Ok(mut allowed) = self.always_allowed.lock()
+            {
+                allowed.insert(request.scope);
+            }
+            response
         })
     }
 }
@@ -1254,6 +1262,8 @@ async fn run_application() -> Result<(), AppError> {
                 AppError::Initialization(format!("could not send configured MCP servers: {error}"))
             })?;
         let permission_pending: PendingPermission = Arc::new(Mutex::new(None));
+        let permission_always_allowed =
+            Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
         let instructions =
             std::fs::read_to_string(bootstrap.project.gocode_dir.join("instructions.md")).ok();
         let project_overview =
@@ -1656,13 +1666,19 @@ async fn run_application() -> Result<(), AppError> {
                     let resolver = Arc::new(TuiPermissionResolver {
                         event_tx: driver.event_tx.clone(),
                         pending: permission_pending.clone(),
+                        always_allowed: permission_always_allowed.clone(),
                     });
                     let policy: Arc<dyn PermissionPolicy> = match permission_mode {
                         gocode_core::PermissionMode::Auto => {
                             Arc::new(DefaultPermissionPolicy::editing())
                         }
                         gocode_core::PermissionMode::Plan => Arc::new(PlanPermissionPolicy),
-                        gocode_core::PermissionMode::Approve => Arc::new(ApproveEverythingPolicy),
+                        gocode_core::PermissionMode::Approve => Arc::new(
+                            ApprovePermissionPolicy::new(permission_always_allowed.clone()),
+                        ),
+                        gocode_core::PermissionMode::Manual => Arc::new(
+                            ManualPermissionPolicy::new(permission_always_allowed.clone()),
+                        ),
                     };
                     let permissions = PermissionContext::new(policy, resolver);
                     let agent = Agent::new(
@@ -1757,15 +1773,24 @@ async fn run_application() -> Result<(), AppError> {
                         cancellation.cancel();
                     }
                     if let Some(pending) = permission_pending.lock().await.take() {
-                        let _ = pending.send(false);
+                        let _ = pending.send(PermissionResponse::Deny);
                     }
                     if let Some(pending) = guided_question_pending.lock().await.take() {
                         let _ = pending.send(None);
                     }
                 }
-                AppCommand::PermissionResponse(approved) => {
+                AppCommand::PermissionResponse(choice) => {
                     if let Some(pending) = permission_pending.lock().await.take() {
-                        let _ = pending.send(approved);
+                        let response = match choice {
+                            gocode_core::PermissionChoice::AllowOnce => {
+                                PermissionResponse::AllowOnce
+                            }
+                            gocode_core::PermissionChoice::AllowAlways => {
+                                PermissionResponse::AllowAlways
+                            }
+                            gocode_core::PermissionChoice::Deny => PermissionResponse::Deny,
+                        };
+                        let _ = pending.send(response);
                     }
                 }
                 AppCommand::GuidedAnswer(answer) => {

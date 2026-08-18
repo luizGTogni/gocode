@@ -61,8 +61,8 @@ pub enum AppCommand {
     SetSessionPersonality(PersonalityName),
     /// Cancel the current provider request while retaining the application session.
     CancelProviderRequest,
-    /// Answer the single active permission prompt: `true` approves, `false` denies.
-    PermissionResponse(bool),
+    /// Answer the single active permission prompt.
+    PermissionResponse(PermissionChoice),
     /// Select one option from a model-requested guided decision.
     GuidedAnswer(String),
     /// Start the user-approved update download and staging.
@@ -220,16 +220,19 @@ pub enum PermissionMode {
     Plan,
     /// Every write and command, however low-risk, asks for explicit confirmation first.
     Approve,
+    /// Every read, edit, and command requires approval.
+    Manual,
 }
 
 impl PermissionMode {
-    /// Advances to the next mode in the Auto → Plan → Approve → Auto cycle.
+    /// Advances to the next mode in the Auto → Plan → Approve → Manual → Auto cycle.
     #[must_use]
     pub const fn cycle(self) -> Self {
         match self {
             Self::Auto => Self::Plan,
             Self::Plan => Self::Approve,
-            Self::Approve => Self::Auto,
+            Self::Approve => Self::Manual,
+            Self::Manual => Self::Auto,
         }
     }
 
@@ -240,8 +243,17 @@ impl PermissionMode {
             Self::Auto => "auto",
             Self::Plan => "plan",
             Self::Approve => "approve",
+            Self::Manual => "manual",
         }
     }
+}
+
+/// User choice in a permission card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionChoice {
+    AllowOnce,
+    AllowAlways,
+    Deny,
 }
 
 /// One option in a model-requested decision card.
@@ -365,6 +377,8 @@ pub enum AppEvent {
         summary: String,
         /// Working directory the action would run or write in.
         working_directory: String,
+        /// Category affected when “allow always” is chosen.
+        scope_label: String,
     },
     /// The agent needs a product or implementation preference before it can continue.
     GuidedQuestionRequested(GuidedQuestion),

@@ -498,6 +498,8 @@ pub struct PermissionPrompt {
     pub summary: String,
     /// Working directory the action would run or write in.
     pub working_directory: String,
+    /// The action category affected by “allow always”.
+    pub scope_label: String,
 }
 
 /// An `/undo` or `/redo` that stopped because a transaction's files no longer match, awaiting
@@ -1354,10 +1356,12 @@ impl AppState {
             AppEvent::PermissionRequested {
                 summary,
                 working_directory,
+                scope_label,
             } => {
                 self.pending_permission = Some(PermissionPrompt {
                     summary: summary.clone(),
                     working_directory: working_directory.clone(),
+                    scope_label: scope_label.clone(),
                 });
             }
             AppEvent::GuidedQuestionRequested(question) => {
@@ -3926,16 +3930,18 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn render_permission_modal(frame: &mut Frame, prompt: &PermissionPrompt, area: Rect) {
-    let modal = centered(area, 60, 7);
+    let modal = centered(area, 72, 12);
     let content = format!(
-        "Permission needed\n\n{}\nin {}\n\n[y] Approve   [n] Deny",
-        prompt.summary, prompt.working_directory
+        "O agente quer executar:\n{}\nEm: {}\n\nPermitir uma vez\n  Executa somente esta ação.\n\nPermitir sempre: {}\n  Não pergunta novamente para esta categoria nesta sessão.\n\nNão permitir\n  Cancela esta ação; o agente procura outra alternativa.\n\n[1] Uma vez   [2] Sempre   [3] Não permitir",
+        prompt.summary, prompt.working_directory, prompt.scope_label
     );
     frame.render_widget(Clear, modal);
     frame.render_widget(
-        Paragraph::new(content)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title("Confirm").borders(Borders::ALL)),
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Permissão necessária")
+                .borders(Borders::ALL),
+        ),
         modal,
     );
 }
@@ -5287,7 +5293,7 @@ pub fn handle_session_picker_event(state: &mut AppState, event: &Event) -> Optio
     None
 }
 
-/// Cycles the permission mode (Auto → Plan → Approve → Auto) on Shift+Tab from the chat
+/// Cycles the permission mode (Auto → Plan → Approve → Manual → Auto) on Shift+Tab from the chat
 /// composer, returning the newly selected mode.
 ///
 /// Handled ahead of [`handle_chat_event`] so a Shift+Tab keypress never falls through to plain
@@ -5514,7 +5520,10 @@ fn try_copy_selection(
 ///
 /// Returns `Some(true)` on approval, `Some(false)` on denial, clearing the prompt either way.
 #[must_use]
-pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bool> {
+pub fn handle_permission_event(
+    state: &mut AppState,
+    event: &Event,
+) -> Option<gocode_core::PermissionChoice> {
     state.pending_permission.as_ref()?;
     let Event::Key(KeyEvent {
         code,
@@ -5527,6 +5536,10 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
     };
 
     match code {
+        KeyCode::Char('1') => {
+            state.pending_permission = None;
+            Some(gocode_core::PermissionChoice::AllowOnce)
+        }
         _ if key_action_matches(
             &state.preferences,
             gocode_core::KeyAction::Approve,
@@ -5535,7 +5548,11 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
         ) || matches!(code, KeyCode::Enter) =>
         {
             state.pending_permission = None;
-            Some(true)
+            Some(gocode_core::PermissionChoice::AllowOnce)
+        }
+        KeyCode::Char('2') => {
+            state.pending_permission = None;
+            Some(gocode_core::PermissionChoice::AllowAlways)
         }
         _ if key_action_matches(
             &state.preferences,
@@ -5545,7 +5562,7 @@ pub fn handle_permission_event(state: &mut AppState, event: &Event) -> Option<bo
         ) || matches!(code, KeyCode::Esc) =>
         {
             state.pending_permission = None;
-            Some(false)
+            Some(gocode_core::PermissionChoice::Deny)
         }
         _ => None,
     }
@@ -7198,7 +7215,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_cycles_the_permission_mode_through_auto_plan_approve() {
+    fn shift_tab_cycles_the_permission_mode_through_auto_plan_approve_manual() {
         use gocode_core::PermissionMode;
 
         let mut state = AppState {
@@ -7220,6 +7237,10 @@ mod tests {
         assert_eq!(
             super::handle_permission_mode_event(&mut state, &back_tab),
             Some(PermissionMode::Approve)
+        );
+        assert_eq!(
+            super::handle_permission_mode_event(&mut state, &back_tab),
+            Some(PermissionMode::Manual)
         );
         assert_eq!(
             super::handle_permission_mode_event(&mut state, &back_tab),
@@ -7496,6 +7517,7 @@ mod tests {
         state.apply(&AppEvent::PermissionRequested {
             summary: "run: npm install".into(),
             working_directory: ".".into(),
+            scope_label: "comandos de risco médio".into(),
         });
 
         assert_eq!(
@@ -7504,7 +7526,7 @@ mod tests {
         );
         assert_eq!(
             handle_permission_event(&mut state, &press(KeyCode::Char('y'))),
-            Some(true)
+            Some(gocode_core::PermissionChoice::AllowOnce)
         );
         assert!(state.pending_permission.is_none());
     }
@@ -7515,11 +7537,28 @@ mod tests {
         state.apply(&AppEvent::PermissionRequested {
             summary: "run: rm".into(),
             working_directory: ".".into(),
+            scope_label: "comandos de alto risco".into(),
         });
 
         assert_eq!(
             handle_permission_event(&mut state, &press(KeyCode::Char('n'))),
-            Some(false)
+            Some(gocode_core::PermissionChoice::Deny)
+        );
+        assert!(state.pending_permission.is_none());
+    }
+
+    #[test]
+    fn permission_prompt_can_allow_a_command_risk_for_the_session() {
+        let mut state = AppState::default();
+        state.apply(&AppEvent::PermissionRequested {
+            summary: "run: npm install".into(),
+            working_directory: ".".into(),
+            scope_label: "comandos de risco médio".into(),
+        });
+
+        assert_eq!(
+            handle_permission_event(&mut state, &press(KeyCode::Char('2'))),
+            Some(gocode_core::PermissionChoice::AllowAlways)
         );
         assert!(state.pending_permission.is_none());
     }
@@ -7530,6 +7569,7 @@ mod tests {
         state.apply(&AppEvent::PermissionRequested {
             summary: "run: rm".into(),
             working_directory: ".".into(),
+            scope_label: "comandos de alto risco".into(),
         });
 
         state.apply(&AppEvent::AgentCancelled);

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -17,6 +18,29 @@ pub enum CommandRisk {
     Medium,
     /// Commands that delete data, touch remote state, or affect the system outside the project.
     High,
+}
+
+/// A reusable approval category. Command approvals intentionally use risk level rather than the
+/// exact command text, so "always allow medium commands" does not silently authorize high-risk
+/// commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PermissionScope {
+    Read,
+    Write,
+    Command(CommandRisk),
+}
+
+impl PermissionScope {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "leitura",
+            Self::Write => "alterações de arquivo",
+            Self::Command(CommandRisk::Low) => "comandos de baixo risco",
+            Self::Command(CommandRisk::Medium) => "comandos de risco médio",
+            Self::Command(CommandRisk::High) => "comandos de alto risco",
+        }
+    }
 }
 
 /// The action a tool is requesting permission for.
@@ -46,6 +70,16 @@ pub struct PermissionRequest {
     pub summary: String,
     /// Working directory the action would run or write in.
     pub working_directory: PathBuf,
+    /// Category used when the user selects “Allow always”.
+    pub scope: PermissionScope,
+}
+
+/// The user's outcome for an interactive permission prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionResponse {
+    AllowOnce,
+    AllowAlways,
+    Deny,
 }
 
 /// The permission engine's decision for one action.
@@ -152,14 +186,14 @@ pub fn classify_command_risk(program: &str, args: &[String], shell: bool) -> Com
 }
 
 /// Future returned by [`PermissionResolver::resolve`].
-pub type ResolveFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+pub type ResolveFuture<'a> = Pin<Box<dyn Future<Output = PermissionResponse> + Send + 'a>>;
 
 /// Resolves an interactive `Ask` decision to a boolean outcome.
 ///
 /// The concrete implementation is the permission-modal integration point: a TUI-backed resolver
 /// prompts the user, while tests use a scripted resolver.
 pub trait PermissionResolver: Send + Sync {
-    /// Returns `true` if the user approved `request`, `false` if they denied it.
+    /// Returns the user's selection for `request`.
     fn resolve<'a>(&'a self, request: &'a PermissionRequest) -> ResolveFuture<'a>;
 }
 
@@ -172,7 +206,7 @@ pub struct AlwaysDenyResolver;
 
 impl PermissionResolver for AlwaysDenyResolver {
     fn resolve<'a>(&'a self, _request: &'a PermissionRequest) -> ResolveFuture<'a> {
-        Box::pin(async { false })
+        Box::pin(async { PermissionResponse::Deny })
     }
 }
 
@@ -199,10 +233,40 @@ fn evaluate_command_risk(
                 .trim()
                 .to_string(),
             working_directory: cwd.to_path_buf(),
+            scope: PermissionScope::Command(risk),
         }),
         CommandRisk::High => PermissionDecision::Deny(PermissionReason(format!(
             "{program} is classified high-risk and requires an explicit, narrower tool"
         ))),
+    }
+}
+
+fn request_for(action: &PermissionAction) -> PermissionRequest {
+    match action {
+        PermissionAction::ReadOnly => PermissionRequest {
+            summary: "read project files".into(),
+            working_directory: PathBuf::from("."),
+            scope: PermissionScope::Read,
+        },
+        PermissionAction::Write { path } => PermissionRequest {
+            summary: format!("write: {}", path.display()),
+            working_directory: path
+                .parent()
+                .map_or_else(|| path.clone(), Path::to_path_buf),
+            scope: PermissionScope::Write,
+        },
+        PermissionAction::Command {
+            program,
+            args,
+            cwd,
+            risk,
+        } => PermissionRequest {
+            summary: format!("run: {program} {}", args.join(" "))
+                .trim()
+                .to_string(),
+            working_directory: cwd.clone(),
+            scope: PermissionScope::Command(*risk),
+        },
     }
 }
 
@@ -265,12 +329,70 @@ impl PermissionPolicy for DefaultPermissionPolicy {
                     )))
                 }
             }
+            PermissionAction::Command { .. } => PermissionDecision::Allow,
+        }
+    }
+}
+
+/// Approval mode: reads, edits, and low-risk commands proceed; medium and high-risk commands
+/// pause unless their risk category has already been allowed for this session.
+#[derive(Clone)]
+pub struct ApprovePermissionPolicy {
+    always_allowed: Arc<std::sync::Mutex<BTreeSet<PermissionScope>>>,
+}
+
+impl ApprovePermissionPolicy {
+    #[must_use]
+    pub fn new(always_allowed: Arc<std::sync::Mutex<BTreeSet<PermissionScope>>>) -> Self {
+        Self { always_allowed }
+    }
+}
+
+impl PermissionPolicy for ApprovePermissionPolicy {
+    fn evaluate(&self, action: &PermissionAction) -> PermissionDecision {
+        let request = request_for(action);
+        if self
+            .always_allowed
+            .lock()
+            .is_ok_and(|allowed| allowed.contains(&request.scope))
+        {
+            return PermissionDecision::Allow;
+        }
+        match action {
             PermissionAction::Command {
-                program,
-                args,
-                cwd,
-                risk,
-            } => evaluate_command_risk(program, args, cwd, *risk),
+                risk: CommandRisk::Medium | CommandRisk::High,
+                ..
+            } => PermissionDecision::Ask(request),
+            _ => PermissionDecision::Allow,
+        }
+    }
+}
+
+/// Manual mode: every tool action stops for explicit approval unless its category was allowed
+/// for the current session.
+#[derive(Clone)]
+pub struct ManualPermissionPolicy {
+    always_allowed: Arc<std::sync::Mutex<BTreeSet<PermissionScope>>>,
+}
+
+impl ManualPermissionPolicy {
+    #[must_use]
+    pub fn new(always_allowed: Arc<std::sync::Mutex<BTreeSet<PermissionScope>>>) -> Self {
+        Self { always_allowed }
+    }
+}
+
+impl PermissionPolicy for ManualPermissionPolicy {
+    fn evaluate(&self, action: &PermissionAction) -> PermissionDecision {
+        let request = request_for(action);
+        if self
+            .always_allowed
+            .lock()
+            .is_ok_and(|allowed| allowed.contains(&request.scope))
+        {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Ask(request)
         }
     }
 }
@@ -310,9 +432,7 @@ impl PermissionPolicy for PlanPermissionPolicy {
     }
 }
 
-/// Approve-mode policy: every write and every command, however low-risk, asks for explicit
-/// confirmation first. Reads still proceed without asking; there is nothing to confirm about
-/// looking at a file.
+/// Legacy policy retained for callers that need every non-read action confirmed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApproveEverythingPolicy;
 
@@ -320,31 +440,8 @@ impl PermissionPolicy for ApproveEverythingPolicy {
     fn evaluate(&self, action: &PermissionAction) -> PermissionDecision {
         match action {
             PermissionAction::ReadOnly => PermissionDecision::Allow,
-            PermissionAction::Write { path } => PermissionDecision::Ask(PermissionRequest {
-                summary: format!("write: {}", path.display()),
-                working_directory: path
-                    .parent()
-                    .map_or_else(|| path.clone(), std::path::Path::to_path_buf),
-            }),
-            PermissionAction::Command {
-                program,
-                args,
-                cwd,
-                risk,
-            } => {
-                if *risk == CommandRisk::High {
-                    return PermissionDecision::Deny(PermissionReason(format!(
-                        "{program} is classified high-risk and requires an explicit, narrower \
-                         tool"
-                    )));
-                }
-                PermissionDecision::Ask(PermissionRequest {
-                    summary: format!("run: {program} {}", args.join(" "))
-                        .trim()
-                        .to_string(),
-                    working_directory: cwd.clone(),
-                })
-            }
+            PermissionAction::Write { .. } => PermissionDecision::Ask(request_for(action)),
+            PermissionAction::Command { .. } => PermissionDecision::Ask(request_for(action)),
         }
     }
 }
@@ -388,13 +485,14 @@ impl PermissionContext {
         match self.policy.evaluate(&action) {
             PermissionDecision::Allow => Ok(None),
             PermissionDecision::Deny(reason) => Err(reason),
-            PermissionDecision::Ask(request) => {
-                if self.resolver.resolve(&request).await {
+            PermissionDecision::Ask(request) => match self.resolver.resolve(&request).await {
+                PermissionResponse::AllowOnce | PermissionResponse::AllowAlways => {
                     Ok(Some(request))
-                } else {
+                }
+                PermissionResponse::Deny => {
                     Err(PermissionReason("the user denied this action".into()))
                 }
-            }
+            },
         }
     }
 }
@@ -402,9 +500,10 @@ impl PermissionContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlwaysDenyResolver, ApproveEverythingPolicy, CommandRisk, DefaultPermissionPolicy,
-        PermissionAction, PermissionContext, PermissionDecision, PermissionPolicy,
-        PermissionRequest, PermissionResolver, PlanPermissionPolicy, ResolveFuture,
+        AlwaysDenyResolver, ApproveEverythingPolicy, ApprovePermissionPolicy, CommandRisk,
+        DefaultPermissionPolicy, ManualPermissionPolicy, PermissionAction, PermissionContext,
+        PermissionDecision, PermissionPolicy, PermissionRequest, PermissionResolver,
+        PermissionResponse, PermissionScope, PlanPermissionPolicy, ResolveFuture,
         classify_command_risk,
     };
     use std::{path::PathBuf, sync::Arc};
@@ -414,7 +513,13 @@ mod tests {
     impl PermissionResolver for ScriptedResolver {
         fn resolve<'a>(&'a self, _request: &'a PermissionRequest) -> ResolveFuture<'a> {
             let approved = self.0;
-            Box::pin(async move { approved })
+            Box::pin(async move {
+                if approved {
+                    PermissionResponse::AllowOnce
+                } else {
+                    PermissionResponse::Deny
+                }
+            })
         }
     }
 
@@ -531,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn high_risk_commands_are_denied_outright() {
+    fn auto_mode_allows_high_risk_commands_without_an_interruption() {
         let policy = DefaultPermissionPolicy::editing();
         let decision = policy.evaluate(&PermissionAction::Command {
             program: "git".into(),
@@ -539,11 +644,11 @@ mod tests {
             cwd: PathBuf::from("."),
             risk: CommandRisk::High,
         });
-        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert!(matches!(decision, PermissionDecision::Allow));
     }
 
     #[test]
-    fn medium_risk_commands_carry_the_working_directory_and_action_in_the_prompt() {
+    fn auto_mode_allows_medium_commands_without_a_prompt() {
         let policy = DefaultPermissionPolicy::editing();
         let decision = policy.evaluate(&PermissionAction::Command {
             program: "npm".into(),
@@ -551,21 +656,71 @@ mod tests {
             cwd: PathBuf::from(r"C:\dev\my-project"),
             risk: CommandRisk::Medium,
         });
-        match decision {
-            PermissionDecision::Ask(request) => {
-                assert!(request.summary.contains("npm install"));
-                assert_eq!(
-                    request.working_directory,
-                    PathBuf::from(r"C:\dev\my-project")
-                );
-            }
-            other => panic!("expected an Ask decision, got {other:?}"),
+        assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn approve_mode_asks_for_medium_and_high_commands_only() {
+        let allowed = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let policy = ApprovePermissionPolicy::new(allowed);
+        for risk in [CommandRisk::Medium, CommandRisk::High] {
+            let decision = policy.evaluate(&PermissionAction::Command {
+                program: "npm".into(),
+                args: vec!["install".into()],
+                cwd: PathBuf::from("."),
+                risk,
+            });
+            assert!(matches!(decision, PermissionDecision::Ask(_)));
         }
+        assert!(matches!(
+            policy.evaluate(&PermissionAction::Command {
+                program: "cargo".into(),
+                args: vec!["test".into()],
+                cwd: PathBuf::from("."),
+                risk: CommandRisk::Low,
+            }),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn allow_always_skips_future_prompts_for_the_same_command_risk() {
+        let allowed = Arc::new(std::sync::Mutex::new(
+            [PermissionScope::Command(CommandRisk::Medium)]
+                .into_iter()
+                .collect(),
+        ));
+        let policy = ApprovePermissionPolicy::new(allowed);
+        assert!(matches!(
+            policy.evaluate(&PermissionAction::Command {
+                program: "npm".into(),
+                args: vec!["install".into()],
+                cwd: PathBuf::from("."),
+                risk: CommandRisk::Medium,
+            }),
+            PermissionDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn manual_mode_asks_before_a_read() {
+        let policy = ManualPermissionPolicy::new(Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeSet::new(),
+        )));
+        assert!(matches!(
+            policy.evaluate(&PermissionAction::ReadOnly),
+            PermissionDecision::Ask(_)
+        ));
     }
 
     #[tokio::test]
     async fn authorize_denies_ask_decisions_by_default() {
-        let ctx = PermissionContext::read_only_default();
+        let ctx = PermissionContext::new(
+            Arc::new(ManualPermissionPolicy::new(Arc::new(
+                std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            ))),
+            Arc::new(AlwaysDenyResolver),
+        );
         let outcome = ctx
             .authorize(PermissionAction::Command {
                 program: "npm".into(),
@@ -581,7 +736,9 @@ mod tests {
     #[tokio::test]
     async fn authorize_allows_ask_decisions_the_resolver_approves() {
         let ctx = PermissionContext::new(
-            Arc::new(DefaultPermissionPolicy::editing()),
+            Arc::new(ManualPermissionPolicy::new(Arc::new(
+                std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            ))),
             Arc::new(ScriptedResolver(true)),
         );
         let outcome = ctx
@@ -599,7 +756,9 @@ mod tests {
     #[tokio::test]
     async fn authorize_denies_ask_decisions_the_resolver_rejects() {
         let ctx = PermissionContext::new(
-            Arc::new(DefaultPermissionPolicy::editing()),
+            Arc::new(ManualPermissionPolicy::new(Arc::new(
+                std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            ))),
             Arc::new(AlwaysDenyResolver),
         );
         let outcome = ctx

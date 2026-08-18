@@ -19,6 +19,9 @@ pub use contract::{
     ToolContext, ToolDefinition, ToolError, ToolEvent, ToolEventSink, ToolFuture, ToolMetadata,
     ToolName, ToolOutput, ToolResult, ToolStatus,
 };
+pub use permissions::{
+    ApprovePermissionPolicy, ManualPermissionPolicy, PermissionResponse, PermissionScope,
+};
 pub use registry::{ToolRegistry, builtin_registry};
 pub use tools::ask_user::{AskUserTool, UserChoice, UserQuestion, UserQuestionResolver};
 pub use undo::{
